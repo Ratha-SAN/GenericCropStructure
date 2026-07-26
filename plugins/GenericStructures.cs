@@ -130,6 +130,33 @@
 //                   the repeated "header-tick -> foreach-set -> refresh"
 //                   column-building blocks (Ovl/Opt/PRV/Avoid/Crop?/etc.) into
 //                   one shared AddBoolColumn<T>() helper.
+//   v4.2.0.0  – RCC: single-target and multi-target (SIB) unified into one
+//               process/button, and Falloff Zone laid out as one row:
+//                 - Single ticked target and multi-target (SIB) selections now
+//                   go through the exact same "Generate Structure" click
+//                   (DoRccGenerateStructure) instead of two separate buttons/
+//                   modes: Eval -> Opt -> §2 OAR max-dose crop -> Opt Sum ->
+//                   [2+ targets only: Ring1 -> Ring2 -> SIB shave] -> Rind ->
+//                   [optional] §7 nested sparing, always in that order. A
+//                   single target still gets Eval/Opt/OAR-crop/Rind; it just
+//                   has no "other" PTV to build a ring or SIB-shave against,
+//                   so only those two steps are skipped.
+//                 - §2 OAR max-dose crop now applies directly to each target's
+//                   PTV_Opt (in place, same z{target}_Opt id) instead of the
+//                   raw PTV, and instead of being its own separate pipeline -
+//                   required for both the single-target and multi-target
+//                   cases alike, and feeds into Opt_Sum/Ring/SIB/Rind so they
+//                   all reflect the OAR-sparing already applied.
+//                 - SIB shave now updates z{target}_Opt in place too (cascades
+//                   correctly down the dose ladder) instead of creating a
+//                   separate "z{Low}_Opti" structure - there is one evolving
+//                   PTV_Opt per target now, not two similarly-named structures.
+//                 - Removed the "Create SIB / Ring / Nested Structures" button
+//                   and the Auto-Crop/Advanced mode split; RCC's View combo is
+//                   now a pure OARs/Advanced-Plan-Preview toggle with no effect
+//                   on which button is visible, since there's only one.
+//                 - FALLOFF ZONE card laid out as a single row with one column
+//                   per zone (A-small, A-large, B, C) instead of stacked rows.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -147,14 +174,15 @@ using System.Text;
 using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Data;
 using System.Windows.Markup;
 using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("4.1.0.0")]
-[assembly: AssemblyFileVersion("4.1.0.0")]
+[assembly: AssemblyVersion("4.2.0.0")]
+[assembly: AssemblyFileVersion("4.2.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -2751,7 +2779,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v4.1.0.0";
+                Title = "Generic Crop Structure Generator - v4.2.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
@@ -3002,7 +3030,7 @@ namespace VMS.TPS
                 private DataGridColumn _colDose, _colSuffix, _colBolus, _colAvoid;
 
                 private Button _btnCrop, _btnDone, _btnCreate;
-                private Button _btnAutoCrop, _btnAdvCreate;
+                private Button _btnAutoCrop;
                 private bool _inCropMode;   // Generic / Breast Opto: crop-from-OAR sub-mode
 
                 private TextBlock _txtStats;
@@ -3116,7 +3144,7 @@ namespace VMS.TPS
 
                     topBar.Children.Add(new TextBlock
                     {
-                        Text = IsRcc ? "Mode: " : "PTV Mode: ",
+                        Text = IsRcc ? "View: " : "PTV Mode: ",
                         VerticalAlignment = VerticalAlignment.Center,
                         FontWeight = FontWeights.Bold,
                         Margin = new Thickness(0, 0, 4, 0)
@@ -3124,8 +3152,11 @@ namespace VMS.TPS
                     _cbMode = new ComboBox { MinWidth = 190 };
                     if (IsRcc)
                     {
-                        _cbMode.Items.Add("Auto-Crop (Max Dose)");
-                        _cbMode.Items.Add("Advanced (SIB / Ring / Nested)");
+                        // View-only for RCC: Generate Structure is the single
+                        // action button, always visible; this just previews what
+                        // it will build (OARs list vs the Advanced plan grid).
+                        _cbMode.Items.Add("OARs");
+                        _cbMode.Items.Add("Advanced Plan Preview");
                     }
                     else
                     {
@@ -3161,7 +3192,8 @@ namespace VMS.TPS
 
                 // RCC-only: falloff zone-rate inputs, shown below the Targets grid
                 // (rather than in the top bar, so the top bar stays identical
-                // across all three tabs) as their own stacked, titled section.
+                // across all three tabs) as their own titled section - one row,
+                // one column per zone (A-small, A-large, B, C).
                 // Zone A is split small/large (per-OAR choice via the Organs
                 // grid's Small/Large columns); B/C are the SIB-shave/ring rates.
                 private UIElement BuildRccFalloffZonePanel()
@@ -3175,10 +3207,12 @@ namespace VMS.TPS
                         Margin = new Thickness(0, 0, 0, 8)
                     });
 
-                    _txtRccZoneASmall = AddRateRow(section, "Zone A - small organ (%/mm):", RCC_ZONE_A_SMALL_DEFAULT_PCT_PER_MM);
-                    _txtRccZoneALarge = AddRateRow(section, "Zone A - large organ (%/mm):", RCC_ZONE_A_LARGE_DEFAULT_PCT_PER_MM);
-                    _txtRccZoneB = AddRateRow(section, "Zone B - SIB / ring1 (%/mm):", RCC_ZONE_B_DEFAULT_PCT_PER_MM);
-                    _txtRccZoneC = AddRateRow(section, "Zone C - ring2 (%/mm):", RCC_ZONE_C_DEFAULT_PCT_PER_MM);
+                    var row = new UniformGrid { Rows = 1, Columns = 4 };
+                    _txtRccZoneASmall = AddRateColumn(row, "Zone A - small organ (%/mm)", RCC_ZONE_A_SMALL_DEFAULT_PCT_PER_MM);
+                    _txtRccZoneALarge = AddRateColumn(row, "Zone A - large organ (%/mm)", RCC_ZONE_A_LARGE_DEFAULT_PCT_PER_MM);
+                    _txtRccZoneB = AddRateColumn(row, "Zone B - SIB / ring1 (%/mm)", RCC_ZONE_B_DEFAULT_PCT_PER_MM);
+                    _txtRccZoneC = AddRateColumn(row, "Zone C - ring2 (%/mm)", RCC_ZONE_C_DEFAULT_PCT_PER_MM);
+                    section.Children.Add(row);
 
                     return _owner.CreateCard(section);
                 }
@@ -3631,15 +3665,13 @@ namespace VMS.TPS
 
                     if (IsRcc)
                     {
+                        // Single unified action - single-target and multi-target
+                        // (SIB) selections both go through DoRccGenerateStructure;
+                        // there's no separate Advanced/SIB/Ring/Nested button anymore.
                         _btnAutoCrop = new Button { Content = "Generate Structure", Padding = new Thickness(20, 8, 20, 8), Margin = new Thickness(0, 0, 6, 0) };
                         _btnAutoCrop.SetResourceReference(FrameworkElement.StyleProperty, "PrimaryButton");
-                        _btnAutoCrop.Click += (s, e) => DoRccAutoCrop();
+                        _btnAutoCrop.Click += (s, e) => DoRccGenerateStructure();
                         buttonPanel.Children.Add(_btnAutoCrop);
-
-                        _btnAdvCreate = new Button { Content = "Create SIB / Ring / Nested Structures", Padding = new Thickness(20, 8, 20, 8), Margin = new Thickness(0, 0, 6, 0), Visibility = Visibility.Collapsed };
-                        _btnAdvCreate.SetResourceReference(FrameworkElement.StyleProperty, "WarningButton");
-                        _btnAdvCreate.Click += (s, e) => DoRccAdvancedCreate();
-                        buttonPanel.Children.Add(_btnAdvCreate);
                     }
                     else
                     {
@@ -3675,15 +3707,14 @@ namespace VMS.TPS
                 {
                     if (IsRcc)
                     {
-                        // Organs and the Advanced plan preview share one Grid cell
-                        // (see BuildRightPanel) - toggling Visibility here is enough
-                        // for whichever is shown to fill it. The Crop Distance Matrix
-                        // lives under the Targets section now and stays visible in
-                        // both modes.
+                        // View-only toggle: Organs and the Advanced plan preview
+                        // share one Grid cell (see BuildRightPanel), so switching
+                        // Visibility here is enough for whichever is shown to fill
+                        // it. Generate Structure is the one action button and stays
+                        // visible either way; the Crop Distance Matrix lives under
+                        // the Targets section now and is visible in both views.
                         _dgOrgans.Visibility = secondMode ? Visibility.Collapsed : Visibility.Visible;
                         _dgRccPlan.Visibility = secondMode ? Visibility.Visible : Visibility.Collapsed;
-                        _btnAutoCrop.Visibility = secondMode ? Visibility.Collapsed : Visibility.Visible;
-                        _btnAdvCreate.Visibility = secondMode ? Visibility.Visible : Visibility.Collapsed;
                         RefreshRccPlan();
                         return;
                     }
@@ -4194,26 +4225,28 @@ namespace VMS.TPS
                 // i.e. the exact same rows ticked in the shared grids above.
                 // ==================================================================
 
-                // One stacked "label: [rate]" row, used to build the FALLOFF ZONE
-                // section (one row per zone) instead of laying the rates out inline.
-                private TextBox AddRateRow(StackPanel parent, string label, double defaultValue)
+                // One "label above, rate below" column, used to lay the FALLOFF
+                // ZONE section out as a single row with one column per zone.
+                private TextBox AddRateColumn(UniformGrid parent, string label, double defaultValue)
                 {
-                    var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 6) };
-                    row.Children.Add(new TextBlock
+                    var col = new StackPanel { Orientation = Orientation.Vertical, Margin = new Thickness(0, 0, 12, 0) };
+                    col.Children.Add(new TextBlock
                     {
                         Text = label,
-                        VerticalAlignment = VerticalAlignment.Center,
-                        Width = 190
+                        FontSize = 11,
+                        Foreground = (Brush)_owner.FindResource("TextSecondary"),
+                        Margin = new Thickness(0, 0, 0, 3),
+                        TextWrapping = TextWrapping.Wrap
                     });
                     var tb = new TextBox
                     {
                         Text = defaultValue.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture),
-                        Width = 60,
-                        VerticalAlignment = VerticalAlignment.Center
+                        Width = 70,
+                        HorizontalAlignment = HorizontalAlignment.Left
                     };
                     tb.LostFocus += (s, e) => RefreshRccPlan();
-                    row.Children.Add(tb);
-                    parent.Children.Add(row);
+                    col.Children.Add(tb);
+                    parent.Children.Add(col);
                     return tb;
                 }
 
@@ -4280,27 +4313,35 @@ namespace VMS.TPS
                             ResultId = RCC_OPT_SUM_ID
                         });
 
-                    foreach (var lvl in _rccPlan.Ring1Levels)
-                        rows.Add(new RccPlanRow
-                        {
-                            Category = "z-ring sib1 (§4)",
-                            Source = $"from {lvl.Target.TargetId} (target {_rccPlan.Ring1TargetDoseGy:0.##} Gy = 85% x {_rccPlan.LowestSibRxGy:0.##} Gy)",
-                            Zone = "B",
-                            PctDiff = 0,
-                            CropMm = lvl.CropMm,
-                            ResultId = "z-ring_sib1"
-                        });
+                    // Ring1/Ring2 (and SIB shave below) only run once there are 2+
+                    // ticked targets to compare against each other - Ring1Levels has
+                    // one entry per ticked target regardless, so gate on count here
+                    // to keep the preview honest about what Generate Structure will
+                    // actually build for a single-target selection.
+                    if (_rccPlan.Ring1Levels.Count >= 2)
+                    {
+                        foreach (var lvl in _rccPlan.Ring1Levels)
+                            rows.Add(new RccPlanRow
+                            {
+                                Category = "z-ring sib1 (§4)",
+                                Source = $"from {lvl.Target.TargetId} (target {_rccPlan.Ring1TargetDoseGy:0.##} Gy = 85% x {_rccPlan.LowestSibRxGy:0.##} Gy)",
+                                Zone = "B",
+                                PctDiff = 0,
+                                CropMm = lvl.CropMm,
+                                ResultId = "z-ring_sib1"
+                            });
 
-                    foreach (var lvl in _rccPlan.Ring2Levels)
-                        rows.Add(new RccPlanRow
-                        {
-                            Category = "z-ring sib2 (§5)",
-                            Source = $"from {lvl.Target.TargetId} (target {_rccPlan.Ring2TargetDoseGy:0.##} Gy = 65% x {_rccPlan.LowestSibRxGy:0.##} Gy)",
-                            Zone = "C",
-                            PctDiff = 0,
-                            CropMm = lvl.CropMm,
-                            ResultId = "z-ring_sib2"
-                        });
+                        foreach (var lvl in _rccPlan.Ring2Levels)
+                            rows.Add(new RccPlanRow
+                            {
+                                Category = "z-ring sib2 (§5)",
+                                Source = $"from {lvl.Target.TargetId} (target {_rccPlan.Ring2TargetDoseGy:0.##} Gy = 65% x {_rccPlan.LowestSibRxGy:0.##} Gy)",
+                                Zone = "C",
+                                PctDiff = 0,
+                                CropMm = lvl.CropMm,
+                                ResultId = "z-ring_sib2"
+                            });
+                    }
 
                     // Step 5: SIB shave, now on the PTV_Opt structures from §1-2
                     // (not the raw PTV).
@@ -4339,11 +4380,15 @@ namespace VMS.TPS
 
                     if (_txtStats != null)
                     {
+                        int targetCount = _rccPlan.Ring1Levels.Count;
                         int applicablePairs = _rccPlan.MaxDoseCrops.Count;
                         int targetsToCrop = _rccPlan.MaxDoseCrops.Select(c => c.Target.TargetId).Distinct(StringComparer.OrdinalIgnoreCase).Count();
-                        _txtStats.Text = $"{applicablePairs} target/OAR pair(s) need cropping -> {targetsToCrop} PTV(s) will be auto-cropped.  " +
-                                         $"Advanced: {_rccPlan.SibShaves.Count} SIB shave(s), " +
-                                         $"{_rccPlan.Ring1Levels.Count} ring level(s), {_rccPlan.NestedRings.Count} nested-sparing pair(s).";
+                        _txtStats.Text = $"{targetCount} target(s): Eval/Opt/Rind always; " +
+                                         $"{applicablePairs} OAR max-dose crop(s) on {targetsToCrop} PTV(s); " +
+                                         (targetCount >= 2
+                                             ? $"{_rccPlan.SibShaves.Count} SIB shave(s) + rings (2+ targets); "
+                                             : "no SIB shave/rings (need 2+ targets); ") +
+                                         $"{_rccPlan.NestedRings.Count} nested-sparing pair(s).";
                         _txtStats.Foreground = (Brush)_owner.FindResource("AccentCyan");
                     }
                 }
@@ -4517,18 +4562,14 @@ namespace VMS.TPS
                 }
 
                 // ------------------------------------------------------------
-                // PRIMARY OBJECTIVE: Rx (PTV) + Max Dose (OAR) -> crop distance
-                // (the matrix above) -> automated cropping (this method).
-                // A target with several ticked OARs gets ONE cropped structure:
-                // each OAR is expanded by its own computed distance first, then
-                // all expansions are unioned before the single subtraction from
-                // the target, so every applicable OAR's crop is honoured at once.
+                // Pre-flight check for Generate Structure: returns a human-
+                // readable list of missing/invalid required input (empty when
+                // everything needed - External/Body, >=1 ticked target with a
+                // valid Rx - is present). OAR Max Dose is optional (Eval/Opt/
+                // Rind, and Ring/SIB for 2+ targets, don't need any OAR at all)
+                // but any Max Dose that IS entered must be a valid number.
                 // ------------------------------------------------------------
-                // Pre-flight check for Auto-Crop: returns a human-readable list of
-                // missing/invalid required inputs (empty when everything needed -
-                // External/Body, >=1 ticked target with a valid Rx, >=1 ticked OAR
-                // with a valid Max Dose - is present).
-                private List<string> ValidateRccAutoCropInputs(Structure ext)
+                private List<string> ValidateRccGenerateInputs(Structure ext)
                 {
                     var missing = new List<string>();
 
@@ -4549,117 +4590,167 @@ namespace VMS.TPS
                             missing.Add("Rx (Gy) for: " + string.Join(", ", badRx));
                     }
 
-                    // An OAR participates the moment a Max Dose is entered - no
-                    // separate tick anymore, so "ticked" here means "typed something".
-                    var enteredOars = _vm.OrganRows.Where(r => !string.IsNullOrWhiteSpace(r.MaxDoseGy)).ToList();
-                    if (enteredOars.Count == 0)
-                    {
-                        missing.Add("At least one OAR Max Dose (Gy)");
-                    }
-                    else
-                    {
-                        var badMax = enteredOars
-                            .Where(r => !r.ParsedMaxDoseGy.HasValue || r.ParsedMaxDoseGy.Value <= 0)
-                            .Select(r => r.OarId).ToList();
-                        if (badMax.Count > 0)
-                            missing.Add("Max Dose (Gy) for: " + string.Join(", ", badMax));
-                    }
+                    // OAR Max Dose is optional; an entered value just has to be valid.
+                    var badMax = _vm.OrganRows
+                        .Where(r => !string.IsNullOrWhiteSpace(r.MaxDoseGy) &&
+                                    (!r.ParsedMaxDoseGy.HasValue || r.ParsedMaxDoseGy.Value <= 0))
+                        .Select(r => r.OarId).ToList();
+                    if (badMax.Count > 0)
+                        missing.Add("Max Dose (Gy) for: " + string.Join(", ", badMax));
 
                     return missing;
                 }
 
-                private void DoRccAutoCrop()
+                // Single vs multi-target (SIB) are one process now, both starting
+                // from Eval/Opt. On a clean run (nothing missing, no errors) this
+                // closes the whole dialog right away; on missing input or a
+                // creation error it shows what's wrong and stays open.
+                private void DoRccGenerateStructure()
                 {
                     RefreshRccPlan();
 
                     var ext = _vm.SelectedExternal ?? FindExternalFallback(_ss);
 
-                    var missing = ValidateRccAutoCropInputs(ext);
+                    var missing = ValidateRccGenerateInputs(ext);
                     if (missing.Count > 0)
                     {
                         MessageBox.Show(_owner,
-                            "Cannot auto-crop - missing/invalid input:\n\n" +
+                            "Cannot generate - missing/invalid input:\n\n" +
                             string.Join("\n", missing.Select(m => "- " + m)),
                             "Missing Input", MessageBoxButton.OK, MessageBoxImage.Warning);
                         return;
                     }
 
                     var plan = _rccPlan;
-                    if (plan.MaxDoseCrops.Count == 0)
-                    {
-                        MessageBox.Show(_owner,
-                            "Nothing to crop – every entered OAR Max Dose already meets or exceeds its ticked target(s)' Rx.",
-                            "Nothing to crop", MessageBoxButton.OK, MessageBoxImage.Information);
-                        return;
-                    }
+                    // Validation above already guarantees at least one ticked
+                    // target with a valid Rx, so pipelineTargets is never empty here.
+                    var pipelineTargets = _vm.TargetDoseRows
+                        .Where(r => r.IsSelected && r.ParsedDoseGy.HasValue && r.ParsedDoseGy.Value > 0)
+                        .ToList();
 
                     var fb = new SliceRecontourFallback();
                     var created = new List<string>();
                     var errors = new List<string>();
 
-                    foreach (var grp in plan.MaxDoseCrops.GroupBy(c => c.Target.TargetId, StringComparer.OrdinalIgnoreCase))
+                    // Steps 1-2: PTV_Eval / PTV_Opt per target.
+                    var optByTarget = BuildRccEvalOptStructures(pipelineTargets, ext, created, errors);
+
+                    // §2: OAR max-dose crop, applied to Opt in place - required for
+                    // both the single-target and multi-target pipelines alike.
+                    ApplyRccMaxDoseCropToOpt(plan, optByTarget, ext, created, errors);
+
+                    // PTV_Opt_Sum, built from the (now OAR-cropped) Opt structures.
+                    var optSum = BuildRccOptSum(optByTarget, ext, created, errors);
+
+                    if (pipelineTargets.Count >= 2)
                     {
-                        string resultId = grp.First().ResultId;
+                        // Steps 3-4: Ring1 (Zone B) then Ring2 (Zone C, outside
+                        // ring1) - only meaningful once there's another PTV to
+                        // fall off around.
+                        var ring1St = BuildRccRing1(plan, optSum, optByTarget, ext, created, errors);
+                        BuildRccRing2(plan, optSum, optByTarget, ext, ring1St, created, errors);
+
+                        // Step 5: SIB-shave each lower-dose target's Opt from the
+                        // next higher-dose target's Opt, in place.
+                        ApplyRccSibShaveToOpt(plan, optByTarget, ext, created, errors);
+                    }
+
+                    // Step 6: Rind = outer 5mm shell of each target's FINAL
+                    // PTV_Opt. optByTarget already reflects the OAR max-dose crop,
+                    // and the SIB shave when 2+ targets, since both are applied in
+                    // place above.
+                    BuildRccRind(optByTarget, ext, created, errors);
+
+                    // ---- Section 7: nested OAR-in-PTV sparing rings + full-crop zPTV Opti ----
+                    if (plan.NestedRings.Count > 0)
+                    {
                         try
                         {
-                            var targetSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, grp.Key, StringComparison.OrdinalIgnoreCase));
-                            if (targetSt == null) { errors.Add($"{resultId}: target structure missing"); continue; }
-
                             using (var tg = new TempGuard(_ss))
                             {
-                                var expandedOarTemps = new List<Structure>();
-                                var pairLabels = new List<string>();
+                                var ring1Pieces = new List<Structure>();
+                                var ring2Pieces = new List<Structure>();
 
-                                foreach (var c in grp)
+                                foreach (var nr in plan.NestedRings)
                                 {
-                                    var oarSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, c.Oar.OarId, StringComparison.OrdinalIgnoreCase));
-                                    if (oarSt == null) { errors.Add($"{resultId}: OAR '{c.Oar.OarId}' missing"); continue; }
+                                    var targetSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, nr.Target.TargetId, StringComparison.OrdinalIgnoreCase));
+                                    var oarSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, nr.Oar.OarId, StringComparison.OrdinalIgnoreCase));
+                                    if (targetSt == null || oarSt == null) { errors.Add($"{nr.Target.TargetId}/{nr.Oar.OarId}: source structure missing"); continue; }
 
-                                    var expanded = SafeMargin(oarSt.SegmentVolume, c.CropMm);
-                                    expandedOarTemps.Add(tg.Add(CreateTempFromSegment(_ss, expanded, "zRCC_ExpOar")));
-                                    pairLabels.Add($"{c.Oar.OarId}({c.CropMm:0.0}mm)");
+                                    string fullId = TruncId($"z{nr.Target.TargetId}_Opti");
+                                    var fullSeg = SafeBoolean(_ss, targetSt.SegmentVolume, oarSt.SegmentVolume, BoolOp.Sub,
+                                        targetSt, oarSt, fullId, fb, $"RccNestedFull_{fullId}", tg);
+                                    fullSeg = SafeBoolean(_ss, fullSeg, ext.SegmentVolume, BoolOp.And,
+                                        null, ext, fullId, fb, $"RccNestedFull_{fullId}_CapExt", tg);
+
+                                    var fullSt = GetOrCreate(_ss, "PTV", fullId);
+                                    if (AssignSegmentSafely(fullSt, fullSeg)) { fullSt.Color = Color.FromRgb(255, 99, 71); created.Add(fullId); }
+                                    else { _ss.RemoveStructure(fullSt); errors.Add($"{fullId}: empty result"); }
+
+                                    var overlap = SafeBoolean(_ss, oarSt.SegmentVolume, targetSt.SegmentVolume, BoolOp.And,
+                                        oarSt, targetSt, null, fb, $"RccNested_{nr.Oar.OarId}_Overlap", tg);
+                                    if (overlap == null) continue;
+                                    var overlapSt = tg.Add(CreateTempFromSegment(_ss, overlap, "zRCC_Ovl"));
+
+                                    var shell1Base = SafeMargin(oarSt.SegmentVolume, -RCC_NESTED_RING_STEP_MM);
+                                    var shell1BaseSt = tg.Add(CreateTempFromSegment(_ss, shell1Base, "zRCC_S1B"));
+                                    var shell1 = SafeBoolean(_ss, shell1Base, targetSt.SegmentVolume, BoolOp.And,
+                                        shell1BaseSt, targetSt, null, fb, $"RccNested_{nr.Oar.OarId}_Shell1", tg);
+
+                                    if (shell1 == null) continue;
+                                    var shell1St = tg.Add(CreateTempFromSegment(_ss, shell1, "zRCC_S1"));
+
+                                    var ring1Piece = SafeBoolean(_ss, overlap, shell1, BoolOp.Sub,
+                                        overlapSt, shell1St, null, fb, $"RccNested_{nr.Oar.OarId}_Ring1", tg);
+                                    if (ring1Piece != null) ring1Pieces.Add(tg.Add(CreateTempFromSegment(_ss, ring1Piece, "zRCC_R1P")));
+
+                                    var shell2Base = SafeMargin(oarSt.SegmentVolume, -2.0 * RCC_NESTED_RING_STEP_MM);
+                                    var shell2BaseSt = tg.Add(CreateTempFromSegment(_ss, shell2Base, "zRCC_S2B"));
+                                    var shell2 = SafeBoolean(_ss, shell2Base, targetSt.SegmentVolume, BoolOp.And,
+                                        shell2BaseSt, targetSt, null, fb, $"RccNested_{nr.Oar.OarId}_Shell2", tg);
+
+                                    if (shell2 != null)
+                                    {
+                                        var shell2St = tg.Add(CreateTempFromSegment(_ss, shell2, "zRCC_S2"));
+                                        var ring2Piece = SafeBoolean(_ss, shell1, shell2, BoolOp.Sub,
+                                            shell1St, shell2St, null, fb, $"RccNested_{nr.Oar.OarId}_Ring2", tg);
+                                        if (ring2Piece != null) ring2Pieces.Add(tg.Add(CreateTempFromSegment(_ss, ring2Piece, "zRCC_R2P")));
+                                    }
                                 }
-                                if (expandedOarTemps.Count == 0) continue;
 
-                                var oarsUnionSt = tg.Add(UnionManyToTemp(_ss, expandedOarTemps, fb, "zRCC_OarsU", $"RccOarsUnion_{resultId}", tg));
-                                if (oarsUnionSt == null) continue;
-
-                                var croppedSeg = SafeBoolean(_ss, targetSt.SegmentVolume, oarsUnionSt.SegmentVolume, BoolOp.Sub,
-                                    targetSt, oarsUnionSt, resultId, fb, $"RccOpti_{resultId}_Sub", tg);
-                                croppedSeg = SafeBoolean(_ss, croppedSeg, ext.SegmentVolume, BoolOp.And,
-                                    null, ext, resultId, fb, $"RccOpti_{resultId}_CapExt", tg);
-
-                                var st = GetOrCreate(_ss, "PTV", resultId);
-                                if (AssignSegmentSafely(st, croppedSeg))
+                                if (ring1Pieces.Count > 0)
                                 {
-                                    st.Color = Color.FromRgb(255, 165, 0);
-                                    created.Add($"{resultId}  <-  {string.Join(", ", pairLabels)}");
+                                    var r1Union = tg.Add(UnionManyToTemp(_ss, ring1Pieces, fb, "zRCC_R1Un", "NestedRing1Union", tg));
+                                    if (r1Union != null)
+                                    {
+                                        var r1 = GetOrCreate(_ss, "CONTROL", "zOAR-in-PTV1");
+                                        if (AssignSegmentSafely(r1, r1Union.SegmentVolume)) { r1.Color = Colors.Gold; created.Add("zOAR-in-PTV1"); }
+                                        else { _ss.RemoveStructure(r1); errors.Add("zOAR-in-PTV1: empty result"); }
+                                    }
                                 }
-                                else
+                                if (ring2Pieces.Count > 0)
                                 {
-                                    _ss.RemoveStructure(st);
-                                    errors.Add($"{resultId}: empty result");
+                                    var r2Union = tg.Add(UnionManyToTemp(_ss, ring2Pieces, fb, "zRCC_R2Un", "NestedRing2Union", tg));
+                                    if (r2Union != null)
+                                    {
+                                        var r2 = GetOrCreate(_ss, "CONTROL", "zOAR-in-PTV2");
+                                        if (AssignSegmentSafely(r2, r2Union.SegmentVolume)) { r2.Color = Colors.DarkGoldenrod; created.Add("zOAR-in-PTV2"); }
+                                        else { _ss.RemoveStructure(r2); errors.Add("zOAR-in-PTV2: empty result"); }
+                                    }
                                 }
                             }
                         }
-                        catch (Exception ex) { errors.Add($"{resultId}: {ex.Message}"); }
+                        catch (Exception ex) { errors.Add($"zOAR-in-PTV1/2: {ex.Message}"); }
                     }
-
-                    // Required input was validated up front, so a clean run (no
-                    // errors) closes the whole window right away - nothing left to
-                    // fix, no reason to make the user dismiss a popup and then close
-                    // it themselves. Only stay open when something went wrong during
-                    // creation (e.g. a ticked structure was deleted from the set
-                    // after ticking) so the user can see what needs attention.
                     if (errors.Count > 0)
                     {
                         var summary = new StringBuilder();
-                        summary.AppendLine($"Auto-cropped {created.Count} PTV(s):");
+                        summary.AppendLine($"Generated/updated {created.Count} structure(s):");
                         foreach (var id in created) summary.AppendLine($"  {id}");
                         summary.AppendLine();
                         summary.AppendLine($"Errors ({errors.Count}):");
                         foreach (var err in errors) summary.AppendLine($"  {err}");
-                        MessageBox.Show(_owner, summary.ToString(), "RCC Auto-Crop", MessageBoxButton.OK, MessageBoxImage.Warning);
+                        MessageBox.Show(_owner, summary.ToString(), "RCC Generate Structure", MessageBoxButton.OK, MessageBoxImage.Warning);
                         RefreshRccPlan();
                     }
                     else
@@ -4669,29 +4760,31 @@ namespace VMS.TPS
                 }
 
                 // ==============================================================
-                // RCC CROP PIPELINE (Steps 1-6) - the SIB shave / ring / rind
-                // formulas from the cheat sheet, chained the same way the
-                // Generic/Breast Eval -> Opt -> Opt Sum -> Rings pipeline works
-                // (Step1_EvalPtv / Step2_OptPtv / Step3b_GlobalOptPtvSum /
-                // Step9_Rings), just driven by RCC's own falloff-zone formulas
-                // instead of fixed margins. Runs from the "Create SIB / Ring /
-                // Nested Structures" button; nested OAR-in-PTV sparing (§7)
-                // still runs from the same button but is unaffected by this
-                // pipeline (it works off the raw ticked target, per the cheat
-                // sheet's own §7 wording) and stays below, unchanged.
+                // RCC UNIFIED GENERATE-STRUCTURE PIPELINE HELPERS
+                // Single vs multi-target (SIB) are the same process, both
+                // starting from Eval/Opt: PTV_Eval -> PTV_Opt -> OAR max-dose
+                // crop (applied to Opt, required for both cases alike) ->
+                // PTV_Opt_Sum -> [2+ targets only: Ring1 -> Ring2 -> SIB shave]
+                // -> Rind. One ticked target still gets Eval/Opt/OAR-crop/Rind;
+                // it just has no "other" PTV to build a ring or SIB-shave
+                // against, so those two steps are skipped for it (see
+                // DoRccGenerateStructure above, which calls these in order).
+                // Nested OAR-in-PTV sparing (§7) is unaffected by this pipeline
+                // (it works off the raw ticked target, per the cheat sheet's
+                // own §7 wording) and lives inside DoRccGenerateStructure itself.
                 // ==============================================================
 
                 // Step 1 + Step 2: for every ticked target, PTV_Eval = target
                 // cropped out of the body by 3mm, then PTV_Opt = Eval expanded
-                // 2mm (capped to Body). PTV_Opt_Sum = union of all PTV_Opt,
-                // used as the shared base for Ring1/Ring2 (Steps 3-4).
+                // 2mm (capped to Body). Returns the per-target Opt structures;
+                // call BuildRccOptSum separately (after any further Opt edits,
+                // e.g. the OAR max-dose crop) to (re)build PTV_Opt_Sum from them.
                 private Dictionary<string, Structure> BuildRccEvalOptStructures(
                     List<TargetDoseRow> targets, Structure ext,
-                    List<string> created, List<string> errors, out Structure optSum)
+                    List<string> created, List<string> errors)
                 {
                     var fb = new SliceRecontourFallback();
                     var optByTarget = new Dictionary<string, Structure>(StringComparer.OrdinalIgnoreCase);
-                    optSum = null;
                     if (targets.Count == 0) return optByTarget;
 
                     SegmentVolume bodyMinus3;
@@ -4752,37 +4845,97 @@ namespace VMS.TPS
                         catch (Exception ex) { errors.Add($"{row.TargetId}: {ex.Message}"); }
                     }
 
-                    if (optByTarget.Count > 0)
-                    {
-                        using (var tg = new TempGuard(_ss))
-                        {
-                            var optTemps = optByTarget.Values
-                                .Select(s => tg.Add(CreateTempFromSegment(_ss, s.SegmentVolume, "zRCC_OptTmp")))
-                                .ToList();
-                            var unionSt = tg.Add(UnionManyToTemp(_ss, optTemps, fb, "zRCC_OptSumU", "RccOptSumUnion", tg));
-                            if (unionSt != null)
-                            {
-                                var sumSeg = SafeBoolean(_ss, unionSt.SegmentVolume, ext.SegmentVolume, BoolOp.And,
-                                    unionSt, ext, RCC_OPT_SUM_ID, fb, "RccOptSum_CapExt", tg);
+                    return optByTarget;
+                }
 
-                                var sumSt = GetOrCreate(_ss, "PTV", RCC_OPT_SUM_ID);
-                                if (AssignSegmentSafely(sumSt, sumSeg))
+                // PTV_Opt_Sum = union of the current per-target PTV_Opt structures,
+                // capped to Body. Called after Eval/Opt (and again after the OAR
+                // max-dose crop updates those same Opt structures in place) so the
+                // sum - and the Ring1/Ring2 base derived from it - always reflects
+                // the latest Opt boundaries.
+                private Structure BuildRccOptSum(
+                    Dictionary<string, Structure> optByTarget, Structure ext,
+                    List<string> created, List<string> errors)
+                {
+                    if (optByTarget.Count == 0) return null;
+
+                    var fb = new SliceRecontourFallback();
+                    using (var tg = new TempGuard(_ss))
+                    {
+                        var optTemps = optByTarget.Values
+                            .Select(s => tg.Add(CreateTempFromSegment(_ss, s.SegmentVolume, "zRCC_OptTmp")))
+                            .ToList();
+                        var unionSt = tg.Add(UnionManyToTemp(_ss, optTemps, fb, "zRCC_OptSumU", "RccOptSumUnion", tg));
+                        if (unionSt == null) return null;
+
+                        var sumSeg = SafeBoolean(_ss, unionSt.SegmentVolume, ext.SegmentVolume, BoolOp.And,
+                            unionSt, ext, RCC_OPT_SUM_ID, fb, "RccOptSum_CapExt", tg);
+
+                        var sumSt = GetOrCreate(_ss, "PTV", RCC_OPT_SUM_ID);
+                        if (AssignSegmentSafely(sumSt, sumSeg))
+                        {
+                            sumSt.Color = Colors.Red;
+                            if (SMOOTH_OPT_TARGET) SmoothStructureByExpandContract(sumSt, SMOOTH_MM);
+                            created.Add(RCC_OPT_SUM_ID);
+                            return sumSt;
+                        }
+
+                        _ss.RemoveStructure(sumSt);
+                        errors.Add($"{RCC_OPT_SUM_ID}: empty result");
+                        return null;
+                    }
+                }
+
+                // §2: OAR max-dose crop, applied directly to each target's PTV_Opt
+                // (in place) rather than the raw PTV - required for both the
+                // single-target and multi-target (SIB) pipelines alike. Reuses
+                // plan.MaxDoseCrops (same numbers the matrix shows) grouped by
+                // target; each qualifying OAR is expanded by its own Zone A
+                // (small/large) crop distance, unioned, and subtracted from that
+                // target's Opt.
+                private void ApplyRccMaxDoseCropToOpt(
+                    RccPlan plan, Dictionary<string, Structure> optByTarget, Structure ext,
+                    List<string> created, List<string> errors)
+                {
+                    var fb = new SliceRecontourFallback();
+                    foreach (var grp in plan.MaxDoseCrops.GroupBy(c => c.Target.TargetId, StringComparer.OrdinalIgnoreCase))
+                    {
+                        if (!optByTarget.TryGetValue(grp.Key, out var optSt)) continue;
+
+                        try
+                        {
+                            using (var tg = new TempGuard(_ss))
+                            {
+                                var expandedOarTemps = new List<Structure>();
+                                var pairLabels = new List<string>();
+
+                                foreach (var c in grp)
                                 {
-                                    sumSt.Color = Colors.Red;
-                                    if (SMOOTH_OPT_TARGET) SmoothStructureByExpandContract(sumSt, SMOOTH_MM);
-                                    created.Add(RCC_OPT_SUM_ID);
-                                    optSum = sumSt;
+                                    var oarSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, c.Oar.OarId, StringComparison.OrdinalIgnoreCase));
+                                    if (oarSt == null) { errors.Add($"{optSt.Id}: OAR '{c.Oar.OarId}' missing"); continue; }
+
+                                    var expanded = SafeMargin(oarSt.SegmentVolume, c.CropMm);
+                                    expandedOarTemps.Add(tg.Add(CreateTempFromSegment(_ss, expanded, "zRCC_MDExpOar")));
+                                    pairLabels.Add($"{c.Oar.OarId}({c.CropMm:0.0}mm)");
                                 }
+                                if (expandedOarTemps.Count == 0) continue;
+
+                                var oarsUnionSt = tg.Add(UnionManyToTemp(_ss, expandedOarTemps, fb, "zRCC_MDOarsU", $"RccMaxDoseOarsUnion_{grp.Key}", tg));
+                                if (oarsUnionSt == null) continue;
+
+                                var croppedSeg = SafeBoolean(_ss, optSt.SegmentVolume, oarsUnionSt.SegmentVolume, BoolOp.Sub,
+                                    optSt, oarsUnionSt, optSt.Id, fb, $"RccMaxDoseCrop_{grp.Key}_Sub", tg);
+                                croppedSeg = SafeBoolean(_ss, croppedSeg, ext.SegmentVolume, BoolOp.And,
+                                    null, ext, optSt.Id, fb, $"RccMaxDoseCrop_{grp.Key}_CapExt", tg);
+
+                                if (AssignSegmentSafely(optSt, croppedSeg))
+                                    created.Add($"{optSt.Id}  <-  OAR max-dose crop: {string.Join(", ", pairLabels)}");
                                 else
-                                {
-                                    _ss.RemoveStructure(sumSt);
-                                    errors.Add($"{RCC_OPT_SUM_ID}: empty result");
-                                }
+                                    errors.Add($"{optSt.Id}: empty result after OAR max-dose crop");
                             }
                         }
+                        catch (Exception ex) { errors.Add($"{optSt.Id} OAR max-dose crop: {ex.Message}"); }
                     }
-
-                    return optByTarget;
                 }
 
                 // Step 3: Ring1, 1cm (10mm) thick, built from PTV_Opt_Sum. The gap
@@ -4909,58 +5062,58 @@ namespace VMS.TPS
                 // successfully-shaved structures keyed by the low-dose target's ID,
                 // so Step 6 (Rind) can use the post-shave Opt boundary for those
                 // targets instead of the plain (unshaved) Opt.
-                private Dictionary<string, Structure> BuildRccSibShaveOpt(
+                // Step 5 (2+ targets only): SIB shave, applied IN PLACE to each
+                // low-dose target's own PTV_Opt (same z{target}_Opt structure from
+                // Steps 1-2/OAR-crop) rather than creating a separate result
+                // structure - PTV_Opt is the one evolving structure per target, and
+                // downstream steps (Rind, and any Ring1/Ring2 already built) just
+                // read optByTarget again to see the latest boundary. plan.SibShaves
+                // is ordered highest-to-lowest Rx, so by the time a target is used
+                // as the "High" side of one pair it has already been shaved (if
+                // applicable) as the "Low" side of the previous pair - the shave
+                // cascades correctly through the whole dose ladder.
+                private void ApplyRccSibShaveToOpt(
                     RccPlan plan, Dictionary<string, Structure> optByTarget, Structure ext,
                     List<string> created, List<string> errors)
                 {
                     var fb = new SliceRecontourFallback();
-                    var shavedByTarget = new Dictionary<string, Structure>(StringComparer.OrdinalIgnoreCase);
 
                     foreach (var sh in plan.SibShaves)
                     {
+                        if (!optByTarget.TryGetValue(sh.Low.TargetId, out var lowOptSt) ||
+                            !optByTarget.TryGetValue(sh.High.TargetId, out var highOptSt))
+                        {
+                            errors.Add($"{sh.Low.TargetId}: PTV_Opt source missing for SIB shave");
+                            continue;
+                        }
+
                         try
                         {
-                            if (!optByTarget.TryGetValue(sh.Low.TargetId, out var lowOptSt) ||
-                                !optByTarget.TryGetValue(sh.High.TargetId, out var highOptSt))
-                            {
-                                errors.Add($"{sh.ResultId}: PTV_Opt source missing (Steps 1-2 must run first)");
-                                continue;
-                            }
-
                             using (var tg = new TempGuard(_ss))
                             {
                                 var expandedHigh = SafeMargin(highOptSt.SegmentVolume, sh.CropMm);
                                 var expandedHighSt = tg.Add(CreateTempFromSegment(_ss, expandedHigh, "zRCC_ShaveHigh"));
 
                                 var shavedSeg = SafeBoolean(_ss, lowOptSt.SegmentVolume, expandedHigh, BoolOp.Sub,
-                                    lowOptSt, expandedHighSt, sh.ResultId, fb, $"RccShaveOpt_{sh.ResultId}_Sub", tg);
+                                    lowOptSt, expandedHighSt, lowOptSt.Id, fb, $"RccShaveOpt_{lowOptSt.Id}_Sub", tg);
                                 shavedSeg = SafeBoolean(_ss, shavedSeg, ext.SegmentVolume, BoolOp.And,
-                                    null, ext, sh.ResultId, fb, $"RccShaveOpt_{sh.ResultId}_CapExt", tg);
+                                    null, ext, lowOptSt.Id, fb, $"RccShaveOpt_{lowOptSt.Id}_CapExt", tg);
 
-                                var st = GetOrCreate(_ss, "PTV", sh.ResultId);
-                                if (AssignSegmentSafely(st, shavedSeg))
-                                {
-                                    st.Color = Color.FromRgb(255, 140, 0);
-                                    created.Add(sh.ResultId);
-                                    shavedByTarget[sh.Low.TargetId] = st;
-                                }
+                                if (AssignSegmentSafely(lowOptSt, shavedSeg))
+                                    created.Add($"{lowOptSt.Id}  <-  SIB shave from {highOptSt.Id} ({sh.CropMm:0.0}mm)");
                                 else
-                                {
-                                    _ss.RemoveStructure(st);
-                                    errors.Add($"{sh.ResultId}: empty result");
-                                }
+                                    errors.Add($"{lowOptSt.Id}: empty result after SIB shave");
                             }
                         }
-                        catch (Exception ex) { errors.Add($"{sh.ResultId}: {ex.Message}"); }
+                        catch (Exception ex) { errors.Add($"{lowOptSt.Id} SIB shave: {ex.Message}"); }
                     }
-
-                    return shavedByTarget;
                 }
 
                 // Step 6: Rind = the outer 5mm shell of each target's final PTV_Opt
-                // boundary (PTV_Opt minus PTV_Opt contracted 5mm inward), built AFTER
-                // the SIB shave in Step 5 so low-dose targets use their shaved
-                // boundary rather than the plain (pre-shave) PTV_Opt.
+                // boundary (PTV_Opt minus PTV_Opt contracted 5mm inward). optByTarget
+                // already reflects the OAR-crop and (if applicable) SIB-shave state
+                // since both are applied in place, so this always reads the final
+                // boundary regardless of how many targets are ticked.
                 private void BuildRccRind(
                     Dictionary<string, Structure> finalOptByTarget, Structure ext,
                     List<string> created, List<string> errors)
@@ -5000,155 +5153,6 @@ namespace VMS.TPS
                     }
                 }
 
-                // Advanced/optional formulas from the same cheat sheet (SIB shave,
-                // variable rings, nested OAR sparing) - separate from the primary
-                // Rx+MaxDose auto-crop objective above.
-                private void DoRccAdvancedCreate()
-                {
-                    RefreshRccPlan();
-                    var plan = _rccPlan;
-                    if (plan == null) return;
-
-                    var ext = _vm.SelectedExternal ?? FindExternalFallback(_ss);
-                    if (ext == null || ext.IsEmpty)
-                    {
-                        MessageBox.Show(_owner, "No External/Body structure selected.",
-                            "Missing External", MessageBoxButton.OK, MessageBoxImage.Warning);
-                        return;
-                    }
-
-                    if (plan.SibShaves.Count == 0 && plan.Ring1Levels.Count == 0 && plan.NestedRings.Count == 0)
-                    {
-                        MessageBox.Show(_owner,
-                            "Nothing to create – tick 2+ targets for SIB shave/rings, and/or tick Nested OARs for §7.",
-                            "Nothing selected", MessageBoxButton.OK, MessageBoxImage.Warning);
-                        return;
-                    }
-
-                    var fb = new SliceRecontourFallback();
-                    var created = new List<string>();
-                    var errors = new List<string>();
-
-                    // ---- Steps 1-6: Eval -> Opt -> Opt Sum -> Ring1 -> Ring2 -> SIB shave -> Rind ----
-                    var pipelineTargets = _vm.TargetDoseRows
-                        .Where(r => r.IsSelected && r.ParsedDoseGy.HasValue && r.ParsedDoseGy.Value > 0)
-                        .ToList();
-
-                    if (pipelineTargets.Count > 0)
-                    {
-                        // Steps 1-2: PTV_Eval / PTV_Opt per target + PTV_Opt_Sum
-                        var optByTarget = BuildRccEvalOptStructures(pipelineTargets, ext, created, errors, out var optSum);
-
-                        // Steps 3-4: Ring1 (Zone B) then Ring2 (Zone C, outside ring1)
-                        var ring1St = BuildRccRing1(plan, optSum, optByTarget, ext, created, errors);
-                        BuildRccRing2(plan, optSum, optByTarget, ext, ring1St, created, errors);
-
-                        // Step 5: SIB-shave the PTV_Opt structures (low dose from high dose)
-                        var shavedByTarget = BuildRccSibShaveOpt(plan, optByTarget, ext, created, errors);
-
-                        // Step 6: Rind = outer 5mm shell of each target's final PTV_Opt
-                        // (post-shave boundary where a target was shaved in Step 5).
-                        var finalOptByTarget = new Dictionary<string, Structure>(optByTarget, StringComparer.OrdinalIgnoreCase);
-                        foreach (var kvp in shavedByTarget) finalOptByTarget[kvp.Key] = kvp.Value;
-                        BuildRccRind(finalOptByTarget, ext, created, errors);
-                    }
-
-                    // ---- Section 7: nested OAR-in-PTV sparing rings + full-crop zPTV Opti ----
-                    if (plan.NestedRings.Count > 0)
-                    {
-                        try
-                        {
-                            using (var tg = new TempGuard(_ss))
-                            {
-                                var ring1Pieces = new List<Structure>();
-                                var ring2Pieces = new List<Structure>();
-
-                                foreach (var nr in plan.NestedRings)
-                                {
-                                    var targetSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, nr.Target.TargetId, StringComparison.OrdinalIgnoreCase));
-                                    var oarSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, nr.Oar.OarId, StringComparison.OrdinalIgnoreCase));
-                                    if (targetSt == null || oarSt == null) { errors.Add($"{nr.Target.TargetId}/{nr.Oar.OarId}: source structure missing"); continue; }
-
-                                    string fullId = TruncId($"z{nr.Target.TargetId}_Opti");
-                                    var fullSeg = SafeBoolean(_ss, targetSt.SegmentVolume, oarSt.SegmentVolume, BoolOp.Sub,
-                                        targetSt, oarSt, fullId, fb, $"RccNestedFull_{fullId}", tg);
-                                    fullSeg = SafeBoolean(_ss, fullSeg, ext.SegmentVolume, BoolOp.And,
-                                        null, ext, fullId, fb, $"RccNestedFull_{fullId}_CapExt", tg);
-
-                                    var fullSt = GetOrCreate(_ss, "PTV", fullId);
-                                    if (AssignSegmentSafely(fullSt, fullSeg)) { fullSt.Color = Color.FromRgb(255, 99, 71); created.Add(fullId); }
-                                    else { _ss.RemoveStructure(fullSt); errors.Add($"{fullId}: empty result"); }
-
-                                    var overlap = SafeBoolean(_ss, oarSt.SegmentVolume, targetSt.SegmentVolume, BoolOp.And,
-                                        oarSt, targetSt, null, fb, $"RccNested_{nr.Oar.OarId}_Overlap", tg);
-                                    if (overlap == null) continue;
-                                    var overlapSt = tg.Add(CreateTempFromSegment(_ss, overlap, "zRCC_Ovl"));
-
-                                    var shell1Base = SafeMargin(oarSt.SegmentVolume, -RCC_NESTED_RING_STEP_MM);
-                                    var shell1BaseSt = tg.Add(CreateTempFromSegment(_ss, shell1Base, "zRCC_S1B"));
-                                    var shell1 = SafeBoolean(_ss, shell1Base, targetSt.SegmentVolume, BoolOp.And,
-                                        shell1BaseSt, targetSt, null, fb, $"RccNested_{nr.Oar.OarId}_Shell1", tg);
-
-                                    if (shell1 == null) continue;
-                                    var shell1St = tg.Add(CreateTempFromSegment(_ss, shell1, "zRCC_S1"));
-
-                                    var ring1Piece = SafeBoolean(_ss, overlap, shell1, BoolOp.Sub,
-                                        overlapSt, shell1St, null, fb, $"RccNested_{nr.Oar.OarId}_Ring1", tg);
-                                    if (ring1Piece != null) ring1Pieces.Add(tg.Add(CreateTempFromSegment(_ss, ring1Piece, "zRCC_R1P")));
-
-                                    var shell2Base = SafeMargin(oarSt.SegmentVolume, -2.0 * RCC_NESTED_RING_STEP_MM);
-                                    var shell2BaseSt = tg.Add(CreateTempFromSegment(_ss, shell2Base, "zRCC_S2B"));
-                                    var shell2 = SafeBoolean(_ss, shell2Base, targetSt.SegmentVolume, BoolOp.And,
-                                        shell2BaseSt, targetSt, null, fb, $"RccNested_{nr.Oar.OarId}_Shell2", tg);
-
-                                    if (shell2 != null)
-                                    {
-                                        var shell2St = tg.Add(CreateTempFromSegment(_ss, shell2, "zRCC_S2"));
-                                        var ring2Piece = SafeBoolean(_ss, shell1, shell2, BoolOp.Sub,
-                                            shell1St, shell2St, null, fb, $"RccNested_{nr.Oar.OarId}_Ring2", tg);
-                                        if (ring2Piece != null) ring2Pieces.Add(tg.Add(CreateTempFromSegment(_ss, ring2Piece, "zRCC_R2P")));
-                                    }
-                                }
-
-                                if (ring1Pieces.Count > 0)
-                                {
-                                    var r1Union = tg.Add(UnionManyToTemp(_ss, ring1Pieces, fb, "zRCC_R1Un", "NestedRing1Union", tg));
-                                    if (r1Union != null)
-                                    {
-                                        var r1 = GetOrCreate(_ss, "CONTROL", "zOAR-in-PTV1");
-                                        if (AssignSegmentSafely(r1, r1Union.SegmentVolume)) { r1.Color = Colors.Gold; created.Add("zOAR-in-PTV1"); }
-                                        else { _ss.RemoveStructure(r1); errors.Add("zOAR-in-PTV1: empty result"); }
-                                    }
-                                }
-                                if (ring2Pieces.Count > 0)
-                                {
-                                    var r2Union = tg.Add(UnionManyToTemp(_ss, ring2Pieces, fb, "zRCC_R2Un", "NestedRing2Union", tg));
-                                    if (r2Union != null)
-                                    {
-                                        var r2 = GetOrCreate(_ss, "CONTROL", "zOAR-in-PTV2");
-                                        if (AssignSegmentSafely(r2, r2Union.SegmentVolume)) { r2.Color = Colors.DarkGoldenrod; created.Add("zOAR-in-PTV2"); }
-                                        else { _ss.RemoveStructure(r2); errors.Add("zOAR-in-PTV2: empty result"); }
-                                    }
-                                }
-                            }
-                        }
-                        catch (Exception ex) { errors.Add($"zOAR-in-PTV1/2: {ex.Message}"); }
-                    }
-
-                    var msg = new StringBuilder();
-                    msg.AppendLine($"Advanced RCC structures created/updated: {created.Count}");
-                    foreach (var id in created) msg.AppendLine($"  {id}");
-                    if (errors.Count > 0)
-                    {
-                        msg.AppendLine();
-                        msg.AppendLine($"Errors ({errors.Count}):");
-                        foreach (var err in errors) msg.AppendLine($"  {err}");
-                    }
-                    MessageBox.Show(_owner, msg.ToString(), "RCC Advanced Structures", MessageBoxButton.OK,
-                        errors.Count > 0 ? MessageBoxImage.Warning : MessageBoxImage.Information);
-
-                    RefreshRccPlan();
-                }
             }
         }
     }
