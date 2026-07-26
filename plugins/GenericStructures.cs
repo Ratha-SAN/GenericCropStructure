@@ -94,6 +94,42 @@
 //                                   crop-distance matrix and advanced SIB/ring/
 //                                   nested plan preview retained as additional
 //                                   panels within that shell.
+//   v4.1.0.0  – RCC engine rework + dead-code/duplication cleanup across all
+//               three tabs:
+//                 - RCC's "Create SIB / Ring / Nested Structures" button now
+//                   runs a six-step Eval -> Opt -> Opt Sum -> Ring1 -> Ring2 ->
+//                   SIB shave -> Rind pipeline (mirrors Step1_EvalPtv /
+//                   Step2_OptPtv / Step3b_GlobalOptPtvSum / Step9_Rings, driven
+//                   by RCC's falloff-zone formulas instead of fixed margins).
+//                   Ring1/Ring2 now build from a shared PTV_Opt_Sum instead of
+//                   each raw ticked PTV; SIB shave now crops PTV_Opt (not the
+//                   raw PTV); new z{target}_Rind = outer 5mm shell of each
+//                   target's final (post-shave) PTV_Opt. §7 nested OAR-in-PTV
+//                   sparing and the OAR-max-dose Auto-Crop pipeline (§2) are
+//                   unchanged.
+//                 - RCC "Auto-Crop" renamed "Generate Structure"; validates
+//                   required input up front (alerts exactly what's missing)
+//                   and closes the dialog on a clean run instead of leaving it
+//                   open.
+//                 - RCC OAR grid: removed the separate "Crop" tick - an OAR
+//                   now participates the moment a Max Dose is entered - and
+//                   added mutually-exclusive Small/Large tick columns so each
+//                   OAR can pick its own Zone A falloff rate (10%/mm small,
+//                   5%/mm large, both configurable).
+//                 - RCC layout: falloff-zone rates moved into their own
+//                   stacked "FALLOFF ZONE" card below the Targets grid; the
+//                   Crop Distance Matrix moved there too (below the falloff
+//                   card); the Organs grid now fills the whole right panel
+//                   (shares a layout cell with the Advanced plan preview
+//                   instead of being height-capped alongside the matrix).
+//                 - Removed dead code found across the three-tab split:
+//                   StructureProcessor's unused `externals` field/param,
+//                   SiteTabController's write-only `_inAdvMode` field and
+//                   unused `Vm` property, and several DataGridColumn fields
+//                   that were assigned once and never read again. Extracted
+//                   the repeated "header-tick -> foreach-set -> refresh"
+//                   column-building blocks (Ovl/Opt/PRV/Avoid/Crop?/etc.) into
+//                   one shared AddBoolColumn<T>() helper.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -117,8 +153,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("4.0.0.0")]
-[assembly: AssemblyFileVersion("4.0.0.0")]
+[assembly: AssemblyVersion("4.1.0.0")]
+[assembly: AssemblyFileVersion("4.1.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -2715,7 +2751,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v4.0.0.0";
+                Title = "Generic Crop Structure Generator - v4.1.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
