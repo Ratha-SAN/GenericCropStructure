@@ -227,6 +227,17 @@
 //               RCC_RIND_MARGIN_MM (renamed from RCC_RIND_OUTWARD_MM),
 //               capped to Body - a solid, smaller volume, not a boolean
 //               shell/ring at all.
+//   v4.9.0.0  – RCC: ApplyRccMaxDoseCropToOpt no longer silently skips the
+//               §2 OAR max-dose crop when it fails. Two paths used to
+//               `continue` with no message: PTV_Opt missing from
+//               optByTarget, and the expanded-OAR union coming back null
+//               (e.g. every expanded-OAR temp ended up empty). Both now add
+//               to `errors` so a failed crop shows up in the Generate
+//               Structure summary instead of the dialog just closing as if
+//               nothing was wrong. Note this only fires on generation
+//               failures - if an OAR's Max Dose is >= its target's Rx, the
+//               formula correctly computes zero crop pairs for that pair
+//               (check the Crop Distance Matrix), which is not an error.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -251,8 +262,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("4.8.0.0")]
-[assembly: AssemblyFileVersion("4.8.0.0")]
+[assembly: AssemblyVersion("4.9.0.0")]
+[assembly: AssemblyFileVersion("4.9.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -2863,7 +2874,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v4.8.0.0";
+                Title = "Generic Crop Structure Generator - v4.9.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
@@ -5003,7 +5014,11 @@ namespace VMS.TPS
                     var fb = new SliceRecontourFallback();
                     foreach (var grp in plan.MaxDoseCrops.GroupBy(c => c.Target.TargetId, StringComparer.OrdinalIgnoreCase))
                     {
-                        if (!optByTarget.TryGetValue(grp.Key, out var optSt)) continue;
+                        if (!optByTarget.TryGetValue(grp.Key, out var optSt))
+                        {
+                            errors.Add($"{grp.Key}: PTV_Opt missing, OAR max-dose crop not applied");
+                            continue;
+                        }
 
                         try
                         {
@@ -5024,7 +5039,11 @@ namespace VMS.TPS
                                 if (expandedOarTemps.Count == 0) continue;
 
                                 var oarsUnionSt = tg.Add(UnionManyToTemp(_ss, expandedOarTemps, fb, "zRCC_MDOarsU", $"RccMaxDoseOarsUnion_{grp.Key}", tg));
-                                if (oarsUnionSt == null) continue;
+                                if (oarsUnionSt == null)
+                                {
+                                    errors.Add($"{optSt.Id}: failed to build expanded-OAR union for {string.Join(", ", pairLabels)} - crop not applied");
+                                    continue;
+                                }
 
                                 var croppedSeg = SafeBoolean(_ss, optSt.SegmentVolume, oarsUnionSt.SegmentVolume, BoolOp.Sub,
                                     optSt, oarsUnionSt, optSt.Id, fb, $"RccMaxDoseCrop_{grp.Key}_Sub", tg);
