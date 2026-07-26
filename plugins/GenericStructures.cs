@@ -175,6 +175,25 @@
 //                   the RCC pipeline creates or reuses (PTV_Eval, PTV_Opt,
 //                   PTV_Opt_Sum, Ring1, Ring2, Rind, zOAR-in-PTV1/2) so all
 //                   RCC output is high resolution.
+//   v4.4.0.0  – RCC: PTV_Opt no longer expands past PTV_Eval; rings renamed;
+//               §7 nested sparing generalised to N variable-thickness shells:
+//                 - Step 2 no longer expands PTV_Opt +2mm past PTV_Eval - Opt
+//                   now starts out identical to Eval (capped to Body) and is
+//                   reshaped from there by every later crop (§2 OAR max-dose,
+//                   SIB shave, §7 nested). EVAL_TO_OPT_EXPAND_MM stays in use
+//                   by the separate Generic/Breast Opto pipeline only.
+//                 - Renamed the Zone B/C isodose rings from "z-ring_sib1"/
+//                   "z-ring_sib2" to "z_Ring_1"/"z_Ring_2".
+//                 - §7 nested OAR-in-PTV sparing no longer hardcodes 2
+//                   shells at a fixed 2mm/4mm step. Each OAR ticked "Nested
+//                   §7" now has its own "Nested Thickness (mm)" input (next
+//                   to the tick column); BuildRccNestedShells steps outward
+//                   from that OAR's surface by that thickness, building one
+//                   z_oar_in_ptv_hr{level} structure per level (e.g.
+//                   z_parotidL_in_ptv_hr1, _hr2, ...), unioned across every
+//                   ticked target the OAR overlaps, until a level no longer
+//                   overlaps any of them - so shell count follows the actual
+//                   OAR/target geometry instead of a fixed count of two.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -199,8 +218,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("4.3.0.0")]
-[assembly: AssemblyFileVersion("4.3.0.0")]
+[assembly: AssemblyVersion("4.4.0.0")]
+[assembly: AssemblyFileVersion("4.4.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -237,12 +256,13 @@ namespace VMS.TPS
         // OrganRow.IsSmallOrgan/IsLargeOrgan.
         private const double RCC_ZONE_A_SMALL_DEFAULT_PCT_PER_MM = 10.0; // small/critical OAR max-dose crop falloff
         private const double RCC_ZONE_A_LARGE_DEFAULT_PCT_PER_MM = 5.0;  // large OAR max-dose crop falloff
-        private const double RCC_ZONE_B_DEFAULT_PCT_PER_MM = 5.0;  // SIB shave / z-ring sib1 falloff
-        private const double RCC_ZONE_C_DEFAULT_PCT_PER_MM = 2.7;  // z-ring sib2 (far-target) falloff
-        private const double RCC_RING1_ISO_FRACTION = 0.85;        // z-ring sib1 target = 85% x lowest ticked Rx
-        private const double RCC_RING2_ISO_FRACTION = 0.65;        // z-ring sib2 target = 65% x lowest ticked Rx
-        private const double RCC_RING1_MIN_CROP_MM = 3.0;          // z-ring sib1 minimum crop distance
-        private const double RCC_NESTED_RING_STEP_MM = 2.0;        // zOAR-in-PTV1/2 shell thickness
+        private const double RCC_ZONE_B_DEFAULT_PCT_PER_MM = 5.0;  // SIB shave / z_Ring_1 falloff
+        private const double RCC_ZONE_C_DEFAULT_PCT_PER_MM = 2.7;  // z_Ring_2 (far-target) falloff
+        private const double RCC_RING1_ISO_FRACTION = 0.85;        // z_Ring_1 target = 85% x lowest ticked Rx
+        private const double RCC_RING2_ISO_FRACTION = 0.65;        // z_Ring_2 target = 65% x lowest ticked Rx
+        private const double RCC_RING1_MIN_CROP_MM = 3.0;          // z_Ring_1 minimum crop distance
+        private const double RCC_NESTED_RING_STEP_MM = 2.0;        // z_oar_in_ptv_hr# default shell thickness (used when OrganRow.NestedThicknessMm is blank/invalid)
+        private const int RCC_NESTED_MAX_LEVELS = 30;               // safety cap on how many z_oar_in_ptv_hr# shells one OAR can produce
         private const double RCC_RIND_INWARD_MM = 5.0;             // z{target}_Rind: outer shell thickness of PTV_Opt
 
         private const bool SMOOTH_OPT_TARGET = true;
@@ -2383,6 +2403,7 @@ namespace VMS.TPS
             private bool _isSmallOrgan;
             private bool _isLargeOrgan;
             private bool _nestedSparing;
+            private string _nestedThicknessMm;
 
             public string OarId { get; set; }
 
@@ -2453,6 +2474,18 @@ namespace VMS.TPS
                 get => _nestedSparing;
                 set { if (_nestedSparing != value) { _nestedSparing = value; OnPC(nameof(NestedSparing)); } }
             }
+
+            // Shell thickness (mm) used to step the §7 nested OAR-in-PTV rings
+            // outward from the OAR surface; one shell per step, stopping once a
+            // shell no longer overlaps the OAR (see BuildRccNestedShells).
+            public string NestedThicknessMm
+            {
+                get => _nestedThicknessMm;
+                set { if (_nestedThicknessMm != value) { _nestedThicknessMm = value; OnPC(nameof(NestedThicknessMm)); } }
+            }
+            public double? ParsedNestedThicknessMm => double.TryParse(_nestedThicknessMm,
+                System.Globalization.NumberStyles.Any,
+                System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : (double?)null;
 
             public event PropertyChangedEventHandler PropertyChanged;
             private void OnPC(string name) =>
@@ -2797,7 +2830,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v4.3.0.0";
+                Title = "Generic Crop Structure Generator - v4.4.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
@@ -3576,6 +3609,17 @@ namespace VMS.TPS
 
                         AddBoolColumn(_dgOrgans, _vm.OrganRows, "Nested §7",
                             (r, v) => r.NestedSparing = v, nameof(OrganRow.NestedSparing), 90, RefreshRccPlan);
+
+                        // Shell thickness driving how many z_oar_in_ptv_hr# rings
+                        // BuildRccNestedShells steps outward (see that method).
+                        _dgOrgans.Columns.Add(new DataGridTextColumn
+                        {
+                            Header = "Nested Thickness (mm)",
+                            Binding = new Binding(nameof(OrganRow.NestedThicknessMm)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.LostFocus },
+                            Width = 150,
+                            ElementStyle = _inputTextBlockStyle,
+                            EditingElementStyle = _inputTextBoxStyle
+                        });
                     }
                     else
                     {
@@ -3671,7 +3715,7 @@ namespace VMS.TPS
                         foreach (var r in _vm.OrganRows)
                         {
                             r.CreateOvl = false; r.CreateOpt = false; r.CreatePrv = false;
-                            r.MaxDoseGy = ""; r.IsSmallOrgan = false; r.IsLargeOrgan = false; r.NestedSparing = false;
+                            r.MaxDoseGy = ""; r.IsSmallOrgan = false; r.IsLargeOrgan = false; r.NestedSparing = false; r.NestedThicknessMm = "";
                         }
                         foreach (var r in _vm.TargetDoseRows) { r.IsSelected = false; r.CreateAvoidance = false; r.BolusMm = ""; }
                         if (_cropRows != null) { foreach (var r in _cropRows) r.IsTicked = false; _dgCrop?.Items.Refresh(); }
@@ -4294,6 +4338,11 @@ namespace VMS.TPS
                 private static string RccRindId(string targetId) => TruncId($"z{targetId}_Rind");
                 private const string RCC_OPT_SUM_ID = "zRCC_Opt_Sum";
 
+                // §7 nested OAR-in-PTV shell, one structure per OAR per level
+                // (level 1 = nearest the OAR surface), unioned across every ticked
+                // target that OAR overlaps - see BuildRccNestedShells.
+                private static string RccNestedShellId(string oarId, int level) => TruncId($"z_{oarId}_in_ptv_hr{level}");
+
                 // Every RCC-created/updated structure is forced to high resolution
                 // regardless of the source structures' own resolution, for finer
                 // geometric fidelity in the final crops - unlike the rest of the
@@ -4354,23 +4403,23 @@ namespace VMS.TPS
                         foreach (var lvl in _rccPlan.Ring1Levels)
                             rows.Add(new RccPlanRow
                             {
-                                Category = "z-ring sib1 (§4)",
+                                Category = "z_Ring_1 (§4)",
                                 Source = $"from {lvl.Target.TargetId} (target {_rccPlan.Ring1TargetDoseGy:0.##} Gy = 85% x {_rccPlan.LowestSibRxGy:0.##} Gy)",
                                 Zone = "B",
                                 PctDiff = 0,
                                 CropMm = lvl.CropMm,
-                                ResultId = "z-ring_sib1"
+                                ResultId = "z_Ring_1"
                             });
 
                         foreach (var lvl in _rccPlan.Ring2Levels)
                             rows.Add(new RccPlanRow
                             {
-                                Category = "z-ring sib2 (§5)",
+                                Category = "z_Ring_2 (§5)",
                                 Source = $"from {lvl.Target.TargetId} (target {_rccPlan.Ring2TargetDoseGy:0.##} Gy = 65% x {_rccPlan.LowestSibRxGy:0.##} Gy)",
                                 Zone = "C",
                                 PctDiff = 0,
                                 CropMm = lvl.CropMm,
-                                ResultId = "z-ring_sib2"
+                                ResultId = "z_Ring_2"
                             });
                     }
 
@@ -4401,10 +4450,26 @@ namespace VMS.TPS
                         });
 
                     foreach (var nr in _rccPlan.NestedRings)
-                    {
                         rows.Add(new RccPlanRow { Category = "PTV_Opt nested crop (§7 full)", Source = $"{nr.Target.TargetId} minus {nr.Oar.OarId}", Zone = "-", PctDiff = 0, CropMm = 0, ResultId = RccOptId(nr.Target.TargetId) });
-                        rows.Add(new RccPlanRow { Category = "zOAR-in-PTV1 (§7)", Source = $"{nr.Oar.OarId} ∩ {nr.Target.TargetId}, 0-2mm shell", Zone = "-", PctDiff = 0, CropMm = RCC_NESTED_RING_STEP_MM, ResultId = "zOAR-in-PTV1" });
-                        rows.Add(new RccPlanRow { Category = "zOAR-in-PTV2 (§7)", Source = $"{nr.Oar.OarId} ∩ {nr.Target.TargetId}, 2-4mm shell", Zone = "-", PctDiff = 0, CropMm = 2.0 * RCC_NESTED_RING_STEP_MM, ResultId = "zOAR-in-PTV2" });
+
+                    // Shell count/geometry can only be known once real segment
+                    // volumes are booleaned at generation time, so the preview just
+                    // names the pattern and step size per OAR rather than guessing N.
+                    foreach (var oarGroup in _rccPlan.NestedRings.GroupBy(nr => nr.Oar.OarId, StringComparer.OrdinalIgnoreCase))
+                    {
+                        var oar = oarGroup.First().Oar;
+                        double thickness = oar.ParsedNestedThicknessMm ?? RCC_NESTED_RING_STEP_MM;
+                        if (thickness <= 0) thickness = RCC_NESTED_RING_STEP_MM;
+                        var targetIds = string.Join(", ", oarGroup.Select(nr => nr.Target.TargetId));
+                        rows.Add(new RccPlanRow
+                        {
+                            Category = "OAR-in-PTV shells (§7)",
+                            Source = $"{oar.OarId} ∩ [{targetIds}], stepped {thickness:0.#}mm shells until clear",
+                            Zone = "-",
+                            PctDiff = 0,
+                            CropMm = thickness,
+                            ResultId = RccNestedShellId(oar.OarId, 1) + " .. hrN"
+                        });
                     }
 
                     _dgRccPlan.ItemsSource = rows;
@@ -4693,14 +4758,12 @@ namespace VMS.TPS
                     // "_Opti" structure. ----
                     if (plan.NestedRings.Count > 0)
                     {
-                        try
+                        // Step A: crop each (target, OAR) pair's PTV_Opt in place.
+                        foreach (var nr in plan.NestedRings)
                         {
-                            using (var tg = new TempGuard(_ss))
+                            try
                             {
-                                var ring1Pieces = new List<Structure>();
-                                var ring2Pieces = new List<Structure>();
-
-                                foreach (var nr in plan.NestedRings)
+                                using (var tg = new TempGuard(_ss))
                                 {
                                     var oarSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, nr.Oar.OarId, StringComparison.OrdinalIgnoreCase));
                                     if (oarSt == null || !optByTarget.TryGetValue(nr.Target.TargetId, out var targetOptSt))
@@ -4718,70 +4781,22 @@ namespace VMS.TPS
                                         created.Add($"{targetOptSt.Id}  <-  nested OAR crop: {nr.Oar.OarId}");
                                     else
                                         errors.Add($"{targetOptSt.Id}: empty result after nested OAR crop");
-
-                                    // The zOAR-in-PTV1/2 shell/ring-piece math stays based
-                                    // on the raw target and OAR geometry - it's about the
-                                    // OAR's own overlap footprint, not the (now further-
-                                    // cropped) optimisation Opt boundary.
-                                    var targetSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, nr.Target.TargetId, StringComparison.OrdinalIgnoreCase));
-                                    if (targetSt == null) continue;
-
-                                    var overlap = SafeBoolean(_ss, oarSt.SegmentVolume, targetSt.SegmentVolume, BoolOp.And,
-                                        oarSt, targetSt, null, fb, $"RccNested_{nr.Oar.OarId}_Overlap", tg);
-                                    if (overlap == null) continue;
-                                    var overlapSt = tg.Add(CreateTempFromSegment(_ss, overlap, "zRCC_Ovl"));
-
-                                    var shell1Base = SafeMargin(oarSt.SegmentVolume, -RCC_NESTED_RING_STEP_MM);
-                                    var shell1BaseSt = tg.Add(CreateTempFromSegment(_ss, shell1Base, "zRCC_S1B"));
-                                    var shell1 = SafeBoolean(_ss, shell1Base, targetSt.SegmentVolume, BoolOp.And,
-                                        shell1BaseSt, targetSt, null, fb, $"RccNested_{nr.Oar.OarId}_Shell1", tg);
-
-                                    if (shell1 == null) continue;
-                                    var shell1St = tg.Add(CreateTempFromSegment(_ss, shell1, "zRCC_S1"));
-
-                                    var ring1Piece = SafeBoolean(_ss, overlap, shell1, BoolOp.Sub,
-                                        overlapSt, shell1St, null, fb, $"RccNested_{nr.Oar.OarId}_Ring1", tg);
-                                    if (ring1Piece != null) ring1Pieces.Add(tg.Add(CreateTempFromSegment(_ss, ring1Piece, "zRCC_R1P")));
-
-                                    var shell2Base = SafeMargin(oarSt.SegmentVolume, -2.0 * RCC_NESTED_RING_STEP_MM);
-                                    var shell2BaseSt = tg.Add(CreateTempFromSegment(_ss, shell2Base, "zRCC_S2B"));
-                                    var shell2 = SafeBoolean(_ss, shell2Base, targetSt.SegmentVolume, BoolOp.And,
-                                        shell2BaseSt, targetSt, null, fb, $"RccNested_{nr.Oar.OarId}_Shell2", tg);
-
-                                    if (shell2 != null)
-                                    {
-                                        var shell2St = tg.Add(CreateTempFromSegment(_ss, shell2, "zRCC_S2"));
-                                        var ring2Piece = SafeBoolean(_ss, shell1, shell2, BoolOp.Sub,
-                                            shell1St, shell2St, null, fb, $"RccNested_{nr.Oar.OarId}_Ring2", tg);
-                                        if (ring2Piece != null) ring2Pieces.Add(tg.Add(CreateTempFromSegment(_ss, ring2Piece, "zRCC_R2P")));
-                                    }
-                                }
-
-                                if (ring1Pieces.Count > 0)
-                                {
-                                    var r1Union = tg.Add(UnionManyToTemp(_ss, ring1Pieces, fb, "zRCC_R1Un", "NestedRing1Union", tg));
-                                    if (r1Union != null)
-                                    {
-                                        var r1 = GetOrCreate(_ss, "CONTROL", "zOAR-in-PTV1");
-                                        EnsureRccHighRes(r1);
-                                        if (AssignSegmentSafely(r1, r1Union.SegmentVolume)) { r1.Color = Colors.Gold; created.Add("zOAR-in-PTV1"); }
-                                        else { _ss.RemoveStructure(r1); errors.Add("zOAR-in-PTV1: empty result"); }
-                                    }
-                                }
-                                if (ring2Pieces.Count > 0)
-                                {
-                                    var r2Union = tg.Add(UnionManyToTemp(_ss, ring2Pieces, fb, "zRCC_R2Un", "NestedRing2Union", tg));
-                                    if (r2Union != null)
-                                    {
-                                        var r2 = GetOrCreate(_ss, "CONTROL", "zOAR-in-PTV2");
-                                        EnsureRccHighRes(r2);
-                                        if (AssignSegmentSafely(r2, r2Union.SegmentVolume)) { r2.Color = Colors.DarkGoldenrod; created.Add("zOAR-in-PTV2"); }
-                                        else { _ss.RemoveStructure(r2); errors.Add("zOAR-in-PTV2: empty result"); }
-                                    }
                                 }
                             }
+                            catch (Exception ex) { errors.Add($"{nr.Target.TargetId}/{nr.Oar.OarId}: {ex.Message}"); }
                         }
-                        catch (Exception ex) { errors.Add($"zOAR-in-PTV1/2: {ex.Message}"); }
+
+                        // Step B: z_oar_in_ptv_hr# shells, one level set per OAR
+                        // (unioned across every ticked target that OAR overlaps),
+                        // stepped outward from the raw OAR/target geometry - not the
+                        // now-further-cropped Opt boundary from Step A above.
+                        foreach (var oarGroup in plan.NestedRings.GroupBy(nr => nr.Oar.OarId, StringComparer.OrdinalIgnoreCase))
+                        {
+                            var oar = oarGroup.First().Oar;
+                            var targetIds = oarGroup.Select(nr => nr.Target.TargetId)
+                                .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+                            BuildRccNestedShells(oar, targetIds, fb, created, errors);
+                        }
                     }
 
                     // Smooth every target's FINAL PTV_Opt (level 3 = SMOOTH_MM) now
@@ -4829,10 +4844,11 @@ namespace VMS.TPS
                 // ==============================================================
 
                 // Step 1 + Step 2: for every ticked target, PTV_Eval = target
-                // cropped out of the body by 3mm, then PTV_Opt = Eval expanded
-                // 2mm (capped to Body). Returns the per-target Opt structures;
-                // call BuildRccOptSum separately (after any further Opt edits,
-                // e.g. the OAR max-dose crop) to (re)build PTV_Opt_Sum from them.
+                // cropped out of the body by 3mm, then PTV_Opt = PTV_Eval, capped
+                // to Body (no expansion - Opt starts out identical to Eval and is
+                // reshaped from there by every later crop). Returns the per-target
+                // Opt structures; call BuildRccOptSum separately (after any further
+                // Opt edits, e.g. the OAR max-dose crop) to (re)build PTV_Opt_Sum.
                 private Dictionary<string, Structure> BuildRccEvalOptStructures(
                     List<TargetDoseRow> targets, Structure ext,
                     List<string> created, List<string> errors)
@@ -4877,11 +4893,12 @@ namespace VMS.TPS
                                 evalSt.Color = Colors.Blue;
                                 created.Add(evalId);
 
-                                // Step 2: PTV_Opt = Eval expanded 2mm, capped to Body
+                                // Step 2: PTV_Opt = PTV_Eval, capped to Body (no expansion -
+                                // every later crop, e.g. OAR max-dose/SIB/§7, reshapes this
+                                // same structure starting from the Eval boundary itself).
                                 string optId = RccOptId(row.TargetId);
-                                var optSeg = SafeMargin(evalSt.SegmentVolume, +EVAL_TO_OPT_EXPAND_MM);
-                                optSeg = SafeBoolean(_ss, optSeg, ext.SegmentVolume, BoolOp.And,
-                                    null, ext, optId, fb, $"RccOpt_{row.TargetId}_CapExt", tg);
+                                var optSeg = SafeBoolean(_ss, evalSt.SegmentVolume, ext.SegmentVolume, BoolOp.And,
+                                    evalSt, ext, optId, fb, $"RccOpt_{row.TargetId}_CapExt", tg);
 
                                 var optSt = GetOrCreate(_ss, "PTV", optId);
                                 EnsureRccHighRes(optSt);
@@ -5026,7 +5043,7 @@ namespace VMS.TPS
                             var baseSt = tg.Add(CreateTempFromSegment(_ss, baseSeg, "zRCC_R1Base"));
 
                             var ringSeg = SafeBoolean(_ss, outerSeg, baseSeg, BoolOp.Sub,
-                                null, baseSt, "z-ring_sib1", fb, "Ring1_OuterMinusBase", tg);
+                                null, baseSt, "z_Ring_1", fb, "Ring1_OuterMinusBase", tg);
 
                             for (int i = 0; i < plan.Ring1Levels.Count - 1; i++)
                             {
@@ -5035,26 +5052,26 @@ namespace VMS.TPS
                                 var higherExpanded = SafeMargin(higherOpt.SegmentVolume, lvl.CropMm);
                                 var higherSt = tg.Add(CreateTempFromSegment(_ss, higherExpanded, "zRCC_R1HighExp"));
                                 ringSeg = SafeBoolean(_ss, ringSeg, higherExpanded, BoolOp.Sub,
-                                    null, higherSt, "z-ring_sib1", fb, $"Ring1_Sub_{lvl.Target.TargetId}", tg);
+                                    null, higherSt, "z_Ring_1", fb, $"Ring1_Sub_{lvl.Target.TargetId}", tg);
                             }
 
                             ringSeg = SafeBoolean(_ss, ringSeg, ext.SegmentVolume, BoolOp.And,
-                                null, ext, "z-ring_sib1", fb, "Ring1_CapExt", tg);
+                                null, ext, "z_Ring_1", fb, "Ring1_CapExt", tg);
 
-                            var st = GetOrCreate(_ss, "CONTROL", "z-ring_sib1");
+                            var st = GetOrCreate(_ss, "CONTROL", "z_Ring_1");
                             EnsureRccHighRes(st);
                             if (AssignSegmentSafely(st, ringSeg))
                             {
                                 st.Color = Colors.MediumPurple;
-                                created.Add("z-ring_sib1");
+                                created.Add("z_Ring_1");
                                 return st;
                             }
                             _ss.RemoveStructure(st);
-                            errors.Add("z-ring_sib1: empty result");
+                            errors.Add("z_Ring_1: empty result");
                             return null;
                         }
                     }
-                    catch (Exception ex) { errors.Add($"z-ring_sib1: {ex.Message}"); return null; }
+                    catch (Exception ex) { errors.Add($"z_Ring_1: {ex.Message}"); return null; }
                 }
 
                 // Step 4: Ring2, 1cm thick, using the same process as Ring1 but with
@@ -5079,7 +5096,7 @@ namespace VMS.TPS
                             var baseSt = tg.Add(CreateTempFromSegment(_ss, baseSeg, "zRCC_R2Base"));
 
                             var ringSeg = SafeBoolean(_ss, outerSeg, baseSeg, BoolOp.Sub,
-                                null, baseSt, "z-ring_sib2", fb, "Ring2_OuterMinusBase", tg);
+                                null, baseSt, "z_Ring_2", fb, "Ring2_OuterMinusBase", tg);
 
                             for (int i = 0; i < plan.Ring2Levels.Count - 1; i++)
                             {
@@ -5088,34 +5105,34 @@ namespace VMS.TPS
                                 var higherExpanded = SafeMargin(higherOpt.SegmentVolume, lvl.CropMm);
                                 var higherSt = tg.Add(CreateTempFromSegment(_ss, higherExpanded, "zRCC_R2HighExp"));
                                 ringSeg = SafeBoolean(_ss, ringSeg, higherExpanded, BoolOp.Sub,
-                                    null, higherSt, "z-ring_sib2", fb, $"Ring2_Sub_{lvl.Target.TargetId}", tg);
+                                    null, higherSt, "z_Ring_2", fb, $"Ring2_Sub_{lvl.Target.TargetId}", tg);
                             }
 
                             if (ring1St != null)
                             {
                                 var ring1Tmp = tg.Add(CreateTempFromSegment(_ss, ring1St.SegmentVolume, "zRCC_R1Clone"));
                                 ringSeg = SafeBoolean(_ss, ringSeg, ring1St.SegmentVolume, BoolOp.Sub,
-                                    null, ring1Tmp, "z-ring_sib2", fb, "Ring2_SubRing1", tg);
+                                    null, ring1Tmp, "z_Ring_2", fb, "Ring2_SubRing1", tg);
                             }
 
                             ringSeg = SafeBoolean(_ss, ringSeg, ext.SegmentVolume, BoolOp.And,
-                                null, ext, "z-ring_sib2", fb, "Ring2_CapExt", tg);
+                                null, ext, "z_Ring_2", fb, "Ring2_CapExt", tg);
 
-                            var st = GetOrCreate(_ss, "CONTROL", "z-ring_sib2");
+                            var st = GetOrCreate(_ss, "CONTROL", "z_Ring_2");
                             EnsureRccHighRes(st);
                             if (AssignSegmentSafely(st, ringSeg))
                             {
                                 st.Color = Colors.SlateBlue;
-                                created.Add("z-ring_sib2");
+                                created.Add("z_Ring_2");
                             }
                             else
                             {
                                 _ss.RemoveStructure(st);
-                                errors.Add("z-ring_sib2: empty result");
+                                errors.Add("z_Ring_2: empty result");
                             }
                         }
                     }
-                    catch (Exception ex) { errors.Add($"z-ring_sib2: {ex.Message}"); }
+                    catch (Exception ex) { errors.Add($"z_Ring_2: {ex.Message}"); }
                 }
 
                 // Step 5 (2+ targets only): SIB shave, applied IN PLACE to each
@@ -5208,6 +5225,108 @@ namespace VMS.TPS
                         }
                         catch (Exception ex) { errors.Add($"z{targetId}_Rind: {ex.Message}"); }
                     }
+                }
+
+                // Builds the §7 nested OAR-in-PTV shells for one OAR against every
+                // ticked target it overlaps. Shell level k covers the band from
+                // (k-1)*thickness to k*thickness mm inward from the OAR surface,
+                // clipped to each target and unioned across all of that OAR's
+                // targets into one z_oar_in_ptv_hr{k} structure. Stops once a level
+                // no longer overlaps any target, so the number of shells created
+                // follows the actual OAR/target geometry rather than a fixed count.
+                private void BuildRccNestedShells(
+                    OrganRow oar, List<string> targetIds,
+                    SliceRecontourFallback fb, List<string> created, List<string> errors)
+                {
+                    var oarSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, oar.OarId, StringComparison.OrdinalIgnoreCase));
+                    if (oarSt == null) { errors.Add($"{oar.OarId}: source structure missing"); return; }
+
+                    double thickness = oar.ParsedNestedThicknessMm ?? RCC_NESTED_RING_STEP_MM;
+                    if (thickness <= 0) thickness = RCC_NESTED_RING_STEP_MM;
+
+                    try
+                    {
+                        using (var tg = new TempGuard(_ss))
+                        {
+                            var prevShellByTarget = new Dictionary<string, SegmentVolume>(StringComparer.OrdinalIgnoreCase);
+                            var targetStByTarget = new Dictionary<string, Structure>(StringComparer.OrdinalIgnoreCase);
+
+                            foreach (var targetId in targetIds)
+                            {
+                                var targetSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, targetId, StringComparison.OrdinalIgnoreCase));
+                                if (targetSt == null) { errors.Add($"{targetId}: target structure missing"); continue; }
+
+                                var overlap = SafeBoolean(_ss, oarSt.SegmentVolume, targetSt.SegmentVolume, BoolOp.And,
+                                    oarSt, targetSt, null, fb, $"RccNested_{oar.OarId}_{targetId}_Overlap", tg);
+                                if (overlap == null) continue;
+
+                                prevShellByTarget[targetId] = overlap;
+                                targetStByTarget[targetId] = targetSt;
+                            }
+
+                            for (int level = 1; level <= RCC_NESTED_MAX_LEVELS && prevShellByTarget.Count > 0; level++)
+                            {
+                                var shellBase = SafeMargin(oarSt.SegmentVolume, -thickness * level);
+                                var shellBaseSt = tg.Add(CreateTempFromSegment(_ss, shellBase, "zRCC_ShB"));
+
+                                var levelPieces = new List<Structure>();
+                                var nextShellByTarget = new Dictionary<string, SegmentVolume>(StringComparer.OrdinalIgnoreCase);
+
+                                foreach (var kvp in prevShellByTarget)
+                                {
+                                    string targetId = kvp.Key;
+                                    SegmentVolume prevShell = kvp.Value;
+                                    var targetSt = targetStByTarget[targetId];
+
+                                    var shell = SafeBoolean(_ss, shellBase, targetSt.SegmentVolume, BoolOp.And,
+                                        shellBaseSt, targetSt, null, fb, $"RccNested_{oar.OarId}_{targetId}_Shell{level}", tg);
+
+                                    SegmentVolume ringPiece;
+                                    if (shell == null)
+                                    {
+                                        // OAR fully contracted out of this target - the
+                                        // remaining piece from the previous level is the
+                                        // last band; don't carry this target further.
+                                        ringPiece = prevShell;
+                                    }
+                                    else
+                                    {
+                                        var prevShellSt = tg.Add(CreateTempFromSegment(_ss, prevShell, "zRCC_PrevSh"));
+                                        var shellSt = tg.Add(CreateTempFromSegment(_ss, shell, "zRCC_Sh"));
+                                        ringPiece = SafeBoolean(_ss, prevShell, shell, BoolOp.Sub,
+                                            prevShellSt, shellSt, null, fb, $"RccNested_{oar.OarId}_{targetId}_Ring{level}", tg);
+                                        nextShellByTarget[targetId] = shell;
+                                    }
+
+                                    if (ringPiece != null) levelPieces.Add(tg.Add(CreateTempFromSegment(_ss, ringPiece, "zRCC_RingPiece")));
+                                }
+
+                                if (levelPieces.Count > 0)
+                                {
+                                    var union = tg.Add(UnionManyToTemp(_ss, levelPieces, fb, "zRCC_ShellUn", $"NestedShell_{oar.OarId}_{level}", tg));
+                                    if (union != null)
+                                    {
+                                        string shellId = RccNestedShellId(oar.OarId, level);
+                                        var st = GetOrCreate(_ss, "CONTROL", shellId);
+                                        EnsureRccHighRes(st);
+                                        if (AssignSegmentSafely(st, union.SegmentVolume))
+                                        {
+                                            st.Color = level % 2 == 1 ? Colors.Gold : Colors.DarkGoldenrod;
+                                            created.Add(shellId);
+                                        }
+                                        else
+                                        {
+                                            _ss.RemoveStructure(st);
+                                            errors.Add($"{shellId}: empty result");
+                                        }
+                                    }
+                                }
+
+                                prevShellByTarget = nextShellByTarget;
+                            }
+                        }
+                    }
+                    catch (Exception ex) { errors.Add($"{oar.OarId}_in_ptv_hr#: {ex.Message}"); }
                 }
 
             }
