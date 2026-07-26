@@ -252,7 +252,7 @@ namespace VMS.TPS
 
             if (win.ShowDialog() != true || win.ConfirmedVm == null) return;
 
-            var processor = new StructureProcessor(ss, win.ConfirmedVm, targetCandidates, externals);
+            var processor = new StructureProcessor(ss, win.ConfirmedVm, targetCandidates);
             processor.Run();
         }
 
@@ -299,7 +299,6 @@ namespace VMS.TPS
             private readonly StructureSet _ss;
             private readonly UiModel _vm;
             private readonly List<Structure> _targetCandidates;
-            private readonly List<Structure> _externals;
 
             private readonly StringBuilder _progress = new StringBuilder();
             private int _createdCount;
@@ -312,13 +311,11 @@ namespace VMS.TPS
             private readonly Dictionary<double, Structure> _zOptDoseSum = new Dictionary<double, Structure>();
 
             public StructureProcessor(
-                StructureSet ss, UiModel vm,
-                List<Structure> targetCandidates, List<Structure> externals)
+                StructureSet ss, UiModel vm, List<Structure> targetCandidates)
             {
                 _ss = ss;
                 _vm = vm;
                 _targetCandidates = targetCandidates;
-                _externals = externals;
             }
 
             private void LogCreated(string id)
@@ -2924,14 +2921,15 @@ namespace VMS.TPS
                 private DataGrid _dgTargets, _dgOrgans, _dgCrop;
                 private ComboBox _cbExternal, _cbTargetFilter, _cbMode, _cbPhysicalThickness;
 
+                // Only the Targets columns that SwitchMode toggles Visibility on
+                // (crop-from-OAR sub-mode) need to be kept as fields; the Organs
+                // grid columns are never read again after being built, so they
+                // stay as local variables in BuildRightPanel instead.
                 private DataGridColumn _colDose, _colSuffix, _colBolus, _colAvoid;
-                private DataGridColumn _colOvl, _colOpt, _colPrv, _colPrvMargin;
-                private DataGridColumn _colCropMaxDose, _colMaxDoseGy, _colNestedSparing;
 
                 private Button _btnCrop, _btnDone, _btnCreate;
                 private Button _btnAutoCrop, _btnAdvCreate;
                 private bool _inCropMode;   // Generic / Breast Opto: crop-from-OAR sub-mode
-                private bool _inAdvMode;    // RCC: advanced (SIB/ring/nested) sub-mode
 
                 private TextBlock _txtStats;
                 private int _peakProjectedStructures;
@@ -2945,7 +2943,6 @@ namespace VMS.TPS
                 private TextBox _txtRccZoneA, _txtRccZoneB, _txtRccZoneC;
 
                 public UIElement RootElement { get; }
-                public UiModel Vm => _vm;
 
                 public SiteTabController(
                     OptimisationStructureWindow owner, StructureSet ss, UiModel vm,
@@ -3008,9 +3005,16 @@ namespace VMS.TPS
                     Grid.SetRow(topCard, 0);
                     root.Children.Add(topCard);
 
+                    // RCC: targets column reduced 20% (1.15 -> 0.92), the removed
+                    // width handed to the OAR/matrix column (0.8 -> 1.03) since RCC's
+                    // right panel carries the crop matrix + advanced plan on top of
+                    // the OAR grid. Generic / Breast Opto keep the original 1.15/0.8 split.
+                    double leftStar = IsRcc ? 0.92 : 1.15;
+                    double rightStar = IsRcc ? 1.03 : 0.8;
+
                     var mid = new Grid();
-                    mid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.15, GridUnitType.Star) });
-                    mid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(0.8, GridUnitType.Star) });
+                    mid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(leftStar, GridUnitType.Star) });
+                    mid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(rightStar, GridUnitType.Star) });
 
                     var leftCard = _owner.CreateCard(BuildTargetsPanel());
                     Grid.SetColumn(leftCard, 0);
@@ -3078,22 +3082,20 @@ namespace VMS.TPS
                     };
                     topBar.Children.Add(_cbExternal);
 
-                    if (IsRcc)
-                    {
-                        topBar.Children.Add(new Border
-                        {
-                            Width = 1,
-                            Background = (Brush)_owner.FindResource("BorderBrush"),
-                            Margin = new Thickness(14, 2, 14, 2),
-                            VerticalAlignment = VerticalAlignment.Stretch
-                        });
-                        topBar.Children.Add(new TextBlock { Text = "Falloff zones:", FontWeight = FontWeights.Bold, VerticalAlignment = VerticalAlignment.Center });
-                        _txtRccZoneA = AddRateInput(topBar, "A – OAR max-dose (%/mm):", RCC_ZONE_A_DEFAULT_PCT_PER_MM);
-                        _txtRccZoneB = AddRateInput(topBar, "B – SIB / ring1 (%/mm):", RCC_ZONE_B_DEFAULT_PCT_PER_MM);
-                        _txtRccZoneC = AddRateInput(topBar, "C – ring2 (%/mm):", RCC_ZONE_C_DEFAULT_PCT_PER_MM);
-                    }
-
                     return topBar;
+                }
+
+                // RCC-only: falloff zone-rate inputs (A/B/C), shown below the
+                // Targets grid rather than in the top bar so the top bar stays
+                // identical across all three tabs.
+                private UIElement BuildRccFalloffZonePanel()
+                {
+                    var zoneBar = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 10, 0, 0) };
+                    zoneBar.Children.Add(new TextBlock { Text = "Falloff zones:", FontWeight = FontWeights.Bold, VerticalAlignment = VerticalAlignment.Center });
+                    _txtRccZoneA = AddRateInput(zoneBar, "A – OAR max-dose (%/mm):", RCC_ZONE_A_DEFAULT_PCT_PER_MM);
+                    _txtRccZoneB = AddRateInput(zoneBar, "B – SIB / ring1 (%/mm):", RCC_ZONE_B_DEFAULT_PCT_PER_MM);
+                    _txtRccZoneC = AddRateInput(zoneBar, "C – ring2 (%/mm):", RCC_ZONE_C_DEFAULT_PCT_PER_MM);
+                    return zoneBar;
                 }
 
                 // Laterality + Physical Bolus row, shown in the left Targets
@@ -3188,6 +3190,28 @@ namespace VMS.TPS
                     return sidePanel;
                 }
 
+                // Shared "tick to bulk-apply" boolean column: wires the header
+                // checkbox to set `setter` on every row of `rows`, refreshes
+                // `grid`, then runs `onChanged` (UpdateStructureCount /
+                // RefreshRccPlan / no-op). Every plain tick column across all
+                // three tabs' Targets/Organs/Crop grids goes through this
+                // instead of repeating the same foreach+refresh block.
+                private DataGridColumn AddBoolColumn<T>(
+                    DataGrid grid, IEnumerable<T> rows, string header,
+                    Action<T, bool> setter, string bindingPath, double width, Action onChanged)
+                {
+                    var col = _owner.MakeSingleClickCheckColumn(
+                        _owner.MakeHeaderCheckbox(header, isChecked =>
+                        {
+                            foreach (var r in rows) setter(r, isChecked);
+                            grid.Items.Refresh();
+                            onChanged();
+                        }),
+                        bindingPath, width);
+                    grid.Columns.Add(col);
+                    return col;
+                }
+
                 // --- LEFT: TARGETS ---
                 private UIElement BuildTargetsPanel()
                 {
@@ -3279,15 +3303,15 @@ namespace VMS.TPS
 
                     if (!IsRcc)
                     {
-                        _colAvoid = _owner.MakeSingleClickCheckColumn(
-                            _owner.MakeHeaderCheckbox("Avoid", isChecked =>
-                            {
-                                foreach (var r in _vm.TargetDoseRows) r.CreateAvoidance = isChecked;
-                                _dgTargets.Items.Refresh();
-                                UpdateStructureCount();
-                            }),
-                            nameof(TargetDoseRow.CreateAvoidance), 85);
-                        _dgTargets.Columns.Add(_colAvoid);
+                        _colAvoid = AddBoolColumn(_dgTargets, _vm.TargetDoseRows, "Avoid",
+                            (r, v) => r.CreateAvoidance = v, nameof(TargetDoseRow.CreateAvoidance), 85, UpdateStructureCount);
+                    }
+
+                    if (IsRcc)
+                    {
+                        var zonePanel = BuildRccFalloffZonePanel();
+                        DockPanel.SetDock(zonePanel, Dock.Bottom);
+                        leftPanel.Children.Add(zonePanel);
                     }
 
                     leftPanel.Children.Add(_dgTargets);
@@ -3359,72 +3383,40 @@ namespace VMS.TPS
 
                     if (IsRcc)
                     {
-                        _colCropMaxDose = _owner.MakeSingleClickCheckColumn(
-                            _owner.MakeHeaderCheckbox("Crop", isChecked =>
-                            {
-                                foreach (var r in _vm.OrganRows) r.CropMaxDose = isChecked;
-                                _dgOrgans.Items.Refresh(); RefreshRccPlan();
-                            }),
-                            nameof(OrganRow.CropMaxDose), 65);
-                        _dgOrgans.Columns.Add(_colCropMaxDose);
+                        AddBoolColumn(_dgOrgans, _vm.OrganRows, "Crop",
+                            (r, v) => r.CropMaxDose = v, nameof(OrganRow.CropMaxDose), 65, RefreshRccPlan);
 
-                        _colMaxDoseGy = new DataGridTextColumn
+                        _dgOrgans.Columns.Add(new DataGridTextColumn
                         {
                             Header = "Max Dose (Gy)",
                             Binding = new Binding(nameof(OrganRow.MaxDoseGy)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.LostFocus },
                             Width = 110,
                             ElementStyle = _inputTextBlockStyle,
                             EditingElementStyle = _inputTextBoxStyle
-                        };
-                        _dgOrgans.Columns.Add(_colMaxDoseGy);
+                        });
 
-                        _colNestedSparing = _owner.MakeSingleClickCheckColumn(
-                            _owner.MakeHeaderCheckbox("Nested §7", isChecked =>
-                            {
-                                foreach (var r in _vm.OrganRows) r.NestedSparing = isChecked;
-                                _dgOrgans.Items.Refresh(); RefreshRccPlan();
-                            }),
-                            nameof(OrganRow.NestedSparing), 90);
-                        _dgOrgans.Columns.Add(_colNestedSparing);
+                        AddBoolColumn(_dgOrgans, _vm.OrganRows, "Nested §7",
+                            (r, v) => r.NestedSparing = v, nameof(OrganRow.NestedSparing), 90, RefreshRccPlan);
                     }
                     else
                     {
-                        _colOvl = _owner.MakeSingleClickCheckColumn(
-                            _owner.MakeHeaderCheckbox("Ovl", isChecked =>
-                            {
-                                foreach (var r in _vm.OrganRows) r.CreateOvl = isChecked;
-                                _dgOrgans.Items.Refresh(); UpdateStructureCount();
-                            }),
-                            nameof(OrganRow.CreateOvl), 75);
-                        _dgOrgans.Columns.Add(_colOvl);
+                        AddBoolColumn(_dgOrgans, _vm.OrganRows, "Ovl",
+                            (r, v) => r.CreateOvl = v, nameof(OrganRow.CreateOvl), 75, UpdateStructureCount);
 
-                        _colOpt = _owner.MakeSingleClickCheckColumn(
-                            _owner.MakeHeaderCheckbox("Opt", isChecked =>
-                            {
-                                foreach (var r in _vm.OrganRows) r.CreateOpt = isChecked;
-                                _dgOrgans.Items.Refresh(); UpdateStructureCount();
-                            }),
-                            nameof(OrganRow.CreateOpt), 75);
-                        _dgOrgans.Columns.Add(_colOpt);
+                        AddBoolColumn(_dgOrgans, _vm.OrganRows, "Opt",
+                            (r, v) => r.CreateOpt = v, nameof(OrganRow.CreateOpt), 75, UpdateStructureCount);
 
-                        _colPrv = _owner.MakeSingleClickCheckColumn(
-                            _owner.MakeHeaderCheckbox("PRV", isChecked =>
-                            {
-                                foreach (var r in _vm.OrganRows) r.CreatePrv = isChecked;
-                                _dgOrgans.Items.Refresh(); UpdateStructureCount();
-                            }),
-                            nameof(OrganRow.CreatePrv), 75);
-                        _dgOrgans.Columns.Add(_colPrv);
+                        AddBoolColumn(_dgOrgans, _vm.OrganRows, "PRV",
+                            (r, v) => r.CreatePrv = v, nameof(OrganRow.CreatePrv), 75, UpdateStructureCount);
 
-                        _colPrvMargin = new DataGridTextColumn
+                        _dgOrgans.Columns.Add(new DataGridTextColumn
                         {
                             Header = "PRV Margin (mm)",
                             Binding = new Binding(nameof(OrganRow.PrvMarginMm)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.LostFocus },
                             Width = 150,
                             ElementStyle = _inputTextBlockStyle,
                             EditingElementStyle = _inputTextBoxStyle
-                        };
-                        _dgOrgans.Columns.Add(_colPrvMargin);
+                        });
                     }
 
                     rightPanel.Children.Add(_dgOrgans);
@@ -3569,7 +3561,6 @@ namespace VMS.TPS
                 {
                     if (IsRcc)
                     {
-                        _inAdvMode = secondMode;
                         _dgOrgans.Visibility = Visibility.Visible;
                         _dgRccMatrix.Visibility = secondMode ? Visibility.Collapsed : Visibility.Visible;
                         _dgRccPlan.Visibility = secondMode ? Visibility.Visible : Visibility.Collapsed;
@@ -3658,14 +3649,7 @@ namespace VMS.TPS
                         ElementStyle = (Style)_owner.FindResource(typeof(TextBlock))
                     });
 
-                    _dgCrop.Columns.Add(_owner.MakeSingleClickCheckColumn(
-                        _owner.MakeHeaderCheckbox("Crop?", isChecked =>
-                        {
-                            if (_cropRows == null) return;
-                            foreach (var r in _cropRows) r.IsTicked = isChecked;
-                            _dgCrop.Items.Refresh();
-                        }),
-                        "IsTicked", 75));
+                    AddBoolColumn(_dgCrop, _cropRows, "Crop?", (r, v) => r.IsTicked = v, "IsTicked", 75, () => { });
 
                     for (int i = 0; i < selectedTargets.Count; i++)
                     {
@@ -4364,25 +4348,70 @@ namespace VMS.TPS
                 // all expansions are unioned before the single subtraction from
                 // the target, so every applicable OAR's crop is honoured at once.
                 // ------------------------------------------------------------
+                // Pre-flight check for Auto-Crop: returns a human-readable list of
+                // missing/invalid required inputs (empty when everything needed -
+                // External/Body, >=1 ticked target with a valid Rx, >=1 ticked OAR
+                // with a valid Max Dose - is present).
+                private List<string> ValidateRccAutoCropInputs(Structure ext)
+                {
+                    var missing = new List<string>();
+
+                    if (ext == null || ext.IsEmpty)
+                        missing.Add("External/Body structure");
+
+                    var tickedTargets = _vm.TargetDoseRows.Where(r => r.IsSelected).ToList();
+                    if (tickedTargets.Count == 0)
+                    {
+                        missing.Add("At least one ticked target");
+                    }
+                    else
+                    {
+                        var badRx = tickedTargets
+                            .Where(r => !r.ParsedDoseGy.HasValue || r.ParsedDoseGy.Value <= 0)
+                            .Select(r => r.TargetId).ToList();
+                        if (badRx.Count > 0)
+                            missing.Add("Rx (Gy) for: " + string.Join(", ", badRx));
+                    }
+
+                    var tickedOars = _vm.OrganRows.Where(r => r.CropMaxDose).ToList();
+                    if (tickedOars.Count == 0)
+                    {
+                        missing.Add("At least one ticked OAR (Crop column)");
+                    }
+                    else
+                    {
+                        var badMax = tickedOars
+                            .Where(r => !r.ParsedMaxDoseGy.HasValue || r.ParsedMaxDoseGy.Value <= 0)
+                            .Select(r => r.OarId).ToList();
+                        if (badMax.Count > 0)
+                            missing.Add("Max Dose (Gy) for: " + string.Join(", ", badMax));
+                    }
+
+                    return missing;
+                }
+
                 private void DoRccAutoCrop()
                 {
                     RefreshRccPlan();
-                    var plan = _rccPlan;
-                    if (plan == null) return;
 
                     var ext = _vm.SelectedExternal ?? FindExternalFallback(_ss);
-                    if (ext == null || ext.IsEmpty)
+
+                    var missing = ValidateRccAutoCropInputs(ext);
+                    if (missing.Count > 0)
                     {
-                        MessageBox.Show(_owner, "No External/Body structure selected.",
-                            "Missing External", MessageBoxButton.OK, MessageBoxImage.Warning);
+                        MessageBox.Show(_owner,
+                            "Cannot auto-crop - missing/invalid input:\n\n" +
+                            string.Join("\n", missing.Select(m => "- " + m)),
+                            "Missing Input", MessageBoxButton.OK, MessageBoxImage.Warning);
                         return;
                     }
 
+                    var plan = _rccPlan;
                     if (plan.MaxDoseCrops.Count == 0)
                     {
                         MessageBox.Show(_owner,
-                            "Nothing to crop – tick at least one target (with Rx) and one OAR whose Max Dose is below that Rx.",
-                            "Nothing selected", MessageBoxButton.OK, MessageBoxImage.Warning);
+                            "Nothing to crop – every ticked OAR's Max Dose already meets or exceeds its ticked target(s)' Rx.",
+                            "Nothing to crop", MessageBoxButton.OK, MessageBoxImage.Information);
                         return;
                     }
 
@@ -4438,17 +4467,21 @@ namespace VMS.TPS
                         catch (Exception ex) { errors.Add($"{resultId}: {ex.Message}"); }
                     }
 
-                    var summary = new StringBuilder();
-                    summary.AppendLine($"Auto-cropped {created.Count} PTV(s):");
-                    foreach (var id in created) summary.AppendLine($"  {id}");
+                    // Required input was validated up front, so a clean run (no
+                    // errors) needs no further acknowledgement from the user -
+                    // just refresh the plan/matrix in place. Only pop up when
+                    // something still went wrong during creation (e.g. a ticked
+                    // structure was deleted from the set after ticking).
                     if (errors.Count > 0)
                     {
+                        var summary = new StringBuilder();
+                        summary.AppendLine($"Auto-cropped {created.Count} PTV(s):");
+                        foreach (var id in created) summary.AppendLine($"  {id}");
                         summary.AppendLine();
                         summary.AppendLine($"Errors ({errors.Count}):");
                         foreach (var err in errors) summary.AppendLine($"  {err}");
+                        MessageBox.Show(_owner, summary.ToString(), "RCC Auto-Crop", MessageBoxButton.OK, MessageBoxImage.Warning);
                     }
-                    MessageBox.Show(_owner, summary.ToString(), "RCC Auto-Crop", MessageBoxButton.OK,
-                        errors.Count > 0 ? MessageBoxImage.Warning : MessageBoxImage.Information);
 
                     RefreshRccPlan();
                 }
