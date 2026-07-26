@@ -157,6 +157,24 @@
 //                   on which button is visible, since there's only one.
 //                 - FALLOFF ZONE card laid out as a single row with one column
 //                   per zone (A-small, A-large, B, C) instead of stacked rows.
+//   v4.3.0.0  – RCC: PTV_Opt is now the only optimisation target structure,
+//               smoothed once at the end, forced to high resolution:
+//                 - Removed the "_Opti" naming/structure entirely. Section 7's
+//                   nested OAR-in-PTV sparing now crops the SAME z{target}_Opt
+//                   used by every other step (Eval->Opt->§2 OAR crop->SIB
+//                   shave->§7 nested crop), matching how §2/SIB already mutate
+//                   it in place. There is exactly one PTV_Opt per target for
+//                   the whole RCC engine, built from PTV_Eval, never a second
+//                   "_Opti" result.
+//                 - Smoothing (expand/contract by SMOOTH_MM, level 3) moved
+//                   from PTV_Opt's initial creation to a single pass over every
+//                   target's FINAL PTV_Opt, right after §7 nested crop and
+//                   right before Rind is built - smoothing at creation was
+//                   being silently undone by every later crop (§2, SIB, §7).
+//                 - Added EnsureRccHighRes() and called it on every structure
+//                   the RCC pipeline creates or reuses (PTV_Eval, PTV_Opt,
+//                   PTV_Opt_Sum, Ring1, Ring2, Rind, zOAR-in-PTV1/2) so all
+//                   RCC output is high resolution.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -181,8 +199,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("4.2.0.0")]
-[assembly: AssemblyFileVersion("4.2.0.0")]
+[assembly: AssemblyVersion("4.3.0.0")]
+[assembly: AssemblyFileVersion("4.3.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -2779,7 +2797,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v4.2.0.0";
+                Title = "Generic Crop Structure Generator - v4.3.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
@@ -4264,14 +4282,27 @@ namespace VMS.TPS
                 private static double RccCropMm(double pctDiff, double falloffRatePctPerMm) =>
                     falloffRatePctPerMm > 0 ? pctDiff / falloffRatePctPerMm : 0.0;
 
-                // Naming for the RCC Eval/Opt/Sum crop pipeline below - distinct from
-                // the OAR-max-dose "z{target}_Opti" / SIB-shave "z{Low}_Opti" result
-                // names elsewhere in RCC (no "i" suffix), and from the Generic/Breast
-                // pipeline's own "z_PTV_eval_{dose}"/"z_PTV_opt_{dose}"/"z_PTV_opt_sum".
+                // Naming for the RCC Eval/Opt/Sum crop pipeline below. There is
+                // exactly one PTV_Opt per target for the whole RCC engine - the
+                // OAR max-dose crop, SIB shave and nested §7 crop all reshape the
+                // SAME z{target}_Opt structure in place rather than each producing
+                // their own "_Opti" result, unlike how the cheat sheet names things.
+                // Also distinct from the Generic/Breast pipeline's own
+                // "z_PTV_eval_{dose}"/"z_PTV_opt_{dose}"/"z_PTV_opt_sum" naming.
                 private static string RccEvalId(string targetId) => TruncId($"z{targetId}_Eval");
                 private static string RccOptId(string targetId) => TruncId($"z{targetId}_Opt");
                 private static string RccRindId(string targetId) => TruncId($"z{targetId}_Rind");
                 private const string RCC_OPT_SUM_ID = "zRCC_Opt_Sum";
+
+                // Every RCC-created/updated structure is forced to high resolution
+                // regardless of the source structures' own resolution, for finer
+                // geometric fidelity in the final crops - unlike the rest of the
+                // codebase's ConvertToHighResolution calls, which only match an
+                // operand's resolution when needed for a boolean op to succeed.
+                private static void EnsureRccHighRes(Structure st)
+                {
+                    if (st != null && !st.IsHighResolution) st.ConvertToHighResolution();
+                }
 
                 // Recomputes the RCC plan from current ticks/Rx/MaxDose/zone-rate
                 // inputs and repopulates the crop-distance matrix and the advanced
@@ -4371,7 +4402,7 @@ namespace VMS.TPS
 
                     foreach (var nr in _rccPlan.NestedRings)
                     {
-                        rows.Add(new RccPlanRow { Category = "zPTV Opti (§7 full)", Source = $"{nr.Target.TargetId} minus {nr.Oar.OarId}", Zone = "-", PctDiff = 0, CropMm = 0, ResultId = TruncId($"z{nr.Target.TargetId}_Opti") });
+                        rows.Add(new RccPlanRow { Category = "PTV_Opt nested crop (§7 full)", Source = $"{nr.Target.TargetId} minus {nr.Oar.OarId}", Zone = "-", PctDiff = 0, CropMm = 0, ResultId = RccOptId(nr.Target.TargetId) });
                         rows.Add(new RccPlanRow { Category = "zOAR-in-PTV1 (§7)", Source = $"{nr.Oar.OarId} ∩ {nr.Target.TargetId}, 0-2mm shell", Zone = "-", PctDiff = 0, CropMm = RCC_NESTED_RING_STEP_MM, ResultId = "zOAR-in-PTV1" });
                         rows.Add(new RccPlanRow { Category = "zOAR-in-PTV2 (§7)", Source = $"{nr.Oar.OarId} ∩ {nr.Target.TargetId}, 2-4mm shell", Zone = "-", PctDiff = 0, CropMm = 2.0 * RCC_NESTED_RING_STEP_MM, ResultId = "zOAR-in-PTV2" });
                     }
@@ -4506,7 +4537,7 @@ namespace VMS.TPS
                                 Oar = oar,
                                 PctDiff = pctDiff,
                                 CropMm = cropMm,
-                                ResultId = TruncId($"z{t.TargetId}_Opti")
+                                ResultId = RccOptId(t.TargetId)
                             });
                         }
                     }
@@ -4528,7 +4559,7 @@ namespace VMS.TPS
                             Low = low,
                             PctDiff = pctDiff,
                             CropMm = cropMm,
-                            ResultId = TruncId($"z{low.TargetId}_Opti")
+                            ResultId = RccOptId(low.TargetId)
                         });
                     }
 
@@ -4655,13 +4686,11 @@ namespace VMS.TPS
                         ApplyRccSibShaveToOpt(plan, optByTarget, ext, created, errors);
                     }
 
-                    // Step 6: Rind = outer 5mm shell of each target's FINAL
-                    // PTV_Opt. optByTarget already reflects the OAR max-dose crop,
-                    // and the SIB shave when 2+ targets, since both are applied in
-                    // place above.
-                    BuildRccRind(optByTarget, ext, created, errors);
-
-                    // ---- Section 7: nested OAR-in-PTV sparing rings + full-crop zPTV Opti ----
+                    // ---- Section 7: nested OAR-in-PTV sparing rings. The "full
+                    // crop from the overlapping OAR" is now just another
+                    // mutation of the SAME z{target}_Opt used throughout RCC -
+                    // there is only ever one PTV_Opt per target, never a second
+                    // "_Opti" structure. ----
                     if (plan.NestedRings.Count > 0)
                     {
                         try
@@ -4673,19 +4702,29 @@ namespace VMS.TPS
 
                                 foreach (var nr in plan.NestedRings)
                                 {
-                                    var targetSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, nr.Target.TargetId, StringComparison.OrdinalIgnoreCase));
                                     var oarSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, nr.Oar.OarId, StringComparison.OrdinalIgnoreCase));
-                                    if (targetSt == null || oarSt == null) { errors.Add($"{nr.Target.TargetId}/{nr.Oar.OarId}: source structure missing"); continue; }
+                                    if (oarSt == null || !optByTarget.TryGetValue(nr.Target.TargetId, out var targetOptSt))
+                                    {
+                                        errors.Add($"{nr.Target.TargetId}/{nr.Oar.OarId}: source structure missing");
+                                        continue;
+                                    }
 
-                                    string fullId = TruncId($"z{nr.Target.TargetId}_Opti");
-                                    var fullSeg = SafeBoolean(_ss, targetSt.SegmentVolume, oarSt.SegmentVolume, BoolOp.Sub,
-                                        targetSt, oarSt, fullId, fb, $"RccNestedFull_{fullId}", tg);
-                                    fullSeg = SafeBoolean(_ss, fullSeg, ext.SegmentVolume, BoolOp.And,
-                                        null, ext, fullId, fb, $"RccNestedFull_{fullId}_CapExt", tg);
+                                    var optCroppedSeg = SafeBoolean(_ss, targetOptSt.SegmentVolume, oarSt.SegmentVolume, BoolOp.Sub,
+                                        targetOptSt, oarSt, targetOptSt.Id, fb, $"RccNestedOptCrop_{targetOptSt.Id}", tg);
+                                    optCroppedSeg = SafeBoolean(_ss, optCroppedSeg, ext.SegmentVolume, BoolOp.And,
+                                        null, ext, targetOptSt.Id, fb, $"RccNestedOptCrop_{targetOptSt.Id}_CapExt", tg);
 
-                                    var fullSt = GetOrCreate(_ss, "PTV", fullId);
-                                    if (AssignSegmentSafely(fullSt, fullSeg)) { fullSt.Color = Color.FromRgb(255, 99, 71); created.Add(fullId); }
-                                    else { _ss.RemoveStructure(fullSt); errors.Add($"{fullId}: empty result"); }
+                                    if (AssignSegmentSafely(targetOptSt, optCroppedSeg))
+                                        created.Add($"{targetOptSt.Id}  <-  nested OAR crop: {nr.Oar.OarId}");
+                                    else
+                                        errors.Add($"{targetOptSt.Id}: empty result after nested OAR crop");
+
+                                    // The zOAR-in-PTV1/2 shell/ring-piece math stays based
+                                    // on the raw target and OAR geometry - it's about the
+                                    // OAR's own overlap footprint, not the (now further-
+                                    // cropped) optimisation Opt boundary.
+                                    var targetSt = _ss.Structures.FirstOrDefault(s => !s.IsEmpty && string.Equals(s.Id, nr.Target.TargetId, StringComparison.OrdinalIgnoreCase));
+                                    if (targetSt == null) continue;
 
                                     var overlap = SafeBoolean(_ss, oarSt.SegmentVolume, targetSt.SegmentVolume, BoolOp.And,
                                         oarSt, targetSt, null, fb, $"RccNested_{nr.Oar.OarId}_Overlap", tg);
@@ -4724,6 +4763,7 @@ namespace VMS.TPS
                                     if (r1Union != null)
                                     {
                                         var r1 = GetOrCreate(_ss, "CONTROL", "zOAR-in-PTV1");
+                                        EnsureRccHighRes(r1);
                                         if (AssignSegmentSafely(r1, r1Union.SegmentVolume)) { r1.Color = Colors.Gold; created.Add("zOAR-in-PTV1"); }
                                         else { _ss.RemoveStructure(r1); errors.Add("zOAR-in-PTV1: empty result"); }
                                     }
@@ -4734,6 +4774,7 @@ namespace VMS.TPS
                                     if (r2Union != null)
                                     {
                                         var r2 = GetOrCreate(_ss, "CONTROL", "zOAR-in-PTV2");
+                                        EnsureRccHighRes(r2);
                                         if (AssignSegmentSafely(r2, r2Union.SegmentVolume)) { r2.Color = Colors.DarkGoldenrod; created.Add("zOAR-in-PTV2"); }
                                         else { _ss.RemoveStructure(r2); errors.Add("zOAR-in-PTV2: empty result"); }
                                     }
@@ -4742,6 +4783,19 @@ namespace VMS.TPS
                         }
                         catch (Exception ex) { errors.Add($"zOAR-in-PTV1/2: {ex.Message}"); }
                     }
+
+                    // Smooth every target's FINAL PTV_Opt (level 3 = SMOOTH_MM) now
+                    // that all crops - OAR max-dose, SIB shave, nested §7 - are done.
+                    // Smoothing any earlier would just get overwritten by the next
+                    // boolean subtraction, so this runs once, last.
+                    if (SMOOTH_OPT_TARGET)
+                        foreach (var optSt in optByTarget.Values)
+                            SmoothStructureByExpandContract(optSt, SMOOTH_MM);
+
+                    // Step 6: Rind = outer 5mm shell of each target's FINAL, smoothed
+                    // PTV_Opt.
+                    BuildRccRind(optByTarget, ext, created, errors);
+
                     if (errors.Count > 0)
                     {
                         var summary = new StringBuilder();
@@ -4813,6 +4867,7 @@ namespace VMS.TPS
                                     null, ext, evalId, fb, $"RccEval_{row.TargetId}_AndExt", tg);
 
                                 var evalSt = GetOrCreate(_ss, "PTV", evalId);
+                                EnsureRccHighRes(evalSt);
                                 if (!AssignSegmentSafely(evalSt, evalSeg))
                                 {
                                     _ss.RemoveStructure(evalSt);
@@ -4829,6 +4884,7 @@ namespace VMS.TPS
                                     null, ext, optId, fb, $"RccOpt_{row.TargetId}_CapExt", tg);
 
                                 var optSt = GetOrCreate(_ss, "PTV", optId);
+                                EnsureRccHighRes(optSt);
                                 if (!AssignSegmentSafely(optSt, optSeg))
                                 {
                                     _ss.RemoveStructure(optSt);
@@ -4836,7 +4892,10 @@ namespace VMS.TPS
                                     continue;
                                 }
                                 optSt.Color = Colors.Red;
-                                if (SMOOTH_OPT_TARGET) SmoothStructureByExpandContract(optSt, SMOOTH_MM);
+                                // Not smoothed here - the OAR max-dose crop, SIB shave
+                                // and nested §7 crop all still have to reshape this same
+                                // Opt structure, and each one would undo an earlier smooth.
+                                // DoRccGenerateStructure smooths once, after every crop.
                                 created.Add(optId);
 
                                 optByTarget[row.TargetId] = optSt;
@@ -4872,6 +4931,7 @@ namespace VMS.TPS
                             unionSt, ext, RCC_OPT_SUM_ID, fb, "RccOptSum_CapExt", tg);
 
                         var sumSt = GetOrCreate(_ss, "PTV", RCC_OPT_SUM_ID);
+                        EnsureRccHighRes(sumSt);
                         if (AssignSegmentSafely(sumSt, sumSeg))
                         {
                             sumSt.Color = Colors.Red;
@@ -4982,6 +5042,7 @@ namespace VMS.TPS
                                 null, ext, "z-ring_sib1", fb, "Ring1_CapExt", tg);
 
                             var st = GetOrCreate(_ss, "CONTROL", "z-ring_sib1");
+                            EnsureRccHighRes(st);
                             if (AssignSegmentSafely(st, ringSeg))
                             {
                                 st.Color = Colors.MediumPurple;
@@ -5041,6 +5102,7 @@ namespace VMS.TPS
                                 null, ext, "z-ring_sib2", fb, "Ring2_CapExt", tg);
 
                             var st = GetOrCreate(_ss, "CONTROL", "z-ring_sib2");
+                            EnsureRccHighRes(st);
                             if (AssignSegmentSafely(st, ringSeg))
                             {
                                 st.Color = Colors.SlateBlue;
@@ -5056,12 +5118,6 @@ namespace VMS.TPS
                     catch (Exception ex) { errors.Add($"z-ring_sib2: {ex.Message}"); }
                 }
 
-                // Step 5: SIB shave, now cropping the PTV_Opt structures built in
-                // Step 2 (not the raw PTV) - zPTV{Low}_Opti = z{Low}_Opt minus
-                // (z{High}_Opt expanded by the SIB crop distance). Returns the
-                // successfully-shaved structures keyed by the low-dose target's ID,
-                // so Step 6 (Rind) can use the post-shave Opt boundary for those
-                // targets instead of the plain (unshaved) Opt.
                 // Step 5 (2+ targets only): SIB shave, applied IN PLACE to each
                 // low-dose target's own PTV_Opt (same z{target}_Opt structure from
                 // Steps 1-2/OAR-crop) rather than creating a separate result
@@ -5137,6 +5193,7 @@ namespace VMS.TPS
                                     null, ext, rindId, fb, $"RccRind_{targetId}_CapExt", tg);
 
                                 var st = GetOrCreate(_ss, "CONTROL", rindId);
+                                EnsureRccHighRes(st);
                                 if (AssignSegmentSafely(st, rindSeg))
                                 {
                                     st.Color = Color.FromRgb(0, 200, 140);
