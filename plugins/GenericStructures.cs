@@ -194,6 +194,15 @@
 //                   ticked target the OAR overlaps, until a level no longer
 //                   overlaps any of them - so shell count follows the actual
 //                   OAR/target geometry instead of a fixed count of two.
+//   v4.5.0.0  – RCC: removed the level-3 expand/contract smoothing pass added
+//               in v4.3.0.0. It ran on both PTV_Opt_Sum (in BuildRccOptSum)
+//               and every target's final PTV_Opt (end of
+//               DoRccGenerateStructure); either one nudges the boundary past
+//               what the eval+crop formula computes. PTV_Opt is now exactly
+//               PTV_Eval cropped by §2/SIB/§7, nothing else - Rind still
+//               builds from that same (now unsmoothed) PTV_Opt.
+//               SMOOTH_OPT_TARGET/SMOOTH_MM/SmoothStructureByExpandContract
+//               remain in use by the separate Generic/Breast Opto pipeline.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -218,8 +227,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("4.4.0.0")]
-[assembly: AssemblyFileVersion("4.4.0.0")]
+[assembly: AssemblyVersion("4.5.0.0")]
+[assembly: AssemblyFileVersion("4.5.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -2830,7 +2839,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v4.4.0.0";
+                Title = "Generic Crop Structure Generator - v4.5.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
@@ -4799,16 +4808,13 @@ namespace VMS.TPS
                         }
                     }
 
-                    // Smooth every target's FINAL PTV_Opt (level 3 = SMOOTH_MM) now
-                    // that all crops - OAR max-dose, SIB shave, nested §7 - are done.
-                    // Smoothing any earlier would just get overwritten by the next
-                    // boolean subtraction, so this runs once, last.
-                    if (SMOOTH_OPT_TARGET)
-                        foreach (var optSt in optByTarget.Values)
-                            SmoothStructureByExpandContract(optSt, SMOOTH_MM);
+                    // No smoothing here - PTV_Opt is exactly PTV_Eval cropped by the
+                    // formulas above (§2 OAR max-dose, SIB shave, §7 nested), never
+                    // expanded/smoothed past that boundary. SMOOTH_OPT_TARGET/
+                    // SMOOTH_MM remain in use by the separate Generic/Breast Opto
+                    // pipeline only.
 
-                    // Step 6: Rind = outer 5mm shell of each target's FINAL, smoothed
-                    // PTV_Opt.
+                    // Step 6: Rind = outer 5mm shell of each target's FINAL PTV_Opt.
                     BuildRccRind(optByTarget, ext, created, errors);
 
                     if (errors.Count > 0)
@@ -4909,10 +4915,6 @@ namespace VMS.TPS
                                     continue;
                                 }
                                 optSt.Color = Colors.Red;
-                                // Not smoothed here - the OAR max-dose crop, SIB shave
-                                // and nested §7 crop all still have to reshape this same
-                                // Opt structure, and each one would undo an earlier smooth.
-                                // DoRccGenerateStructure smooths once, after every crop.
                                 created.Add(optId);
 
                                 optByTarget[row.TargetId] = optSt;
@@ -4952,7 +4954,6 @@ namespace VMS.TPS
                         if (AssignSegmentSafely(sumSt, sumSeg))
                         {
                             sumSt.Color = Colors.Red;
-                            if (SMOOTH_OPT_TARGET) SmoothStructureByExpandContract(sumSt, SMOOTH_MM);
                             created.Add(RCC_OPT_SUM_ID);
                             return sumSt;
                         }
