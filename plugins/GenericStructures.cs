@@ -203,6 +203,14 @@
 //               builds from that same (now unsmoothed) PTV_Opt.
 //               SMOOTH_OPT_TARGET/SMOOTH_MM/SmoothStructureByExpandContract
 //               remain in use by the separate Generic/Breast Opto pipeline.
+//   v4.6.0.0  – RCC: "Generate Structure" now closes the dialog immediately
+//               after it runs, regardless of outcome. Previously a creation
+//               error kept the dialog open (with a summary shown) so it
+//               could be retried in place; it now shows that same summary
+//               first, then closes either way. Missing/invalid input still
+//               blocks the run before anything is generated and keeps the
+//               dialog open to fix it - only the post-generation branch
+//               changed.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -227,8 +235,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("4.5.0.0")]
-[assembly: AssemblyFileVersion("4.5.0.0")]
+[assembly: AssemblyVersion("4.6.0.0")]
+[assembly: AssemblyFileVersion("4.6.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -2839,7 +2847,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v4.5.0.0";
+                Title = "Generic Crop Structure Generator - v4.6.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
@@ -4707,9 +4715,10 @@ namespace VMS.TPS
                 }
 
                 // Single vs multi-target (SIB) are one process now, both starting
-                // from Eval/Opt. On a clean run (nothing missing, no errors) this
-                // closes the whole dialog right away; on missing input or a
-                // creation error it shows what's wrong and stays open.
+                // from Eval/Opt. Missing/invalid input blocks the run (alert, stays
+                // open so it can be fixed). Once generation actually runs, the
+                // dialog closes right away regardless of outcome - a creation error
+                // still shows a summary of what succeeded/failed first, then closes.
                 private void DoRccGenerateStructure()
                 {
                     RefreshRccPlan();
@@ -4826,12 +4835,12 @@ namespace VMS.TPS
                         summary.AppendLine($"Errors ({errors.Count}):");
                         foreach (var err in errors) summary.AppendLine($"  {err}");
                         MessageBox.Show(_owner, summary.ToString(), "RCC Generate Structure", MessageBoxButton.OK, MessageBoxImage.Warning);
-                        RefreshRccPlan();
                     }
-                    else
-                    {
-                        _owner.CancelDialog();
-                    }
+
+                    // Close immediately after Generate Structure runs, whether it
+                    // finished clean or with errors (the error summary above is
+                    // shown first so nothing silently fails).
+                    _owner.CancelDialog();
                 }
 
                 // ==============================================================
