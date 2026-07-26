@@ -211,6 +211,15 @@
 //               blocks the run before anything is generated and keeps the
 //               dialog open to fix it - only the post-generation branch
 //               changed.
+//   v4.7.0.0  – RCC: fixed z{target}_Rind to actually be the outer shell its
+//               own name/comments always claimed. BuildRccRind previously
+//               contracted PTV_Opt inward by RCC_RIND_INWARD_MM and
+//               subtracted that from PTV_Opt itself, producing an INNER
+//               5mm shell just inside the Opt boundary despite being
+//               documented as "outer". It now expands PTV_Opt outward by
+//               RCC_RIND_OUTWARD_MM (renamed from RCC_RIND_INWARD_MM) and
+//               subtracts the original PTV_Opt from that, so Rind is the
+//               solid 5mm shell surrounding PTV_Opt, capped to Body.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -235,8 +244,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("4.6.0.0")]
-[assembly: AssemblyFileVersion("4.6.0.0")]
+[assembly: AssemblyVersion("4.7.0.0")]
+[assembly: AssemblyFileVersion("4.7.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -280,7 +289,7 @@ namespace VMS.TPS
         private const double RCC_RING1_MIN_CROP_MM = 3.0;          // z_Ring_1 minimum crop distance
         private const double RCC_NESTED_RING_STEP_MM = 2.0;        // z_oar_in_ptv_hr# default shell thickness (used when OrganRow.NestedThicknessMm is blank/invalid)
         private const int RCC_NESTED_MAX_LEVELS = 30;               // safety cap on how many z_oar_in_ptv_hr# shells one OAR can produce
-        private const double RCC_RIND_INWARD_MM = 5.0;             // z{target}_Rind: outer shell thickness of PTV_Opt
+        private const double RCC_RIND_OUTWARD_MM = 5.0;             // z{target}_Rind: outer shell thickness of PTV_Opt
 
         private const bool SMOOTH_OPT_TARGET = true;
         private const double SMOOTH_MM = 3.0;
@@ -2847,7 +2856,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v4.6.0.0";
+                Title = "Generic Crop Structure Generator - v4.7.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
@@ -4459,10 +4468,10 @@ namespace VMS.TPS
                         rows.Add(new RccPlanRow
                         {
                             Category = "Rind (§6)",
-                            Source = $"{RccOptId(lvl.Target.TargetId)} minus itself contracted {RCC_RIND_INWARD_MM:0.#}mm",
+                            Source = $"{RccOptId(lvl.Target.TargetId)} expanded {RCC_RIND_OUTWARD_MM:0.#}mm, minus itself",
                             Zone = "-",
                             PctDiff = 0,
-                            CropMm = RCC_RIND_INWARD_MM,
+                            CropMm = RCC_RIND_OUTWARD_MM,
                             ResultId = RccRindId(lvl.Target.TargetId)
                         });
 
@@ -5211,11 +5220,11 @@ namespace VMS.TPS
                             using (var tg = new TempGuard(_ss))
                             {
                                 string rindId = RccRindId(targetId);
-                                var innerSeg = SafeMargin(optSt.SegmentVolume, -RCC_RIND_INWARD_MM);
-                                var innerSt = tg.Add(CreateTempFromSegment(_ss, innerSeg, "zRCC_RindInner"));
+                                var outerSeg = SafeMargin(optSt.SegmentVolume, +RCC_RIND_OUTWARD_MM);
+                                var outerSt = tg.Add(CreateTempFromSegment(_ss, outerSeg, "zRCC_RindOuter"));
 
-                                var rindSeg = SafeBoolean(_ss, optSt.SegmentVolume, innerSeg, BoolOp.Sub,
-                                    optSt, innerSt, rindId, fb, $"RccRind_{targetId}_Sub", tg);
+                                var rindSeg = SafeBoolean(_ss, outerSeg, optSt.SegmentVolume, BoolOp.Sub,
+                                    outerSt, optSt, rindId, fb, $"RccRind_{targetId}_Sub", tg);
                                 rindSeg = SafeBoolean(_ss, rindSeg, ext.SegmentVolume, BoolOp.And,
                                     null, ext, rindId, fb, $"RccRind_{targetId}_CapExt", tg);
 
