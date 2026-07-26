@@ -220,6 +220,13 @@
 //               RCC_RIND_OUTWARD_MM (renamed from RCC_RIND_INWARD_MM) and
 //               subtracts the original PTV_Opt from that, so Rind is the
 //               solid 5mm shell surrounding PTV_Opt, capped to Body.
+//   v4.8.0.0  – RCC: corrected z{target}_Rind again, per explicit direction
+//               ("rind = opt - 5mm margin"). v4.7.0.0's outer-shell boolean
+//               (PTV_Opt expanded 5mm, minus PTV_Opt) is replaced by a plain
+//               negative margin: Rind = PTV_Opt contracted inward by
+//               RCC_RIND_MARGIN_MM (renamed from RCC_RIND_OUTWARD_MM),
+//               capped to Body - a solid, smaller volume, not a boolean
+//               shell/ring at all.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -244,8 +251,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("4.7.0.0")]
-[assembly: AssemblyFileVersion("4.7.0.0")]
+[assembly: AssemblyVersion("4.8.0.0")]
+[assembly: AssemblyFileVersion("4.8.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -289,7 +296,7 @@ namespace VMS.TPS
         private const double RCC_RING1_MIN_CROP_MM = 3.0;          // z_Ring_1 minimum crop distance
         private const double RCC_NESTED_RING_STEP_MM = 2.0;        // z_oar_in_ptv_hr# default shell thickness (used when OrganRow.NestedThicknessMm is blank/invalid)
         private const int RCC_NESTED_MAX_LEVELS = 30;               // safety cap on how many z_oar_in_ptv_hr# shells one OAR can produce
-        private const double RCC_RIND_OUTWARD_MM = 5.0;             // z{target}_Rind: outer shell thickness of PTV_Opt
+        private const double RCC_RIND_MARGIN_MM = 5.0;              // z{target}_Rind = PTV_Opt contracted inward by this margin
 
         private const bool SMOOTH_OPT_TARGET = true;
         private const double SMOOTH_MM = 3.0;
@@ -2856,7 +2863,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v4.7.0.0";
+                Title = "Generic Crop Structure Generator - v4.8.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
@@ -4462,16 +4469,16 @@ namespace VMS.TPS
                             ResultId = sh.ResultId
                         });
 
-                    // Step 6: Rind = outer 5mm shell of each target's final PTV_Opt
+                    // Step 6: Rind = each target's final PTV_Opt contracted inward
                     // (post-shave boundary for targets shaved in Step 5 above).
                     foreach (var lvl in _rccPlan.Ring1Levels)
                         rows.Add(new RccPlanRow
                         {
                             Category = "Rind (§6)",
-                            Source = $"{RccOptId(lvl.Target.TargetId)} expanded {RCC_RIND_OUTWARD_MM:0.#}mm, minus itself",
+                            Source = $"{RccOptId(lvl.Target.TargetId)} contracted {RCC_RIND_MARGIN_MM:0.#}mm",
                             Zone = "-",
                             PctDiff = 0,
-                            CropMm = RCC_RIND_OUTWARD_MM,
+                            CropMm = RCC_RIND_MARGIN_MM,
                             ResultId = RccRindId(lvl.Target.TargetId)
                         });
 
@@ -4832,7 +4839,7 @@ namespace VMS.TPS
                     // SMOOTH_MM remain in use by the separate Generic/Breast Opto
                     // pipeline only.
 
-                    // Step 6: Rind = outer 5mm shell of each target's FINAL PTV_Opt.
+                    // Step 6: Rind = each target's FINAL PTV_Opt contracted inward.
                     BuildRccRind(optByTarget, ext, created, errors);
 
                     if (errors.Count > 0)
@@ -5201,11 +5208,11 @@ namespace VMS.TPS
                     }
                 }
 
-                // Step 6: Rind = the outer 5mm shell of each target's final PTV_Opt
-                // boundary (PTV_Opt minus PTV_Opt contracted 5mm inward). optByTarget
-                // already reflects the OAR-crop and (if applicable) SIB-shave state
-                // since both are applied in place, so this always reads the final
-                // boundary regardless of how many targets are ticked.
+                // Step 6: Rind = each target's final PTV_Opt contracted inward by
+                // RCC_RIND_MARGIN_MM (a plain negative margin, not a boolean shell).
+                // optByTarget already reflects the OAR-crop and (if applicable)
+                // SIB-shave state since both are applied in place, so this always
+                // reads the final boundary regardless of how many targets are ticked.
                 private void BuildRccRind(
                     Dictionary<string, Structure> finalOptByTarget, Structure ext,
                     List<string> created, List<string> errors)
@@ -5220,13 +5227,9 @@ namespace VMS.TPS
                             using (var tg = new TempGuard(_ss))
                             {
                                 string rindId = RccRindId(targetId);
-                                var outerSeg = SafeMargin(optSt.SegmentVolume, +RCC_RIND_OUTWARD_MM);
-                                var outerSt = tg.Add(CreateTempFromSegment(_ss, outerSeg, "zRCC_RindOuter"));
-
-                                var rindSeg = SafeBoolean(_ss, outerSeg, optSt.SegmentVolume, BoolOp.Sub,
-                                    outerSt, optSt, rindId, fb, $"RccRind_{targetId}_Sub", tg);
+                                var rindSeg = SafeMargin(optSt.SegmentVolume, -RCC_RIND_MARGIN_MM);
                                 rindSeg = SafeBoolean(_ss, rindSeg, ext.SegmentVolume, BoolOp.And,
-                                    null, ext, rindId, fb, $"RccRind_{targetId}_CapExt", tg);
+                                    optSt, ext, rindId, fb, $"RccRind_{targetId}_CapExt", tg);
 
                                 var st = GetOrCreate(_ss, "CONTROL", rindId);
                                 EnsureRccHighRes(st);
