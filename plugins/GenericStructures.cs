@@ -148,7 +148,13 @@ namespace VMS.TPS
         // RCC LOGIC ENGINE CONFIG
         // "PTV Cropping & Optimization Formulas" clinical cheat sheet, v1.0
         // ---------------------------------------------------------------
-        private const double RCC_ZONE_A_DEFAULT_PCT_PER_MM = 10.0; // High-priority OAR max-dose crop falloff
+        // Zone A splits by OAR size per the cheat sheet's own note ("Falloff:
+        // 10%/mm small volumes - 5%/mm large"): a small/critical OAR gets the
+        // steeper (higher %/mm) rate, a large OAR the shallower one (which
+        // yields a bigger crop for the same %Diff). Selected per-row via
+        // OrganRow.IsSmallOrgan/IsLargeOrgan.
+        private const double RCC_ZONE_A_SMALL_DEFAULT_PCT_PER_MM = 10.0; // small/critical OAR max-dose crop falloff
+        private const double RCC_ZONE_A_LARGE_DEFAULT_PCT_PER_MM = 5.0;  // large OAR max-dose crop falloff
         private const double RCC_ZONE_B_DEFAULT_PCT_PER_MM = 5.0;  // SIB shave / z-ring sib1 falloff
         private const double RCC_ZONE_C_DEFAULT_PCT_PER_MM = 2.7;  // z-ring sib2 (far-target) falloff
         private const double RCC_RING1_ISO_FRACTION = 0.85;        // z-ring sib1 target = 85% x lowest ticked Rx
@@ -2220,8 +2226,9 @@ namespace VMS.TPS
                         CreatePrv = false,
                         PrvMarginMm = DEFAULT_PRV_MARGIN_MM.ToString(
                                             "0.###", System.Globalization.CultureInfo.InvariantCulture),
-                        CropMaxDose = false,
                         MaxDoseGy = "",
+                        IsSmallOrgan = false,
+                        IsLargeOrgan = false,
                         NestedSparing = false
                     });
                 }
@@ -2290,8 +2297,9 @@ namespace VMS.TPS
             // Shared onto the same OrganRow used by the Generic/Breast Opto tabs
             // so all three tabs bind to one row type. Unused (default) outside
             // the RCC tab.
-            private bool _cropMaxDose;
             private string _maxDoseGy;
+            private bool _isSmallOrgan;
+            private bool _isLargeOrgan;
             private bool _nestedSparing;
 
             public string OarId { get; set; }
@@ -2320,11 +2328,8 @@ namespace VMS.TPS
                 System.Globalization.NumberStyles.Any,
                 System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : (double?)null;
 
-            public bool CropMaxDose
-            {
-                get => _cropMaxDose;
-                set { if (_cropMaxDose != value) { _cropMaxDose = value; OnPC(nameof(CropMaxDose)); } }
-            }
+            // Whether this OAR participates in the Zone A max-dose crop is now
+            // driven purely by whether MaxDoseGy has a value (no separate tick).
             public string MaxDoseGy
             {
                 get => _maxDoseGy;
@@ -2333,6 +2338,34 @@ namespace VMS.TPS
             public double? ParsedMaxDoseGy => double.TryParse(_maxDoseGy,
                 System.Globalization.NumberStyles.Any,
                 System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : (double?)null;
+
+            // Small/Large select which Zone A falloff rate applies to this OAR's
+            // max-dose crop (small = higher %/mm, large = lower %/mm -> bigger
+            // crop for the same %Diff). Mutually exclusive - ticking one clears
+            // the other, enforced here so it holds regardless of which column
+            // (or the header bulk-tick) changed it.
+            public bool IsSmallOrgan
+            {
+                get => _isSmallOrgan;
+                set
+                {
+                    if (_isSmallOrgan == value) return;
+                    _isSmallOrgan = value;
+                    OnPC(nameof(IsSmallOrgan));
+                    if (value && _isLargeOrgan) { _isLargeOrgan = false; OnPC(nameof(IsLargeOrgan)); }
+                }
+            }
+            public bool IsLargeOrgan
+            {
+                get => _isLargeOrgan;
+                set
+                {
+                    if (_isLargeOrgan == value) return;
+                    _isLargeOrgan = value;
+                    OnPC(nameof(IsLargeOrgan));
+                    if (value && _isSmallOrgan) { _isSmallOrgan = false; OnPC(nameof(IsSmallOrgan)); }
+                }
+            }
             public bool NestedSparing
             {
                 get => _nestedSparing;
@@ -2350,7 +2383,7 @@ namespace VMS.TPS
         // (ComputeRccPlan) in SiteTabController below. They reference the same
         // TargetDoseRow / OrganRow classes used by the Generic and Breast Opto
         // tabs, since RCC now ticks/edits targets and OARs through the same
-        // grids (RCC uses TargetDoseRow.DoseGy as "Rx" and adds CropMaxDose /
+        // grids (RCC uses TargetDoseRow.DoseGy as "Rx" and adds MaxDoseGy /
         // MaxDoseGy / NestedSparing on OrganRow above).
         // ==================================================================
         private sealed class RccPlanRow
@@ -2776,6 +2809,10 @@ namespace VMS.TPS
                 Close();
             }
 
+            // Closes without confirming (Cancel buttons on every tab), and also
+            // used by RCC's Generate Structure button on a clean success - RCC
+            // builds its structures directly rather than through NotifyConfirmed,
+            // so "close the dialog" and "cancel the dialog" are the same call here.
             internal void CancelDialog()
             {
                 DialogResult = false;
@@ -2941,7 +2978,7 @@ namespace VMS.TPS
                 // ---- RCC-only state ----
                 private RccPlan _rccPlan;
                 private DataGrid _dgRccMatrix, _dgRccPlan;
-                private TextBox _txtRccZoneA, _txtRccZoneB, _txtRccZoneC;
+                private TextBox _txtRccZoneASmall, _txtRccZoneALarge, _txtRccZoneB, _txtRccZoneC;
 
                 public UIElement RootElement { get; }
 
@@ -3086,17 +3123,28 @@ namespace VMS.TPS
                     return topBar;
                 }
 
-                // RCC-only: falloff zone-rate inputs (A/B/C), shown below the
-                // Targets grid rather than in the top bar so the top bar stays
-                // identical across all three tabs.
+                // RCC-only: falloff zone-rate inputs, shown below the Targets grid
+                // (rather than in the top bar, so the top bar stays identical
+                // across all three tabs) as their own stacked, titled section.
+                // Zone A is split small/large (per-OAR choice via the Organs
+                // grid's Small/Large columns); B/C are the SIB-shave/ring rates.
                 private UIElement BuildRccFalloffZonePanel()
                 {
-                    var zoneBar = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 10, 0, 0) };
-                    zoneBar.Children.Add(new TextBlock { Text = "Falloff zones:", FontWeight = FontWeights.Bold, VerticalAlignment = VerticalAlignment.Center });
-                    _txtRccZoneA = AddRateInput(zoneBar, "A – OAR max-dose (%/mm):", RCC_ZONE_A_DEFAULT_PCT_PER_MM);
-                    _txtRccZoneB = AddRateInput(zoneBar, "B – SIB / ring1 (%/mm):", RCC_ZONE_B_DEFAULT_PCT_PER_MM);
-                    _txtRccZoneC = AddRateInput(zoneBar, "C – ring2 (%/mm):", RCC_ZONE_C_DEFAULT_PCT_PER_MM);
-                    return zoneBar;
+                    var section = new StackPanel { Orientation = Orientation.Vertical };
+                    section.Children.Add(new TextBlock
+                    {
+                        Text = "FALLOFF ZONE",
+                        FontWeight = FontWeights.Bold,
+                        Foreground = (Brush)_owner.FindResource("TextSecondary"),
+                        Margin = new Thickness(0, 0, 0, 8)
+                    });
+
+                    _txtRccZoneASmall = AddRateRow(section, "Zone A - small organ (%/mm):", RCC_ZONE_A_SMALL_DEFAULT_PCT_PER_MM);
+                    _txtRccZoneALarge = AddRateRow(section, "Zone A - large organ (%/mm):", RCC_ZONE_A_LARGE_DEFAULT_PCT_PER_MM);
+                    _txtRccZoneB = AddRateRow(section, "Zone B - SIB / ring1 (%/mm):", RCC_ZONE_B_DEFAULT_PCT_PER_MM);
+                    _txtRccZoneC = AddRateRow(section, "Zone C - ring2 (%/mm):", RCC_ZONE_C_DEFAULT_PCT_PER_MM);
+
+                    return _owner.CreateCard(section);
                 }
 
                 // Laterality + Physical Bolus row, shown in the left Targets
@@ -3308,8 +3356,16 @@ namespace VMS.TPS
                             (r, v) => r.CreateAvoidance = v, nameof(TargetDoseRow.CreateAvoidance), 85, UpdateStructureCount);
                     }
 
+                    // DockPanel stacks same-side children from the outside in, so
+                    // among the Bottom-docked items the FIRST one added ends up
+                    // outermost (bottom-most). Add the matrix first so it sits below
+                    // the falloff-zone section, which sits below the Targets grid.
                     if (IsRcc)
                     {
+                        var matrixPanel = BuildRccCropDistanceMatrixPanel();
+                        DockPanel.SetDock(matrixPanel, Dock.Bottom);
+                        leftPanel.Children.Add(matrixPanel);
+
                         var zonePanel = BuildRccFalloffZonePanel();
                         DockPanel.SetDock(zonePanel, Dock.Bottom);
                         leftPanel.Children.Add(zonePanel);
@@ -3319,14 +3375,42 @@ namespace VMS.TPS
                     return leftPanel;
                 }
 
-                // --- RIGHT: OAR/ORGANS (+ RCC matrix / advanced plan) ---
+                // RCC-only: the read-only "Crop Distance Matrix" (one row per OAR
+                // with a Max Dose, one column per ticked target), shown below the
+                // Targets section rather than in the OAR panel so the Organs grid
+                // can fill the whole right-hand panel instead.
+                private UIElement BuildRccCropDistanceMatrixPanel()
+                {
+                    var section = new StackPanel { Orientation = Orientation.Vertical, Margin = new Thickness(0, 10, 0, 0) };
+                    section.Children.Add(new TextBlock
+                    {
+                        Text = "CROP DISTANCE (auto, from Rx & Max Dose)",
+                        FontWeight = FontWeights.Bold,
+                        Foreground = (Brush)_owner.FindResource("TextSecondary"),
+                        Margin = new Thickness(0, 0, 0, 8)
+                    });
+
+                    _dgRccMatrix = new DataGrid
+                    {
+                        AutoGenerateColumns = false,
+                        CanUserAddRows = false,
+                        IsReadOnly = true,
+                        HeadersVisibility = DataGridHeadersVisibility.Column,
+                        MaxHeight = 220
+                    };
+                    section.Children.Add(_dgRccMatrix);
+
+                    return _owner.CreateCard(section);
+                }
+
+                // --- RIGHT: OAR/ORGANS (+ RCC advanced plan) ---
                 private UIElement BuildRightPanel()
                 {
                     var rightPanel = new DockPanel();
                     var rightHeader = new TextBlock
                     {
                         Text = IsRcc
-                            ? "OARs  (tick + Max Dose for auto-crop; tick Nested for §7 sparing)"
+                            ? "OARs  (enter Max Dose to auto-crop; tick Small/Large for falloff zone; tick Nested for §7)"
                             : "ORGANS  (tick what to create per organ)",
                         FontWeight = FontWeights.Bold,
                         Foreground = (Brush)_owner.FindResource("AccentBlue"),
@@ -3342,8 +3426,7 @@ namespace VMS.TPS
                         CanUserDeleteRows = false,
                         SelectionMode = DataGridSelectionMode.Extended,
                         ItemsSource = _vm.OrganRows,
-                        CellStyle = _singleClickCellStyle,
-                        MaxHeight = IsRcc ? 200 : double.PositiveInfinity
+                        CellStyle = _singleClickCellStyle
                     };
 
                     if (!IsRcc)
@@ -3384,9 +3467,8 @@ namespace VMS.TPS
 
                     if (IsRcc)
                     {
-                        AddBoolColumn(_dgOrgans, _vm.OrganRows, "Crop",
-                            (r, v) => r.CropMaxDose = v, nameof(OrganRow.CropMaxDose), 65, RefreshRccPlan);
-
+                        // No separate "Crop" tick - an OAR is included the moment a
+                        // valid Max Dose is entered (confirmed by the number itself).
                         _dgOrgans.Columns.Add(new DataGridTextColumn
                         {
                             Header = "Max Dose (Gy)",
@@ -3395,6 +3477,14 @@ namespace VMS.TPS
                             ElementStyle = _inputTextBlockStyle,
                             EditingElementStyle = _inputTextBoxStyle
                         });
+
+                        // Small/Large pick which Zone A rate applies to this OAR
+                        // (mutually exclusive - enforced on OrganRow itself).
+                        AddBoolColumn(_dgOrgans, _vm.OrganRows, "Small",
+                            (r, v) => r.IsSmallOrgan = v, nameof(OrganRow.IsSmallOrgan), 65, RefreshRccPlan);
+
+                        AddBoolColumn(_dgOrgans, _vm.OrganRows, "Large",
+                            (r, v) => r.IsLargeOrgan = v, nameof(OrganRow.IsLargeOrgan), 65, RefreshRccPlan);
 
                         AddBoolColumn(_dgOrgans, _vm.OrganRows, "Nested §7",
                             (r, v) => r.NestedSparing = v, nameof(OrganRow.NestedSparing), 90, RefreshRccPlan);
@@ -3420,50 +3510,37 @@ namespace VMS.TPS
                         });
                     }
 
-                    rightPanel.Children.Add(_dgOrgans);
-
                     if (IsRcc)
                     {
-                        DockPanel.SetDock(_dgOrgans, Dock.Top);
-
-                        var matrixHeader = new TextBlock
-                        {
-                            Text = "Crop distance (auto, from Rx & Max Dose):",
-                            FontWeight = FontWeights.Bold,
-                            Margin = new Thickness(0, 10, 0, 4)
-                        };
-                        DockPanel.SetDock(matrixHeader, Dock.Top);
-                        rightPanel.Children.Add(matrixHeader);
-
-                        _dgRccMatrix = new DataGrid
-                        {
-                            AutoGenerateColumns = false,
-                            CanUserAddRows = false,
-                            IsReadOnly = true,
-                            HeadersVisibility = DataGridHeadersVisibility.Column,
-                            MaxHeight = 220
-                        };
-                        rightPanel.Children.Add(_dgRccMatrix);
-
+                        // Organs and the Advanced plan preview share the same Grid
+                        // cell (only one Visible at a time, toggled by SwitchMode) so
+                        // whichever is showing fills all remaining right-panel space
+                        // - a plain DockPanel "last child fills" rule only applies to
+                        // the literal last child, not whichever sibling is visible.
                         _dgRccPlan = new DataGrid
                         {
                             AutoGenerateColumns = false,
                             CanUserAddRows = false,
                             IsReadOnly = true,
                             HeadersVisibility = DataGridHeadersVisibility.Column,
-                            MaxHeight = 220,
                             Visibility = Visibility.Collapsed
                         };
-                        _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "Step", Binding = new Binding("Category"), Width = 120, ElementStyle = (Style)_owner.FindResource(typeof(TextBlock)) });
+                        _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "Step", Binding = new Binding("Category"), Width = 150, ElementStyle = (Style)_owner.FindResource(typeof(TextBlock)) });
                         _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "Source", Binding = new Binding("Source"), Width = new DataGridLength(1, DataGridLengthUnitType.Star), ElementStyle = (Style)_owner.FindResource(typeof(TextBlock)) });
                         _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "Zone", Binding = new Binding("Zone"), Width = 45, ElementStyle = (Style)_owner.FindResource(typeof(TextBlock)) });
                         _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "%Diff", Binding = new Binding("PctDiff") { StringFormat = "0.00" }, Width = 65, ElementStyle = (Style)_owner.FindResource(typeof(TextBlock)) });
                         _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "Crop (mm)", Binding = new Binding("CropMm") { StringFormat = "0.00" }, Width = 80, ElementStyle = (Style)_owner.FindResource(typeof(TextBlock)) });
                         _dgRccPlan.Columns.Add(new DataGridTextColumn { Header = "Result ID", Binding = new Binding("ResultId"), Width = 130, ElementStyle = (Style)_owner.FindResource(typeof(TextBlock)) });
-                        rightPanel.Children.Add(_dgRccPlan);
+
+                        var toggleArea = new Grid();
+                        toggleArea.Children.Add(_dgOrgans);
+                        toggleArea.Children.Add(_dgRccPlan);
+                        rightPanel.Children.Add(toggleArea);
                     }
                     else
                     {
+                        rightPanel.Children.Add(_dgOrgans);
+
                         _dgCrop = new DataGrid
                         {
                             AutoGenerateColumns = false,
@@ -3506,7 +3583,7 @@ namespace VMS.TPS
                         foreach (var r in _vm.OrganRows)
                         {
                             r.CreateOvl = false; r.CreateOpt = false; r.CreatePrv = false;
-                            r.CropMaxDose = false; r.MaxDoseGy = ""; r.NestedSparing = false;
+                            r.MaxDoseGy = ""; r.IsSmallOrgan = false; r.IsLargeOrgan = false; r.NestedSparing = false;
                         }
                         foreach (var r in _vm.TargetDoseRows) { r.IsSelected = false; r.CreateAvoidance = false; r.BolusMm = ""; }
                         if (_cropRows != null) { foreach (var r in _cropRows) r.IsTicked = false; _dgCrop?.Items.Refresh(); }
@@ -3518,7 +3595,7 @@ namespace VMS.TPS
 
                     if (IsRcc)
                     {
-                        _btnAutoCrop = new Button { Content = "Auto-Crop PTVs from OARs", Padding = new Thickness(20, 8, 20, 8), Margin = new Thickness(0, 0, 6, 0) };
+                        _btnAutoCrop = new Button { Content = "Generate Structure", Padding = new Thickness(20, 8, 20, 8), Margin = new Thickness(0, 0, 6, 0) };
                         _btnAutoCrop.SetResourceReference(FrameworkElement.StyleProperty, "PrimaryButton");
                         _btnAutoCrop.Click += (s, e) => DoRccAutoCrop();
                         buttonPanel.Children.Add(_btnAutoCrop);
@@ -3562,8 +3639,12 @@ namespace VMS.TPS
                 {
                     if (IsRcc)
                     {
-                        _dgOrgans.Visibility = Visibility.Visible;
-                        _dgRccMatrix.Visibility = secondMode ? Visibility.Collapsed : Visibility.Visible;
+                        // Organs and the Advanced plan preview share one Grid cell
+                        // (see BuildRightPanel) - toggling Visibility here is enough
+                        // for whichever is shown to fill it. The Crop Distance Matrix
+                        // lives under the Targets section now and stays visible in
+                        // both modes.
+                        _dgOrgans.Visibility = secondMode ? Visibility.Collapsed : Visibility.Visible;
                         _dgRccPlan.Visibility = secondMode ? Visibility.Visible : Visibility.Collapsed;
                         _btnAutoCrop.Visibility = secondMode ? Visibility.Collapsed : Visibility.Visible;
                         _btnAdvCreate.Visibility = secondMode ? Visibility.Visible : Visibility.Collapsed;
@@ -4073,26 +4154,30 @@ namespace VMS.TPS
                 // ==================================================================
                 // RCC ENGINE — "RCC Optimization Cropping Method" cheat-sheet formulas.
                 // Reads Rx from TargetDoseRow (IsSelected + DoseGy) and Max Dose /
-                // Nested-sparing from OrganRow (CropMaxDose + MaxDoseGy + NestedSparing),
+                // Nested-sparing from OrganRow (MaxDoseGy + IsSmallOrgan/IsLargeOrgan + NestedSparing),
                 // i.e. the exact same rows ticked in the shared grids above.
                 // ==================================================================
 
-                private TextBox AddRateInput(StackPanel parent, string label, double defaultValue)
+                // One stacked "label: [rate]" row, used to build the FALLOFF ZONE
+                // section (one row per zone) instead of laying the rates out inline.
+                private TextBox AddRateRow(StackPanel parent, string label, double defaultValue)
                 {
-                    parent.Children.Add(new TextBlock
+                    var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 6) };
+                    row.Children.Add(new TextBlock
                     {
                         Text = label,
                         VerticalAlignment = VerticalAlignment.Center,
-                        Margin = new Thickness(12, 0, 4, 0)
+                        Width = 190
                     });
                     var tb = new TextBox
                     {
                         Text = defaultValue.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture),
-                        Width = 50,
+                        Width = 60,
                         VerticalAlignment = VerticalAlignment.Center
                     };
                     tb.LostFocus += (s, e) => RefreshRccPlan();
-                    parent.Children.Add(tb);
+                    row.Children.Add(tb);
+                    parent.Children.Add(row);
                     return tb;
                 }
 
@@ -4232,15 +4317,19 @@ namespace VMS.TPS
                 // "-" if that OAR's Max Dose does not require sparing this target's Rx).
                 private void RefreshRccMatrix()
                 {
-                    double zoneA = ParseRateOrDefault(_txtRccZoneA, RCC_ZONE_A_DEFAULT_PCT_PER_MM);
+                    double zoneASmall = ParseRateOrDefault(_txtRccZoneASmall, RCC_ZONE_A_SMALL_DEFAULT_PCT_PER_MM);
+                    double zoneALarge = ParseRateOrDefault(_txtRccZoneALarge, RCC_ZONE_A_LARGE_DEFAULT_PCT_PER_MM);
                     var tickedTargets = _vm.TargetDoseRows
                         .Where(r => r.IsSelected && r.ParsedDoseGy.HasValue && r.ParsedDoseGy.Value > 0)
                         .ToList();
-                    var tickedOars = _vm.OrganRows.Where(r => r.CropMaxDose).ToList();
+                    // An OAR is included the moment it has a valid Max Dose - no
+                    // separate tick anymore.
+                    var tickedOars = _vm.OrganRows.Where(r => r.ParsedMaxDoseGy.HasValue).ToList();
 
                     var matrixRows = new List<RccMatrixRow>();
                     foreach (var oar in tickedOars)
                     {
+                        double zoneA = oar.IsLargeOrgan ? zoneALarge : zoneASmall;
                         var row = new RccMatrixRow
                         {
                             OarId = oar.OarId,
@@ -4306,7 +4395,8 @@ namespace VMS.TPS
                 private RccPlan ComputeRccPlan()
                 {
                     var plan = new RccPlan();
-                    double zoneA = ParseRateOrDefault(_txtRccZoneA, RCC_ZONE_A_DEFAULT_PCT_PER_MM);
+                    double zoneASmall = ParseRateOrDefault(_txtRccZoneASmall, RCC_ZONE_A_SMALL_DEFAULT_PCT_PER_MM);
+                    double zoneALarge = ParseRateOrDefault(_txtRccZoneALarge, RCC_ZONE_A_LARGE_DEFAULT_PCT_PER_MM);
                     double zoneB = ParseRateOrDefault(_txtRccZoneB, RCC_ZONE_B_DEFAULT_PCT_PER_MM);
                     double zoneC = ParseRateOrDefault(_txtRccZoneC, RCC_ZONE_C_DEFAULT_PCT_PER_MM);
 
@@ -4314,9 +4404,11 @@ namespace VMS.TPS
                         .Where(r => r.IsSelected && r.ParsedDoseGy.HasValue && r.ParsedDoseGy.Value > 0)
                         .ToList();
 
-                    // Section 2: zPTV Opti (strict Max-Dose OAR sparing crop), Zone A.
-                    foreach (var oar in _vm.OrganRows.Where(o => o.CropMaxDose && o.ParsedMaxDoseGy.HasValue))
+                    // Section 2: zPTV Opti (strict Max-Dose OAR sparing crop), Zone A
+                    // (small-organ or large-organ rate, per that OAR's own tick).
+                    foreach (var oar in _vm.OrganRows.Where(o => o.ParsedMaxDoseGy.HasValue))
                     {
+                        double zoneA = oar.IsLargeOrgan ? zoneALarge : zoneASmall;
                         foreach (var t in selTargets)
                         {
                             double rx = t.ParsedDoseGy.Value;
@@ -4421,14 +4513,16 @@ namespace VMS.TPS
                             missing.Add("Rx (Gy) for: " + string.Join(", ", badRx));
                     }
 
-                    var tickedOars = _vm.OrganRows.Where(r => r.CropMaxDose).ToList();
-                    if (tickedOars.Count == 0)
+                    // An OAR participates the moment a Max Dose is entered - no
+                    // separate tick anymore, so "ticked" here means "typed something".
+                    var enteredOars = _vm.OrganRows.Where(r => !string.IsNullOrWhiteSpace(r.MaxDoseGy)).ToList();
+                    if (enteredOars.Count == 0)
                     {
-                        missing.Add("At least one ticked OAR (Crop column)");
+                        missing.Add("At least one OAR Max Dose (Gy)");
                     }
                     else
                     {
-                        var badMax = tickedOars
+                        var badMax = enteredOars
                             .Where(r => !r.ParsedMaxDoseGy.HasValue || r.ParsedMaxDoseGy.Value <= 0)
                             .Select(r => r.OarId).ToList();
                         if (badMax.Count > 0)
@@ -4458,7 +4552,7 @@ namespace VMS.TPS
                     if (plan.MaxDoseCrops.Count == 0)
                     {
                         MessageBox.Show(_owner,
-                            "Nothing to crop – every ticked OAR's Max Dose already meets or exceeds its ticked target(s)' Rx.",
+                            "Nothing to crop – every entered OAR Max Dose already meets or exceeds its ticked target(s)' Rx.",
                             "Nothing to crop", MessageBoxButton.OK, MessageBoxImage.Information);
                         return;
                     }
@@ -4516,10 +4610,11 @@ namespace VMS.TPS
                     }
 
                     // Required input was validated up front, so a clean run (no
-                    // errors) needs no further acknowledgement from the user -
-                    // just refresh the plan/matrix in place. Only pop up when
-                    // something still went wrong during creation (e.g. a ticked
-                    // structure was deleted from the set after ticking).
+                    // errors) closes the whole window right away - nothing left to
+                    // fix, no reason to make the user dismiss a popup and then close
+                    // it themselves. Only stay open when something went wrong during
+                    // creation (e.g. a ticked structure was deleted from the set
+                    // after ticking) so the user can see what needs attention.
                     if (errors.Count > 0)
                     {
                         var summary = new StringBuilder();
@@ -4529,9 +4624,12 @@ namespace VMS.TPS
                         summary.AppendLine($"Errors ({errors.Count}):");
                         foreach (var err in errors) summary.AppendLine($"  {err}");
                         MessageBox.Show(_owner, summary.ToString(), "RCC Auto-Crop", MessageBoxButton.OK, MessageBoxImage.Warning);
+                        RefreshRccPlan();
                     }
-
-                    RefreshRccPlan();
+                    else
+                    {
+                        _owner.CancelDialog();
+                    }
                 }
 
                 // ==============================================================
