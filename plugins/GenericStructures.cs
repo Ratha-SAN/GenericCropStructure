@@ -317,6 +317,24 @@
 //                   formula entirely; GENERIC_AVOIDANCE_EXTRA_MM is gone,
 //                   replaced by GENERIC_AVOIDANCE_SUM_MARGIN_MM (30mm) and
 //                   GENERIC_AVOIDANCE_ISO_FRACTION (0.5).
+//   v5.3.0.0  – Generic: zRing_{dose} rebuilt to literally match RCC's own
+//               ring construction (SiteTabController.BuildRccRing1), per
+//               explicit direction to reuse the RCC ring pipeline. The
+//               script's completion log reported zRing_60 as created
+//               successfully, yet it wasn't showing up afterward - the
+//               concrete difference found versus RCC's own rings: Generic's
+//               ring was capped to Body-3mm (extMinus3), while RCC's own
+//               Ring1/Ring2 are capped to the FULL Body. For a PTV close to
+//               the skin, that extra 3mm contraction can shrink the ring
+//               band to nothing (or next-to-nothing) even though the
+//               boolean ops technically still "succeed". Step9_Rings_Generic
+//               now uses RCC's exact technique - base = PTV_Opt expanded by
+//               the (still fixed, single-target) 3mm gap, outer = base
+//               expanded by the 10mm ring thickness, ring = outer minus
+//               base, capped to the full Body, and forced to high
+//               resolution via EnsureRccHighRes (moved from
+//               SiteTabController up to Script level, alongside
+//               RccPctDiff/RccCropMm, so StructureProcessor can call it).
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -341,8 +359,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.2.0.0")]
-[assembly: AssemblyFileVersion("5.2.0.0")]
+[assembly: AssemblyVersion("5.3.0.0")]
+[assembly: AssemblyFileVersion("5.3.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -403,6 +421,17 @@ namespace VMS.TPS
 
         private static double RccCropMm(double pctDiff, double falloffRatePctPerMm) =>
             falloffRatePctPerMm > 0 ? pctDiff / falloffRatePctPerMm : 0.0;
+
+        // Every RCC-created/updated structure (and, since v5.3.0.0, Generic's
+        // own zRing_{dose}) is forced to high resolution regardless of the
+        // source structures' own resolution, for finer geometric fidelity in
+        // the final crops - unlike the rest of the codebase's
+        // ConvertToHighResolution calls, which only match an operand's
+        // resolution when needed for a boolean op to succeed.
+        private static void EnsureRccHighRes(Structure st)
+        {
+            if (st != null && !st.IsHighResolution) st.ConvertToHighResolution();
+        }
 
         private const bool SMOOTH_OPT_TARGET = true;
         private const double SMOOTH_MM = 3.0;
@@ -743,7 +772,7 @@ namespace VMS.TPS
                         if (isGeneric)
                         {
                             RunStep("9) zRing_{dose} (highest-dose PTV only)",
-                                () => Step9_Rings_Generic(groupKeys, selectedExternal, extMinus3));
+                                () => Step9_Rings_Generic(groupKeys, selectedExternal));
                             RunStep("10) z_Rind_{dose}",
                                 () => Step10_Rind_Generic(groupKeys, selectedExternal));
                         }
@@ -2005,13 +2034,19 @@ namespace VMS.TPS
 
             // ------------------------------------------------------------------
             // STEP 9 (Generic tab only): a single zRing_{dose} around the
-            // highest-dose target's z_PTV_opt only - RING_OUTER_EXPAND_MM
-            // (10mm) thick, starting a fixed GENERIC_RING_GAP_MM (3mm) away
-            // from that PTV_Opt, capped to Body-3mm. No lower-dose rings, no
-            // 2nd ring - just the one ring the highest-dose target gets.
+            // highest-dose target's z_PTV_opt only, built with the exact same
+            // technique as RCC's own BuildRccRing1 (SiteTabController) -
+            // base = PTV_Opt expanded by the gap, outer = base expanded by
+            // the ring thickness, ring = outer minus base, capped to the FULL
+            // Body (not Body-3mm - RCC's own rings are never given that extra
+            // 3mm contraction, so a PTV close to skin doesn't get its ring
+            // clipped away entirely), forced to high resolution like RCC's
+            // own output. Only the gap is different: a fixed
+            // GENERIC_RING_GAP_MM (3mm) instead of RCC's formula-derived one,
+            // since there's only ever one target here. No lower-dose rings,
+            // no 2nd ring - just the one ring the highest-dose target gets.
             // ------------------------------------------------------------------
-            private void Step9_Rings_Generic(
-                List<OptKey> groupKeys, Structure ext, SegmentVolume extMinus3)
+            private void Step9_Rings_Generic(List<OptKey> groupKeys, Structure ext)
             {
                 LogSection("9) zRing_{dose} (highest-dose PTV only)");
                 if (groupKeys.Count == 0) return;
@@ -2039,19 +2074,19 @@ namespace VMS.TPS
                             return;
                         }
 
-                        var innerSeg = SafeMargin(baseSt.SegmentVolume, +GENERIC_RING_GAP_MM);
-                        var innerSt = tg.Add(CreateTempFromSegment(_ss, innerSeg, "zTmpRingInner"));
+                        var baseSeg = SafeMargin(baseSt.SegmentVolume, +GENERIC_RING_GAP_MM);
+                        var outerSeg = SafeMargin(baseSeg, +RING_OUTER_EXPAND_MM);
+                        var baseSegSt = tg.Add(CreateTempFromSegment(_ss, baseSeg, "zTmpRingBase"));
 
-                        var outerSeg = SafeMargin(baseSt.SegmentVolume, +(GENERIC_RING_GAP_MM + RING_OUTER_EXPAND_MM));
-
-                        var ringSeg = SafeBoolean(_ss, outerSeg, innerSeg, BoolOp.Sub,
-                                            null, innerSt, ringId, _fb, $"Ring_{doseStr}_OuterMinusInner", tg);
-                        ringSeg = SafeBoolean(_ss, ringSeg, extMinus3, BoolOp.And,
-                                            null, ext, ringId, _fb, $"Ring_{doseStr}_CapExtMinus3", tg);
+                        var ringSeg = SafeBoolean(_ss, outerSeg, baseSeg, BoolOp.Sub,
+                                            null, baseSegSt, ringId, _fb, $"Ring_{doseStr}_OuterMinusBase", tg);
+                        ringSeg = SafeBoolean(_ss, ringSeg, ext.SegmentVolume, BoolOp.And,
+                                            null, ext, ringId, _fb, $"Ring_{doseStr}_CapExt", tg);
 
                         if (ringSeg != null)
                         {
                             var ring = GetOrCreate(_ss, "CONTROL", ringId);
+                            EnsureRccHighRes(ring);
                             if (AssignSegmentSafely(ring, ringSeg))
                             {
                                 ring.Color = Colors.Magenta;
@@ -2065,7 +2100,7 @@ namespace VMS.TPS
                         }
                         else
                         {
-                            _progress.AppendLine($"  SKIP: {ringId} (outer-minus-inner or Body-3mm cap left nothing)");
+                            _progress.AppendLine($"  SKIP: {ringId} (outer-minus-base or Body cap left nothing)");
                         }
                     }
                 }
@@ -3251,7 +3286,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.2.0.0";
+                Title = "Generic Crop Structure Generator - v5.3.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
@@ -4774,16 +4809,6 @@ namespace VMS.TPS
                 // (level 1 = nearest the OAR surface), unioned across every ticked
                 // target that OAR overlaps - see BuildRccNestedShells.
                 private static string RccNestedShellId(string oarId, int level) => TruncId($"z_{oarId}_in_ptv_hr{level}");
-
-                // Every RCC-created/updated structure is forced to high resolution
-                // regardless of the source structures' own resolution, for finer
-                // geometric fidelity in the final crops - unlike the rest of the
-                // codebase's ConvertToHighResolution calls, which only match an
-                // operand's resolution when needed for a boolean op to succeed.
-                private static void EnsureRccHighRes(Structure st)
-                {
-                    if (st != null && !st.IsHighResolution) st.ConvertToHighResolution();
-                }
 
                 // Recomputes the RCC plan from current ticks/Rx/MaxDose/zone-rate
                 // inputs and repopulates the crop-distance matrix and the advanced
