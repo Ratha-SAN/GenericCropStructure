@@ -335,6 +335,31 @@
 //               resolution via EnsureRccHighRes (moved from
 //               SiteTabController up to Script level, alongside
 //               RccPctDiff/RccCropMm, so StructureProcessor can call it).
+//   v5.4.0.0  – Generic: replaced the single fixed-3mm-gap zRing_{dose}
+//               with the FULL RCC Ring1+Ring2 pipeline, per explicit
+//               direction to reuse RCC's ring pipeline in Generic. New
+//               Step9_RccRings_Generic + BuildGenericRing1/BuildGenericRing2
+//               are a direct port of SiteTabController's
+//               BuildRccRing1/BuildRccRing2, operating on Generic's own
+//               dose/suffix groups (OptKey, from groupKeys/_zOpt) instead
+//               of RCC's individually-ticked TargetDoseRow targets - each
+//               OptKey plays the same role a ticked target plays in RCC:
+//                 - z_Ring_1: base = z_PTV_opt_sum expanded by the
+//                   lowest-dose group's own gap (max(3mm,
+//                   %Diff(lowestRx, 85%*lowestRx)/ZoneB)); outer = base +
+//                   10mm; ring = outer minus base; every other (higher-
+//                   dose) group's own gap is applied to its own z_PTV_opt
+//                   and subtracted back out so it gets its own clearance.
+//                 - z_Ring_2: same process with 65%-isodose/Zone C gaps,
+//                   plus an explicit Ring1 subtraction so it always sits
+//                   outside Ring1.
+//                 - Only runs with 2+ ticked dose/suffix groups - the same
+//                   gate RCC itself uses (a single group has no "other"
+//                   group to fall off around, so RCC produces no ring for
+//                   a single target either); logs a SKIP reason otherwise
+//                   instead of silently doing nothing.
+//               GENERIC_RING_GAP_MM is removed (no longer used - the ring
+//               gap is now the same formula-derived value RCC computes).
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -359,8 +384,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.3.0.0")]
-[assembly: AssemblyFileVersion("5.3.0.0")]
+[assembly: AssemblyVersion("5.4.0.0")]
+[assembly: AssemblyFileVersion("5.4.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -377,9 +402,9 @@ namespace VMS.TPS
         private const double DEFAULT_PRV_MARGIN_MM = 2.0;
         private const double AVOIDANCE_MARGIN_MM = 35.0;
 
-        // Generic-tab-only ring/avoidance/rind constants (Breast Opto keeps the
-        // constants above instead). See Step9_Rings_Generic/Step4_Avoidance_Generic.
-        private const double GENERIC_RING_GAP_MM = 3.0;       // fixed gap from the highest-dose PTV_Opt to zRing's inner edge
+        // Generic-tab-only avoidance constants (Breast Opto keeps the
+        // constants above instead; the ring pipeline reuses RCC's own zone
+        // constants directly). See Step4_Avoidance_Generic.
         private const double GENERIC_AVOIDANCE_SUM_MARGIN_MM = 30.0;  // z_Avoidance stage 1: fixed 3cm standoff from z_PTV_opt_sum
         private const double GENERIC_AVOIDANCE_ISO_FRACTION = 0.5;    // z_Avoidance stage 2: reference dose = 50% of the highest ticked Rx
 
@@ -771,8 +796,8 @@ namespace VMS.TPS
 
                         if (isGeneric)
                         {
-                            RunStep("9) zRing_{dose} (highest-dose PTV only)",
-                                () => Step9_Rings_Generic(groupKeys, selectedExternal));
+                            RunStep("9) z_Ring_1 / z_Ring_2 (RCC ring pipeline)",
+                                () => Step9_RccRings_Generic(groupKeys, optSum, selectedExternal));
                             RunStep("10) z_Rind_{dose}",
                                 () => Step10_Rind_Generic(groupKeys, selectedExternal));
                         }
@@ -2033,81 +2058,170 @@ namespace VMS.TPS
             }
 
             // ------------------------------------------------------------------
-            // STEP 9 (Generic tab only): a single zRing_{dose} around the
-            // highest-dose target's z_PTV_opt only, built with the exact same
-            // technique as RCC's own BuildRccRing1 (SiteTabController) -
-            // base = PTV_Opt expanded by the gap, outer = base expanded by
-            // the ring thickness, ring = outer minus base, capped to the FULL
-            // Body (not Body-3mm - RCC's own rings are never given that extra
-            // 3mm contraction, so a PTV close to skin doesn't get its ring
-            // clipped away entirely), forced to high resolution like RCC's
-            // own output. Only the gap is different: a fixed
-            // GENERIC_RING_GAP_MM (3mm) instead of RCC's formula-derived one,
-            // since there's only ever one target here. No lower-dose rings,
-            // no 2nd ring - just the one ring the highest-dose target gets.
+            // STEP 9 (Generic tab only): the FULL RCC Ring1+Ring2 pipeline
+            // (SiteTabController.BuildRccRing1/BuildRccRing2), applied to
+            // Generic's own dose/suffix groups (OptKey) instead of RCC's
+            // individually-ticked targets - each OptKey plays exactly the
+            // role a ticked TargetDoseRow plays in RCC. Only runs with 2+
+            // ticked groups, same gate RCC itself uses (a single dose level
+            // has no "other" group to fall off around, so RCC produces no
+            // ring for one target either). Uses RCC's default Zone B/C rates
+            // and 85%/65% isodose-of-lowest-dose fractions, since Generic has
+            // no zone-rate inputs of its own.
             // ------------------------------------------------------------------
-            private void Step9_Rings_Generic(List<OptKey> groupKeys, Structure ext)
+            private void Step9_RccRings_Generic(List<OptKey> groupKeys, Structure optSum, Structure ext)
             {
-                LogSection("9) zRing_{dose} (highest-dose PTV only)");
-                if (groupKeys.Count == 0) return;
+                LogSection("9) z_Ring_1 / z_Ring_2 (RCC ring pipeline)");
+                if (groupKeys.Count < 2 || optSum == null)
+                {
+                    _progress.AppendLine("  SKIP: z_Ring_1/z_Ring_2 (need 2+ ticked dose/suffix groups, same gate RCC uses)");
+                    return;
+                }
 
-                double highestDose = groupKeys.Max(k => k.DoseGy);
-                var optsAtHighest = groupKeys
-                    .Where(k => k.DoseGy == highestDose && _zOpt.ContainsKey(k))
-                    .Select(k => _zOpt[k])
-                    .ToList();
-                if (optsAtHighest.Count == 0) return;
+                double lowestRx = groupKeys.Min(k => k.DoseGy);
+                double ring1RefDoseGy = RCC_RING1_ISO_FRACTION * lowestRx;
+                double ring2RefDoseGy = RCC_RING2_ISO_FRACTION * lowestRx;
 
-                string doseStr = highestDose.ToString(System.Globalization.CultureInfo.InvariantCulture);
-                string ringId = TruncId($"zRing_{doseStr}");
+                var ring1Gaps = new Dictionary<OptKey, double>();
+                var ring2Gaps = new Dictionary<OptKey, double>();
+                foreach (var k in groupKeys)
+                {
+                    double pctDiff1 = RccPctDiff(k.DoseGy, ring1RefDoseGy);
+                    ring1Gaps[k] = Math.Max(RCC_RING1_MIN_CROP_MM, RccCropMm(pctDiff1, RCC_ZONE_B_DEFAULT_PCT_PER_MM));
 
+                    double pctDiff2 = RccPctDiff(k.DoseGy, ring2RefDoseGy);
+                    ring2Gaps[k] = Math.Max(0.0, RccCropMm(pctDiff2, RCC_ZONE_C_DEFAULT_PCT_PER_MM));
+                }
+
+                // groupKeys is built (in Run()) sorted descending by dose, so the
+                // last entry is the lowest-Rx group - matches how RCC's own
+                // Ring1Levels/Ring2Levels ordering is used in BuildRccRing1/2.
+                var lowestKey = groupKeys[groupKeys.Count - 1];
+
+                var ring1St = BuildGenericRing1(groupKeys, lowestKey, ring1Gaps, optSum, ext);
+                BuildGenericRing2(groupKeys, lowestKey, ring2Gaps, optSum, ext, ring1St);
+            }
+
+            // Mirrors SiteTabController.BuildRccRing1 exactly: base = optSum
+            // expanded by the lowest-dose group's own gap, outer = base + 10mm
+            // ring thickness, ring = outer minus base; every OTHER (higher-
+            // dose) group then gets its OWN gap applied to its OWN PTV_Opt and
+            // subtracted back out, so higher-dose groups get their own
+            // (larger) clearance instead of the ring encroaching on them.
+            private Structure BuildGenericRing1(
+                List<OptKey> groupKeys, OptKey lowestKey, Dictionary<OptKey, double> ring1Gaps,
+                Structure optSum, Structure ext)
+            {
+                const string ringId = "z_Ring_1";
                 try
                 {
                     using (var tg = new TempGuard(_ss))
                     {
-                        var baseSt = optsAtHighest.Count == 1
-                            ? optsAtHighest[0]
-                            : tg.Add(UnionManyToTemp(_ss, optsAtHighest, _fb, "zTmpRingBaseU", $"RingBaseUnion_{doseStr}", tg));
-                        if (baseSt == null)
-                        {
-                            _progress.AppendLine($"  SKIP: {ringId} (could not union highest-dose PTV_Opt)");
-                            return;
-                        }
-
-                        var baseSeg = SafeMargin(baseSt.SegmentVolume, +GENERIC_RING_GAP_MM);
+                        var baseSeg = SafeMargin(optSum.SegmentVolume, +ring1Gaps[lowestKey]);
                         var outerSeg = SafeMargin(baseSeg, +RING_OUTER_EXPAND_MM);
-                        var baseSegSt = tg.Add(CreateTempFromSegment(_ss, baseSeg, "zTmpRingBase"));
+                        var baseSt = tg.Add(CreateTempFromSegment(_ss, baseSeg, "zGenR1Base"));
 
                         var ringSeg = SafeBoolean(_ss, outerSeg, baseSeg, BoolOp.Sub,
-                                            null, baseSegSt, ringId, _fb, $"Ring_{doseStr}_OuterMinusBase", tg);
+                            null, baseSt, ringId, _fb, "Ring1_OuterMinusBase", tg);
+
+                        foreach (var k in groupKeys)
+                        {
+                            if (k.Equals(lowestKey)) continue;
+                            if (!_zOpt.TryGetValue(k, out var higherOpt)) continue;
+                            var higherExpanded = SafeMargin(higherOpt.SegmentVolume, ring1Gaps[k]);
+                            var higherSt = tg.Add(CreateTempFromSegment(_ss, higherExpanded, "zGenR1HighExp"));
+                            ringSeg = SafeBoolean(_ss, ringSeg, higherExpanded, BoolOp.Sub,
+                                null, higherSt, ringId, _fb, $"Ring1_Sub_{k.DoseGy}", tg);
+                        }
+
                         ringSeg = SafeBoolean(_ss, ringSeg, ext.SegmentVolume, BoolOp.And,
-                                            null, ext, ringId, _fb, $"Ring_{doseStr}_CapExt", tg);
+                            null, ext, ringId, _fb, "Ring1_CapExt", tg);
 
                         if (ringSeg != null)
                         {
-                            var ring = GetOrCreate(_ss, "CONTROL", ringId);
-                            EnsureRccHighRes(ring);
-                            if (AssignSegmentSafely(ring, ringSeg))
+                            var st = GetOrCreate(_ss, "CONTROL", ringId);
+                            EnsureRccHighRes(st);
+                            if (AssignSegmentSafely(st, ringSeg))
                             {
-                                ring.Color = Colors.Magenta;
+                                st.Color = Colors.MediumPurple;
+                                LogCreated(ringId);
+                                return st;
+                            }
+                            _ss.RemoveStructure(st);
+                            _progress.AppendLine($"  SKIP: {ringId} (Empty volume)");
+                        }
+                        else
+                        {
+                            _progress.AppendLine($"  SKIP: {ringId} (outer-minus-base/subtracts/Body cap left nothing)");
+                        }
+                        return null;
+                    }
+                }
+                catch (Exception ex) { _progress.AppendLine($"  FAIL: {ringId} -> {ex.Message}"); return null; }
+            }
+
+            // Mirrors SiteTabController.BuildRccRing2: same process as Ring1
+            // but with Zone C / 65% isodose gaps (larger than Zone B, so
+            // Ring2 naturally sits further out), and explicitly subtracts
+            // Ring1 too so "outside of Ring1" holds even for unusual gaps.
+            private void BuildGenericRing2(
+                List<OptKey> groupKeys, OptKey lowestKey, Dictionary<OptKey, double> ring2Gaps,
+                Structure optSum, Structure ext, Structure ring1St)
+            {
+                const string ringId = "z_Ring_2";
+                try
+                {
+                    using (var tg = new TempGuard(_ss))
+                    {
+                        var baseSeg = SafeMargin(optSum.SegmentVolume, +ring2Gaps[lowestKey]);
+                        var outerSeg = SafeMargin(baseSeg, +RING_OUTER_EXPAND_MM);
+                        var baseSt = tg.Add(CreateTempFromSegment(_ss, baseSeg, "zGenR2Base"));
+
+                        var ringSeg = SafeBoolean(_ss, outerSeg, baseSeg, BoolOp.Sub,
+                            null, baseSt, ringId, _fb, "Ring2_OuterMinusBase", tg);
+
+                        foreach (var k in groupKeys)
+                        {
+                            if (k.Equals(lowestKey)) continue;
+                            if (!_zOpt.TryGetValue(k, out var higherOpt)) continue;
+                            var higherExpanded = SafeMargin(higherOpt.SegmentVolume, ring2Gaps[k]);
+                            var higherSt = tg.Add(CreateTempFromSegment(_ss, higherExpanded, "zGenR2HighExp"));
+                            ringSeg = SafeBoolean(_ss, ringSeg, higherExpanded, BoolOp.Sub,
+                                null, higherSt, ringId, _fb, $"Ring2_Sub_{k.DoseGy}", tg);
+                        }
+
+                        if (ring1St != null)
+                        {
+                            var ring1Tmp = tg.Add(CreateTempFromSegment(_ss, ring1St.SegmentVolume, "zGenR1Clone"));
+                            ringSeg = SafeBoolean(_ss, ringSeg, ring1St.SegmentVolume, BoolOp.Sub,
+                                null, ring1Tmp, ringId, _fb, "Ring2_SubRing1", tg);
+                        }
+
+                        ringSeg = SafeBoolean(_ss, ringSeg, ext.SegmentVolume, BoolOp.And,
+                            null, ext, ringId, _fb, "Ring2_CapExt", tg);
+
+                        if (ringSeg != null)
+                        {
+                            var st = GetOrCreate(_ss, "CONTROL", ringId);
+                            EnsureRccHighRes(st);
+                            if (AssignSegmentSafely(st, ringSeg))
+                            {
+                                st.Color = Colors.SlateBlue;
                                 LogCreated(ringId);
                             }
                             else
                             {
-                                _ss.RemoveStructure(ring);
+                                _ss.RemoveStructure(st);
                                 _progress.AppendLine($"  SKIP: {ringId} (Empty volume)");
                             }
                         }
                         else
                         {
-                            _progress.AppendLine($"  SKIP: {ringId} (outer-minus-base or Body cap left nothing)");
+                            _progress.AppendLine($"  SKIP: {ringId} (outer-minus-base/subtracts/ring1/Body cap left nothing)");
                         }
                     }
                 }
-                catch (Exception exRing)
-                {
-                    _progress.AppendLine($"  FAIL: {ringId} -> {exRing.Message}");
-                }
+                catch (Exception ex) { _progress.AppendLine($"  FAIL: {ringId} -> {ex.Message}"); }
             }
 
             // ------------------------------------------------------------------
@@ -3286,7 +3400,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.3.0.0";
+                Title = "Generic Crop Structure Generator - v5.4.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
