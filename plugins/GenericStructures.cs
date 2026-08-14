@@ -271,6 +271,32 @@
 //                 - The Generic tab's Targets grid drops the per-target
 //                   "Avoid" tick column (Breast Opto keeps it) since
 //                   avoidance is no longer per-target on Generic.
+//   v5.1.0.0  – Generic: isolated pipeline steps, RCC-formula PTV_Opt crop,
+//               and diagnostics for the v5.0.0.0 avoidance/ring "missing"
+//               reports:
+//                 - Run() previously ran Step1-Step10 inside one shared
+//                   try/catch, so an unhandled exception in an early step
+//                   (e.g. Step3a) silently aborted every step after it -
+//                   avoidance, rings, and rind would just never be
+//                   attempted, with only one generic "Script FAILED"
+//                   dialog as a clue. Each step now runs through a new
+//                   RunStep() helper that catches and logs failures
+//                   per-step, so one step's failure no longer hides
+//                   whether the others ran.
+//                 - Step4_Avoidance_Generic and Step9_Rings_Generic now log
+//                   a SKIP reason when their result comes back cleanly
+//                   empty (not an exception) - e.g. Body-3mm capping
+//                   removing the whole ring band for a superficial target,
+//                   or an avoidance margin large enough to leave no room
+//                   inside Body - instead of silently producing nothing.
+//                 - Step2_OptPtv's higher-dose-opt subtraction margin is
+//                   now RCC's own SIB-shave formula for Generic
+//                   (RccCropMm(RccPctDiff(higherRx, thisRx),
+//                   RCC_ZONE_B_DEFAULT_PCT_PER_MM)) instead of the fixed
+//                   LOWER_SUBTRACT_EXTRA_MM (1mm), so each PTV_Opt is
+//                   cropped from the next higher dose level by the same
+//                   %Diff/Zone-B distance RCC's SIB shave uses. Breast
+//                   Opto keeps the fixed 1mm gap.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -295,8 +321,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.0.0.0")]
-[assembly: AssemblyFileVersion("5.0.0.0")]
+[assembly: AssemblyVersion("5.1.0.0")]
+[assembly: AssemblyFileVersion("5.1.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -531,6 +557,22 @@ namespace VMS.TPS
                 _progress.AppendLine($"-- {name} --");
             }
 
+            // Runs one pipeline step in isolation: a failure inside `step` (e.g.
+            // an unexpected exception from a boolean/margin op) is logged and the
+            // REST of the pipeline still runs, instead of one early step's crash
+            // silently aborting every step after it (as a shared try/catch around
+            // the whole Run() body would do).
+            private void RunStep(string label, Action step)
+            {
+                try { step(); }
+                catch (Exception ex)
+                {
+                    _progress.AppendLine();
+                    _progress.AppendLine($"-- {label} FAILED --");
+                    _progress.AppendLine($"  FAIL: {ex.Message}");
+                }
+            }
+
             public void Run()
             {
                 var selectedExternal = _vm.SelectedExternal ?? FindExternalFallback(_ss);
@@ -633,40 +675,59 @@ namespace VMS.TPS
 
                         bool isGeneric = _vm.IsGenericTab;
 
-                        Step1_EvalPtv(groupKeys, targetsByGroup, selectedExternal, bodyMinus3);
-                        Step2_OptPtv(groupKeys, selectedExternal);
+                        // Each step runs through RunStep() so an exception in one
+                        // (e.g. Step3a) can't silently abort every step after it -
+                        // previously all of Step1-Step10 shared one try/catch around
+                        // the whole Run() body, so an early failure meant later
+                        // structures (avoidance, rings, rind) never even attempted
+                        // and the only sign was one generic "Script FAILED" dialog.
+                        RunStep("1) z_PTV_eval_{dose}_{suffix}",
+                            () => Step1_EvalPtv(groupKeys, targetsByGroup, selectedExternal, bodyMinus3));
+                        RunStep("2) z_PTV_opt_{dose}_{suffix}",
+                            () => Step2_OptPtv(groupKeys, selectedExternal, isGeneric));
 
                         // Step3a's per-dose-level sums (z_PTV_opt_{dose}_sum) still
                         // have to exist for Step6_Overlaps either way, but Generic
                         // only wants the single global z_PTV_opt_sum (Step3b) as a
                         // real, visible structure - so on Generic, Step3a builds
                         // them as globalTg-tracked temps instead of kept structures.
-                        Step3a_DoseOptPtvSum(groupKeys, doseLevels, selectedExternal, isGeneric, globalTg);
-                        Step3b_GlobalOptPtvSum(selectedTargets, selectedExternal);
+                        RunStep("3a) z_PTV_opt_{dose}_sum",
+                            () => Step3a_DoseOptPtvSum(groupKeys, doseLevels, selectedExternal, isGeneric, globalTg));
+                        RunStep("3b) z_PTV_opt_sum",
+                            () => Step3b_GlobalOptPtvSum(selectedTargets, selectedExternal));
 
                         if (isGeneric)
-                            Step4_Avoidance_Generic(groupKeys, selectedTargets, selectedExternal);
+                            RunStep("4) z_Avoidance",
+                                () => Step4_Avoidance_Generic(groupKeys, selectedTargets, selectedExternal));
                         else
-                            Step4_Avoidance(groupKeys, doseLevels, targetDosePairs, selectedExternal);
+                            RunStep("4) zAvoidance_{dose}(_{suffix})",
+                                () => Step4_Avoidance(groupKeys, doseLevels, targetDosePairs, selectedExternal));
 
                         // Step5: pass physicalBolus (null if not used).
                         // When non-null, Step5 builds Body_with_Bolus = body Or physicalBolus
                         // and uses it as the skin baseline. Steps 6-9 still use selectedExternal.
-                        Step5_VirtualBolus(bolusRequests, selectedExternal, isLeft, globalTg,
-                            physicalBolus, _vm.PhysicalBolusThicknessMm);
+                        RunStep("5) Virtual Bolus Pipeline", () => Step5_VirtualBolus(
+                            bolusRequests, selectedExternal, isLeft, globalTg,
+                            physicalBolus, _vm.PhysicalBolusThicknessMm));
 
-                        Step6_Overlaps(organRows, doseLevels, selectedExternal);
-                        Step7_OptOars(organRows, groupKeys, selectedExternal);
-                        Step8_Prvs(organRows, selectedExternal);
+                        RunStep("6) z_[OAR]_Ovl_[dose]",
+                            () => Step6_Overlaps(organRows, doseLevels, selectedExternal));
+                        RunStep("7) z_[OAR]_Opt",
+                            () => Step7_OptOars(organRows, groupKeys, selectedExternal));
+                        RunStep("8) z_[OAR]_PRV",
+                            () => Step8_Prvs(organRows, selectedExternal));
 
                         if (isGeneric)
                         {
-                            Step9_Rings_Generic(groupKeys, selectedExternal, extMinus3);
-                            Step10_Rind_Generic(groupKeys, selectedExternal);
+                            RunStep("9) zRing_{dose} (highest-dose PTV only)",
+                                () => Step9_Rings_Generic(groupKeys, selectedExternal, extMinus3));
+                            RunStep("10) z_Rind_{dose}",
+                                () => Step10_Rind_Generic(groupKeys, selectedExternal));
                         }
                         else
                         {
-                            Step9_Rings(doseLevels, selectedExternal, extMinus3);
+                            RunStep("9) zRing_{dose}_X",
+                                () => Step9_Rings(doseLevels, selectedExternal, extMinus3));
                         }
                     }
 
@@ -745,7 +806,7 @@ namespace VMS.TPS
             // ------------------------------------------------------------------
             // STEP 2: z_PTV_opt_{dose}_{suffix}
             // ------------------------------------------------------------------
-            private void Step2_OptPtv(List<OptKey> groupKeys, Structure ext)
+            private void Step2_OptPtv(List<OptKey> groupKeys, Structure ext, bool isGeneric)
             {
                 LogSection("2) z_PTV_opt_{dose}_{suffix}");
                 foreach (var k in groupKeys)
@@ -761,13 +822,21 @@ namespace VMS.TPS
                         var evalClone = CloneSegViaTempTracked(_ss, evalSt.SegmentVolume, "zTmpEval", tg);
                         var optSeg = SafeMargin(evalClone, +EVAL_TO_OPT_EXPAND_MM);
 
-                        // Subtract all higher-dose opt structures + 1 mm
+                        // Subtract all higher-dose opt structures, expanded by the
+                        // crop distance between this dose and each higher one.
+                        // Generic uses the RCC SIB-shave formula (%Diff/ZoneB,
+                        // RCC's default Zone B rate); Breast Opto keeps the
+                        // original fixed LOWER_SUBTRACT_EXTRA_MM (1mm) gap.
                         foreach (var hk in groupKeys.Where(x => x.DoseGy > k.DoseGy))
                         {
                             if (!_zOpt.TryGetValue(hk, out var higherOpt)) continue;
 
+                            double subtractMm = isGeneric
+                                ? Math.Max(0.0, RccCropMm(RccPctDiff(hk.DoseGy, k.DoseGy), RCC_ZONE_B_DEFAULT_PCT_PER_MM))
+                                : LOWER_SUBTRACT_EXTRA_MM;
+
                             var higherClone = CloneSegViaTempTracked(_ss, higherOpt.SegmentVolume, "zTmpOptH", tg);
-                            var higherExpanded = SafeMargin(higherClone, +LOWER_SUBTRACT_EXTRA_MM);
+                            var higherExpanded = SafeMargin(higherClone, +subtractMm);
 
                             string hDoseStr = hk.DoseGy.ToString(System.Globalization.CultureInfo.InvariantCulture);
                             string hSfxStr = string.IsNullOrWhiteSpace(hk.Suffix) ? "" : "_" + hk.Suffix;
@@ -1007,7 +1076,11 @@ namespace VMS.TPS
                     {
                         var tvUnionSt = tg.Add(UnionManyToTemp(_ss, selectedTargets, _fb,
                                             "zTmpAvoidTvU", "AvoidAllTvUnion", tg));
-                        if (tvUnionSt == null) return;
+                        if (tvUnionSt == null)
+                        {
+                            _progress.AppendLine($"  SKIP: {avoidId} (could not union ticked PTVs)");
+                            return;
+                        }
 
                         var expanded = SafeMargin(tvUnionSt.SegmentVolume, +avoidanceMarginMm);
                         var avoidanceSeg = SafeBoolean(_ss, ext.SegmentVolume, expanded, BoolOp.Sub,
@@ -1020,6 +1093,10 @@ namespace VMS.TPS
                             var st = GetOrCreate(_ss, "CONTROL", avoidId);
                             if (AssignSegmentSafely(st, avoidanceSeg)) LogCreated(avoidId);
                             else { _ss.RemoveStructure(st); _progress.AppendLine($"  SKIP: {avoidId} (Empty volume)"); }
+                        }
+                        else
+                        {
+                            _progress.AppendLine($"  SKIP: {avoidId} (expanded PTVs left no room inside Body for a {avoidanceMarginMm:0.#}mm margin)");
                         }
                     }
                 }
@@ -1932,7 +2009,11 @@ namespace VMS.TPS
                         var baseSt = optsAtHighest.Count == 1
                             ? optsAtHighest[0]
                             : tg.Add(UnionManyToTemp(_ss, optsAtHighest, _fb, "zTmpRingBaseU", $"RingBaseUnion_{doseStr}", tg));
-                        if (baseSt == null) return;
+                        if (baseSt == null)
+                        {
+                            _progress.AppendLine($"  SKIP: {ringId} (could not union highest-dose PTV_Opt)");
+                            return;
+                        }
 
                         var innerSeg = SafeMargin(baseSt.SegmentVolume, +GENERIC_RING_GAP_MM);
                         var innerSt = tg.Add(CreateTempFromSegment(_ss, innerSeg, "zTmpRingInner"));
@@ -1957,6 +2038,10 @@ namespace VMS.TPS
                                 _ss.RemoveStructure(ring);
                                 _progress.AppendLine($"  SKIP: {ringId} (Empty volume)");
                             }
+                        }
+                        else
+                        {
+                            _progress.AppendLine($"  SKIP: {ringId} (outer-minus-inner or Body-3mm cap left nothing)");
                         }
                     }
                 }
@@ -3142,7 +3227,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.0.0.0";
+                Title = "Generic Crop Structure Generator - v5.1.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
