@@ -360,6 +360,16 @@
 //                   instead of silently doing nothing.
 //               GENERIC_RING_GAP_MM is removed (no longer used - the ring
 //               gap is now the same formula-derived value RCC computes).
+//   v5.5.0.0  – Generic: relaxed Step9_RccRings_Generic's gate from 2+
+//               ticked groups to 1+, per explicit direction to always keep
+//               a ring for the highest dose. Unlike RCC (which skips rings
+//               entirely below 2 targets), a single ticked target now
+//               still gets z_Ring_1/z_Ring_2 - with only one dose/suffix
+//               group, lowestRx equals highestRx, so the formula still
+//               produces a real, non-zero gap (a fixed 15%/35% %Diff
+//               against 85%/65% of itself); BuildGenericRing1/2's "every
+//               other group" subtraction loop simply finds nothing to
+//               subtract in that case.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -384,8 +394,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.4.0.0")]
-[assembly: AssemblyFileVersion("5.4.0.0")]
+[assembly: AssemblyVersion("5.5.0.0")]
+[assembly: AssemblyFileVersion("5.5.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -2062,22 +2072,28 @@ namespace VMS.TPS
             // (SiteTabController.BuildRccRing1/BuildRccRing2), applied to
             // Generic's own dose/suffix groups (OptKey) instead of RCC's
             // individually-ticked targets - each OptKey plays exactly the
-            // role a ticked TargetDoseRow plays in RCC. Only runs with 2+
-            // ticked groups, same gate RCC itself uses (a single dose level
-            // has no "other" group to fall off around, so RCC produces no
-            // ring for one target either). Uses RCC's default Zone B/C rates
-            // and 85%/65% isodose-of-lowest-dose fractions, since Generic has
-            // no zone-rate inputs of its own.
+            // role a ticked TargetDoseRow plays in RCC. Runs for any number
+            // of ticked groups, including just one (unlike RCC, which skips
+            // rings entirely below 2 targets) - the highest dose always gets
+            // a ring. Uses RCC's default Zone B/C rates and 85%/65%
+            // isodose-of-lowest-dose fractions, since Generic has no
+            // zone-rate inputs of its own.
             // ------------------------------------------------------------------
             private void Step9_RccRings_Generic(List<OptKey> groupKeys, Structure optSum, Structure ext)
             {
                 LogSection("9) z_Ring_1 / z_Ring_2 (RCC ring pipeline)");
-                if (groupKeys.Count < 2 || optSum == null)
+                if (groupKeys.Count == 0 || optSum == null)
                 {
-                    _progress.AppendLine("  SKIP: z_Ring_1/z_Ring_2 (need 2+ ticked dose/suffix groups, same gate RCC uses)");
+                    _progress.AppendLine("  SKIP: z_Ring_1/z_Ring_2 (no ticked dose/suffix groups)");
                     return;
                 }
 
+                // Unlike RCC (which skips rings entirely below 2 ticked
+                // targets), Generic always builds a ring for the highest dose.
+                // With a single group, lowestRx == highestRx, so the formula
+                // still produces a real, non-zero gap (fixed 15%/35% %Diff
+                // against 85%/65% of itself) - the "every other group" loops
+                // in BuildGenericRing1/2 below just find nothing to subtract.
                 double lowestRx = groupKeys.Min(k => k.DoseGy);
                 double ring1RefDoseGy = RCC_RING1_ISO_FRACTION * lowestRx;
                 double ring2RefDoseGy = RCC_RING2_ISO_FRACTION * lowestRx;
@@ -3400,7 +3416,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.4.0.0";
+                Title = "Generic Crop Structure Generator - v5.5.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
