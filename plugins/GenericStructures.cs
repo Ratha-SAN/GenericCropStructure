@@ -380,6 +380,11 @@
 //               cap-to-Body/high-resolution construction as the other
 //               rings, but has no "other group" subtraction step of its
 //               own and isn't part of the Ring2-subtracts-Ring1 chain.
+//   v5.7.0.0  – Generic: z_Ring_{dose} now uses a fixed 3mm gap
+//               (GENERIC_HIGHEST_DOSE_RING_GAP_MM) instead of the RCC
+//               formula-derived gap it started with in v5.6.0.0.
+//               z_Ring_1/z_Ring_2 are unaffected - they still use RCC's
+//               own %Diff/zone-rate formula for their gaps.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -404,8 +409,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.6.0.0")]
-[assembly: AssemblyFileVersion("5.6.0.0")]
+[assembly: AssemblyVersion("5.7.0.0")]
+[assembly: AssemblyFileVersion("5.7.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -422,11 +427,12 @@ namespace VMS.TPS
         private const double DEFAULT_PRV_MARGIN_MM = 2.0;
         private const double AVOIDANCE_MARGIN_MM = 35.0;
 
-        // Generic-tab-only avoidance constants (Breast Opto keeps the
-        // constants above instead; the ring pipeline reuses RCC's own zone
-        // constants directly). See Step4_Avoidance_Generic.
+        // Generic-tab-only avoidance/ring constants (Breast Opto keeps the
+        // constants above instead; z_Ring_1/z_Ring_2 reuse RCC's own zone
+        // constants directly). See Step4_Avoidance_Generic/BuildGenericHighestDoseRing.
         private const double GENERIC_AVOIDANCE_SUM_MARGIN_MM = 30.0;  // z_Avoidance stage 1: fixed 3cm standoff from z_PTV_opt_sum
         private const double GENERIC_AVOIDANCE_ISO_FRACTION = 0.5;    // z_Avoidance stage 2: reference dose = 50% of the highest ticked Rx
+        private const double GENERIC_HIGHEST_DOSE_RING_GAP_MM = 3.0;  // z_Ring_{dose}: fixed gap from the highest-dose PTV_Opt (not RCC's formula-derived gap)
 
         // Virtual Bolus geometry constants
         private const double VB_EXTRA_EXPAND_MM = 2.0;  // added to user bolus input for Virtual_PTV expansion (no physical bolus)
@@ -2130,10 +2136,11 @@ namespace VMS.TPS
                 BuildGenericRing2(groupKeys, lowestKey, ring2Gaps, optSum, ext, ring1St);
 
                 // A separate, distinctly-named ring around the highest-dose
-                // target's OWN PTV_Opt (not PTV_Opt_Sum) - reuses that group's
-                // own Ring1-style gap (ring1Gaps[highestKey]) already computed
-                // above, but is otherwise independent of z_Ring_1/z_Ring_2.
-                BuildGenericHighestDoseRing(highestKey, ring1Gaps[highestKey], ext);
+                // target's OWN PTV_Opt (not PTV_Opt_Sum) - uses a fixed 3mm
+                // gap (GENERIC_HIGHEST_DOSE_RING_GAP_MM), not RCC's
+                // formula-derived one, and is otherwise independent of
+                // z_Ring_1/z_Ring_2.
+                BuildGenericHighestDoseRing(highestKey, GENERIC_HIGHEST_DOSE_RING_GAP_MM, ext);
             }
 
             // A single ring wrapped around the highest-dose target's own
@@ -3485,7 +3492,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.6.0.0";
+                Title = "Generic Crop Structure Generator - v5.7.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
