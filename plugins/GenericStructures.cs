@@ -462,6 +462,53 @@
 //                   reuse-existing-structure fallback as Eval/Opt/other
 //                   steps when unticked, since Step4/rings/rind consume it
 //                   downstream (both already null-check it).
+//   v5.11.0.0 – Generic: fixed a cascading-skip bug where ticking only a
+//               "downstream" structure (e.g. z_PTV_opt_60, z_Rind_60,
+//               z_Ring_1, z_Avoidance, z_[OAR]_Ovl) without also ticking its
+//               prerequisites (z_PTV_eval, z_PTV_opt_sum, z_Ring_1) produced
+//               nothing at all, silently: Step1/Step2/Step3b's old "reuse an
+//               existing structure or skip" fallback only worked on a SECOND
+//               run against stale structures from an earlier full build - on
+//               a fresh structure set there was nothing to reuse, so the
+//               entire dependency chain (Eval -> Opt -> OptDoseSum -> Ovl,
+//               and Opt -> Rind/Ring1/Ring2/Ring_dose, and OptSum -> Ring1/
+//               Ring2/Avoidance) silently produced zero structures even for
+//               explicitly ticked ids.
+//                 - Selective generation now means "ticked decides what's
+//                   KEPT in the structure set", never "ticked decides what's
+//                   computed". z_PTV_eval, z_PTV_opt (per dose/suffix group),
+//                   z_PTV_opt_sum, and z_Ring_1 are prerequisites other
+//                   structures may need, so they're now always computed via
+//                   their normal pipeline logic regardless of their own tick
+//                   state - new PersistOrScratch(id, category, seg, globalTg,
+//                   ...) is the single place that decides whether the result
+//                   becomes a real kept structure (ticked) or a
+//                   globalTg-tracked scratch structure (unticked): built and
+//                   usable by every later step for the rest of this run, then
+//                   automatically removed from the structure set when
+//                   globalTg disposes at the end of Run() - i.e. it only
+//                   ever existed "in memory" for this run, exactly as
+//                   requested, never appearing as a kept/visible structure.
+//                 - True leaf structures with no downstream consumer
+//                   (z_Ring_2, z_Ring_{highestDose}, z_Rind, z_Avoidance,
+//                   z_[OAR]_Ovl, z_[OAR]_Opt, PRV_[OAR]) are unchanged: still
+//                   skipped outright with no computation at all when
+//                   unticked, since nothing else needs their output - this
+//                   keeps the original "don't run the whole pipeline for one
+//                   structure" performance goal intact for everything that
+//                   safely can be skipped.
+//                 - Removed the old "reuse an existing structure from a
+//                   prior run" fallback entirely (Step1/Step2/Step3b) - it's
+//                   no longer needed now that prerequisites are always freshly
+//                   computed, and it was a source of stale-geometry risk
+//                   (reusing an old structure that no longer matches the
+//                   currently ticked targets/doses).
+//                 - Side effect: z_[OAR]_Opt (Step7) previously silently
+//                   built without subtracting the PTV+2mm region whenever
+//                   z_PTV_eval wasn't rebuilt for any ticked dose group,
+//                   since Step7 could only use whatever it found in _zEval.
+//                   With Eval always computed now, this crop is applied
+//                   correctly regardless of which structures are ticked.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -486,8 +533,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.10.0.0")]
-[assembly: AssemblyFileVersion("5.10.0.0")]
+[assembly: AssemblyVersion("5.11.0.0")]
+[assembly: AssemblyFileVersion("5.11.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -752,15 +799,62 @@ namespace VMS.TPS
             }
 
             // Generic tab only, and only when UseSelectiveGeneration is ticked:
-            // whether the given AutoStructureRow ("Eval"/"Opt"/"Rings"/"Rind"/
-            // "Avoidance") is selected to be (re)built this run. Always true
-            // otherwise (Breast Opto, RCC, or selective generation left off),
-            // matching the original "always generate everything" behavior.
+            // whether the exact structure id is ticked in the Auto Structures
+            // table, i.e. whether it should end up KEPT in the structure set.
+            // This does NOT decide whether its geometry gets computed -
+            // prerequisite structures (Eval/Opt/OptSum/Ring1) are always
+            // computed regardless, see PersistOrScratch. Always true otherwise
+            // (Breast Opto, RCC, or selective generation left off), matching
+            // the original "always generate everything" behavior.
             private bool IsAutoStructureSelected(string name)
             {
                 if (!_vm.IsGenericTab || !_vm.UseSelectiveGeneration) return true;
                 var row = _vm.AutoStructureRows.FirstOrDefault(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase));
                 return row?.IsSelected ?? true;
+            }
+
+            // Selective generation (Generic only): "ticked" only ever decides
+            // whether a structure is KEPT in the structure set, never whether
+            // its geometry gets computed - several structures (z_PTV_opt,
+            // z_Ring_1, z_PTV_opt_sum, ...) are load-bearing inputs to other,
+            // possibly-ticked structures further down the pipeline (e.g.
+            // Rind/Ring2/Ovl/Avoidance all need z_PTV_opt/z_PTV_opt_sum/
+            // z_Ring_1 to exist even when those particular ids weren't ticked
+            // themselves). So this always builds `seg` into `id`: if `id` is
+            // selected it becomes a real, kept structure as usual; if not, it's
+            // still built - but as a globalTg-tracked scratch structure, so
+            // whatever later step needs its geometry still gets a real
+            // Structure to read from, and it's automatically removed from the
+            // structure set once globalTg disposes at the end of Run() (i.e.
+            // it only ever existed "in memory" for this run, never kept).
+            private Structure PersistOrScratch(
+                string id, string category, SegmentVolume seg, TempGuard globalTg,
+                Color color, string scratchPrefix)
+            {
+                if (seg == null) return null;
+
+                if (IsAutoStructureSelected(id))
+                {
+                    var st = GetOrCreate(_ss, category, id);
+                    if (AssignSegmentSafely(st, seg))
+                    {
+                        st.Color = color;
+                        LogCreated(id);
+                        return st;
+                    }
+                    _ss.RemoveStructure(st);
+                    _progress.AppendLine($"  SKIP: {id} (Empty volume)");
+                    return null;
+                }
+
+                var tmp = globalTg.Add(CreateTempFromSegment(_ss, seg, scratchPrefix));
+                if (tmp != null && !tmp.IsEmpty)
+                {
+                    _progress.AppendLine($"  (built {id} internally - not selected, won't be kept)");
+                    return tmp;
+                }
+                _progress.AppendLine($"  SKIP: {id} (Empty volume, not selected)");
+                return null;
             }
 
             public void Run()
@@ -871,15 +965,18 @@ namespace VMS.TPS
                         // the whole Run() body, so an early failure meant later
                         // structures (avoidance, rings, rind) never even attempted
                         // and the only sign was one generic "Script FAILED" dialog.
-                        // Selective generation (Generic only): each step below
-                        // checks IsAutoStructureSelected(resultId) per structure
-                        // it's about to build, so unticked structures are either
-                        // skipped with a fallback lookup (Eval/Opt) or skipped
-                        // outright (everything else) - see each Step method.
+                        // Selective generation (Generic only): ticking is about
+                        // KEEPING a structure, not about computing it - Eval/Opt/
+                        // OptSum/Ring1 are prerequisites other structures need, so
+                        // they're always computed regardless of their own tick
+                        // state (PersistOrScratch decides kept-vs-scratch); true
+                        // leaf structures (Ring2/Ring_dose/Rind/Avoidance/Ovl/
+                        // organ-Opt/PRV) are skipped outright with no computation
+                        // at all when unticked, since nothing else needs them.
                         RunStep("1) z_PTV_eval_{dose}_{suffix}",
-                            () => Step1_EvalPtv(groupKeys, targetsByGroup, selectedExternal, bodyMinus3));
+                            () => Step1_EvalPtv(groupKeys, targetsByGroup, selectedExternal, bodyMinus3, globalTg));
                         RunStep("2) z_PTV_opt_{dose}_{suffix}",
-                            () => Step2_OptPtv(groupKeys, selectedExternal, isGeneric));
+                            () => Step2_OptPtv(groupKeys, selectedExternal, isGeneric, globalTg));
 
                         // Step3a's per-dose-level sums (z_PTV_opt_{dose}_sum) still
                         // have to exist for Step6_Overlaps either way, but Generic
@@ -893,7 +990,7 @@ namespace VMS.TPS
 
                         Structure optSum = null;
                         RunStep("3b) z_PTV_opt_sum",
-                            () => optSum = Step3b_GlobalOptPtvSum(selectedTargets, selectedExternal));
+                            () => optSum = Step3b_GlobalOptPtvSum(selectedTargets, selectedExternal, globalTg));
 
                         if (isGeneric)
                             RunStep("4) z_Avoidance",
@@ -923,7 +1020,7 @@ namespace VMS.TPS
                             // IsAutoStructureSelected(id), so both steps always run and
                             // each decides per-ID whether to build or skip.
                             RunStep("9) z_Ring_1 / z_Ring_2 (RCC ring pipeline) / z_Ring_{dose}",
-                                () => Step9_RccRings_Generic(groupKeys, optSum, selectedExternal));
+                                () => Step9_RccRings_Generic(groupKeys, optSum, selectedExternal, globalTg));
 
                             RunStep("10) z_Rind_{dose}",
                                 () => Step10_Rind_Generic(groupKeys, selectedExternal));
@@ -964,7 +1061,8 @@ namespace VMS.TPS
                 List<OptKey> groupKeys,
                 Dictionary<OptKey, List<Structure>> targetsByGroup,
                 Structure ext,
-                SegmentVolume bodyMinus3)
+                SegmentVolume bodyMinus3,
+                TempGuard globalTg)
             {
                 LogSection("1) z_PTV_eval_{dose}_{suffix}");
                 foreach (var k in groupKeys)
@@ -975,27 +1073,11 @@ namespace VMS.TPS
                     string sfxStr = string.IsNullOrWhiteSpace(k.Suffix) ? "" : "_" + k.Suffix;
                     string evalId = TruncId($"z_PTV_eval_{doseStr}{sfxStr}");
 
-                    // Selective generation (Generic only): this exact structure
-                    // unticked - reuse whatever z_PTV_eval structure already
-                    // exists (from an earlier full run) instead of rebuilding
-                    // it, so Opt/Ring/Rind/Avoidance still have real geometry
-                    // to work from.
-                    if (!IsAutoStructureSelected(evalId))
-                    {
-                        var existing = _ss.Structures.FirstOrDefault(s =>
-                            !s.IsEmpty && string.Equals(s.Id, evalId, StringComparison.OrdinalIgnoreCase));
-                        if (existing != null)
-                        {
-                            _zEval[k] = existing;
-                            _progress.AppendLine($"  REUSE: {evalId} (Eval not selected - using existing structure)");
-                        }
-                        else
-                        {
-                            _progress.AppendLine($"  SKIP: {evalId} (Eval not selected, and no existing structure to reuse)");
-                        }
-                        continue;
-                    }
-
+                    // z_PTV_opt (Step2) always needs this dose group's Eval
+                    // geometry as its crop base, even when z_PTV_eval itself
+                    // isn't ticked - so this always computes the segment;
+                    // PersistOrScratch below is what decides whether it ends
+                    // up kept in the structure set or just used internally.
                     using (var tg = new TempGuard(_ss))
                     {
                         var doseUnionSt = tg.Add(UnionManyToTemp(_ss, src, _fb, "zTmpDoseU",
@@ -1009,21 +1091,8 @@ namespace VMS.TPS
                                     BoolOp.And, null, ext, evalId, _fb,
                                     $"Eval_{doseStr}{sfxStr}_AndExt", tg);
 
-                        if (evalSeg != null)
-                        {
-                            var st = GetOrCreate(_ss, "PTV", evalId);
-                            if (AssignSegmentSafely(st, evalSeg))
-                            {
-                                st.Color = Colors.Blue;
-                                _zEval[k] = st;
-                                LogCreated(evalId);
-                            }
-                            else
-                            {
-                                _ss.RemoveStructure(st);
-                                _progress.AppendLine($"  SKIP: {evalId} (Empty volume)");
-                            }
-                        }
+                        var st = PersistOrScratch(evalId, "PTV", evalSeg, globalTg, Colors.Blue, "zTmpEvalScratch");
+                        if (st != null) _zEval[k] = st;
                     }
                 }
             }
@@ -1031,7 +1100,7 @@ namespace VMS.TPS
             // ------------------------------------------------------------------
             // STEP 2: z_PTV_opt_{dose}_{suffix}
             // ------------------------------------------------------------------
-            private void Step2_OptPtv(List<OptKey> groupKeys, Structure ext, bool isGeneric)
+            private void Step2_OptPtv(List<OptKey> groupKeys, Structure ext, bool isGeneric, TempGuard globalTg)
             {
                 LogSection("2) z_PTV_opt_{dose}_{suffix}");
                 foreach (var k in groupKeys)
@@ -1042,26 +1111,12 @@ namespace VMS.TPS
                     string sfxStr = string.IsNullOrWhiteSpace(k.Suffix) ? "" : "_" + k.Suffix;
                     string optId = TruncId($"z_PTV_opt_{doseStr}{sfxStr}");
 
-                    // Selective generation (Generic only): this exact structure
-                    // unticked - reuse whatever z_PTV_opt structure already
-                    // exists instead of rebuilding it, so Ring/Rind/Avoidance
-                    // still have real geometry to work from.
-                    if (!IsAutoStructureSelected(optId))
-                    {
-                        var existing = _ss.Structures.FirstOrDefault(s =>
-                            !s.IsEmpty && string.Equals(s.Id, optId, StringComparison.OrdinalIgnoreCase));
-                        if (existing != null)
-                        {
-                            _zOpt[k] = existing;
-                            _progress.AppendLine($"  REUSE: {optId} (Opt not selected - using existing structure)");
-                        }
-                        else
-                        {
-                            _progress.AppendLine($"  SKIP: {optId} (Opt not selected, and no existing structure to reuse)");
-                        }
-                        continue;
-                    }
-
+                    // z_PTV_opt_{dose}_sum (Step3a, feeding z_[OAR]_Ovl),
+                    // z_Rind_{dose}, z_Ring_1/z_Ring_2's "other group"
+                    // subtraction, and z_Ring_{highestDose} all need this
+                    // group's z_PTV_opt geometry even when it isn't ticked -
+                    // so this always computes it; PersistOrScratch decides
+                    // whether it's kept or just used internally this run.
                     using (var tg = new TempGuard(_ss))
                     {
                         var evalClone = CloneSegViaTempTracked(_ss, evalSt.SegmentVolume, "zTmpEval", tg);
@@ -1094,21 +1149,11 @@ namespace VMS.TPS
                         optSeg = SafeBoolean(_ss, optSeg, ext.SegmentVolume, BoolOp.And,
                                     null, ext, optId, _fb, $"Opt_{doseStr}{sfxStr}_CapExt", tg);
 
-                        if (optSeg != null)
+                        var st = PersistOrScratch(optId, "PTV", optSeg, globalTg, Colors.Red, "zTmpOptScratch");
+                        if (st != null)
                         {
-                            var st = GetOrCreate(_ss, "PTV", optId);
-                            if (AssignSegmentSafely(st, optSeg))
-                            {
-                                st.Color = Colors.Red;
-                                if (SMOOTH_OPT_TARGET) SmoothStructureByExpandContract(st, SMOOTH_MM);
-                                _zOpt[k] = st;
-                                LogCreated(optId);
-                            }
-                            else
-                            {
-                                _ss.RemoveStructure(st);
-                                _progress.AppendLine($"  SKIP: {optId} (Empty volume)");
-                            }
+                            if (SMOOTH_OPT_TARGET) SmoothStructureByExpandContract(st, SMOOTH_MM);
+                            _zOpt[k] = st;
                         }
                     }
                 }
@@ -1178,27 +1223,14 @@ namespace VMS.TPS
             // ------------------------------------------------------------------
             // STEP 3b: z_PTV_opt_sum (global)
             // ------------------------------------------------------------------
-            private Structure Step3b_GlobalOptPtvSum(List<Structure> selectedTargets, Structure ext)
+            private Structure Step3b_GlobalOptPtvSum(List<Structure> selectedTargets, Structure ext, TempGuard globalTg)
             {
                 LogSection("3b) z_PTV_opt_sum");
 
-                // Selective generation (Generic only): z_PTV_opt_sum feeds
-                // Step4/Ring/Rind downstream, so when it's unticked reuse
-                // whatever already exists instead of skipping outright -
-                // same fallback pattern as Step1/Step2.
-                if (!IsAutoStructureSelected(ID_OPT_TV_SUM))
-                {
-                    var existingSum = _ss.Structures.FirstOrDefault(s =>
-                        !s.IsEmpty && string.Equals(s.Id, ID_OPT_TV_SUM, StringComparison.OrdinalIgnoreCase));
-                    if (existingSum != null)
-                    {
-                        _progress.AppendLine($"  REUSE: {ID_OPT_TV_SUM} (not selected - using existing structure)");
-                        return existingSum;
-                    }
-                    _progress.AppendLine($"  SKIP: {ID_OPT_TV_SUM} (not selected, and no existing structure to reuse)");
-                    return null;
-                }
-
+                // Step4_Avoidance_Generic and Step9_RccRings_Generic (Ring1/
+                // Ring2 base) both need this even when z_PTV_opt_sum itself
+                // isn't ticked, so this always computes it; PersistOrScratch
+                // decides whether it's kept or just used internally this run.
                 using (var tg = new TempGuard(_ss))
                 {
                     var tvUnionSt = tg.Add(UnionManyToTemp(_ss, selectedTargets, _fb,
@@ -1209,23 +1241,9 @@ namespace VMS.TPS
                     optSumSeg = SafeBoolean(_ss, optSumSeg, ext.SegmentVolume, BoolOp.And,
                                     null, ext, ID_OPT_TV_SUM, _fb, "OptSumAndExt", tg);
 
-                    if (optSumSeg != null)
-                    {
-                        var zOptSum = GetOrCreate(_ss, "PTV", ID_OPT_TV_SUM);
-                        if (AssignSegmentSafely(zOptSum, optSumSeg))
-                        {
-                            zOptSum.Color = Colors.Red;
-                            if (SMOOTH_OPT_TARGET) SmoothStructureByExpandContract(zOptSum, SMOOTH_MM);
-                            LogCreated(ID_OPT_TV_SUM);
-                            return zOptSum;
-                        }
-                        else
-                        {
-                            _ss.RemoveStructure(zOptSum);
-                            _progress.AppendLine($"  SKIP: {ID_OPT_TV_SUM} (Empty volume)");
-                        }
-                    }
-                    return null;
+                    var zOptSum = PersistOrScratch(ID_OPT_TV_SUM, "PTV", optSumSeg, globalTg, Colors.Red, "zTmpOptSumScratch");
+                    if (zOptSum != null && SMOOTH_OPT_TARGET) SmoothStructureByExpandContract(zOptSum, SMOOTH_MM);
+                    return zOptSum;
                 }
             }
 
@@ -2274,7 +2292,7 @@ namespace VMS.TPS
             // isodose-of-lowest-dose fractions, since Generic has no
             // zone-rate inputs of its own.
             // ------------------------------------------------------------------
-            private void Step9_RccRings_Generic(List<OptKey> groupKeys, Structure optSum, Structure ext)
+            private void Step9_RccRings_Generic(List<OptKey> groupKeys, Structure optSum, Structure ext, TempGuard globalTg)
             {
                 LogSection("9) z_Ring_1 / z_Ring_2 (RCC ring pipeline) / z_Ring_{dose}");
                 if (groupKeys.Count == 0 || optSum == null)
@@ -2311,7 +2329,7 @@ namespace VMS.TPS
                 var highestKey = groupKeys[0];
                 var lowestKey = groupKeys[groupKeys.Count - 1];
 
-                var ring1St = BuildGenericRing1(groupKeys, lowestKey, ring1Gaps, optSum, ext);
+                var ring1St = BuildGenericRing1(groupKeys, lowestKey, ring1Gaps, optSum, ext, globalTg);
                 BuildGenericRing2(groupKeys, lowestKey, ring2Gaps, optSum, ext, ring1St);
 
                 // A separate, distinctly-named ring around the highest-dose
@@ -2342,7 +2360,7 @@ namespace VMS.TPS
 
                 if (!_zOpt.TryGetValue(highestKey, out var highestOpt))
                 {
-                    _progress.AppendLine($"  SKIP: {ringId} (highest-dose PTV_Opt not available - Opt wasn't (re)built and no existing structure was found)");
+                    _progress.AppendLine($"  SKIP: {ringId} (highest-dose PTV_Opt could not be built - see Step 2 above)");
                     return;
                 }
 
@@ -2391,14 +2409,14 @@ namespace VMS.TPS
             // (larger) clearance instead of the ring encroaching on them.
             private Structure BuildGenericRing1(
                 List<OptKey> groupKeys, OptKey lowestKey, Dictionary<OptKey, double> ring1Gaps,
-                Structure optSum, Structure ext)
+                Structure optSum, Structure ext, TempGuard globalTg)
             {
                 const string ringId = "z_Ring_1";
-                if (!IsAutoStructureSelected(ringId))
-                {
-                    _progress.AppendLine($"  SKIP: {ringId} (not selected)");
-                    return null;
-                }
+                // z_Ring_2 always subtracts Ring1's own geometry (see
+                // BuildGenericRing2), so this always builds it even when
+                // z_Ring_1 itself isn't ticked - selection only decides
+                // whether it's kept as a real structure or built as
+                // globalTg-tracked scratch, same as the Eval/Opt/OptSum steps.
                 try
                 {
                     using (var tg = new TempGuard(_ss))
@@ -2423,9 +2441,16 @@ namespace VMS.TPS
                         ringSeg = SafeBoolean(_ss, ringSeg, ext.SegmentVolume, BoolOp.And,
                             null, ext, ringId, _fb, "Ring1_CapExt", tg);
 
-                        if (ringSeg != null)
+                        if (ringSeg == null)
                         {
-                            var st = GetOrCreate(_ss, "CONTROL", ringId);
+                            _progress.AppendLine($"  SKIP: {ringId} (outer-minus-base/subtracts/Body cap left nothing)");
+                            return null;
+                        }
+
+                        Structure st;
+                        if (IsAutoStructureSelected(ringId))
+                        {
+                            st = GetOrCreate(_ss, "CONTROL", ringId);
                             EnsureRccHighRes(st);
                             if (AssignSegmentSafely(st, ringSeg))
                             {
@@ -2435,12 +2460,18 @@ namespace VMS.TPS
                             }
                             _ss.RemoveStructure(st);
                             _progress.AppendLine($"  SKIP: {ringId} (Empty volume)");
+                            return null;
                         }
-                        else
+
+                        st = globalTg.Add(CreateTempFromSegment(_ss, ringSeg, "zGenR1Scratch"));
+                        if (st == null || st.IsEmpty)
                         {
-                            _progress.AppendLine($"  SKIP: {ringId} (outer-minus-base/subtracts/Body cap left nothing)");
+                            _progress.AppendLine($"  SKIP: {ringId} (Empty volume, not selected)");
+                            return null;
                         }
-                        return null;
+                        EnsureRccHighRes(st);
+                        _progress.AppendLine($"  (built {ringId} internally - not selected, won't be kept)");
+                        return st;
                     }
                 }
                 catch (Exception ex) { _progress.AppendLine($"  FAIL: {ringId} -> {ex.Message}"); return null; }
@@ -3731,7 +3762,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.10.0.0";
+                Title = "Generic Crop Structure Generator - v5.11.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
