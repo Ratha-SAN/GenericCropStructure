@@ -385,6 +385,35 @@
 //               formula-derived gap it started with in v5.6.0.0.
 //               z_Ring_1/z_Ring_2 are unaffected - they still use RCC's
 //               own %Diff/zone-rate formula for their gaps.
+//   v5.8.0.0  – Generic: added selective structure generation, so Generate
+//               Structures doesn't have to run the whole pipeline every
+//               time:
+//                 - New "Auto Structures" table (Eval/Opt/Rings/Rind/
+//                   Avoidance rows, AutoStructureRow) under the Targets
+//                   grid, gated by a "Generate selected structures only"
+//                   checkbox (UiModel.UseSelectiveGeneration) - the table
+//                   is disabled/greyed until the checkbox is ticked. Off by
+//                   default, so nothing changes unless it's explicitly used.
+//                 - Step1_EvalPtv and Step2_OptPtv now take a `rebuild`
+//                   flag: when a category is unticked, they don't
+//                   recompute that dose level's z_PTV_eval/z_PTV_opt at
+//                   all - instead they look up whatever structure with
+//                   that exact id already exists in the structure set
+//                   (from an earlier full run) and reuse it, logging
+//                   REUSE/SKIP accordingly, so Ring/Rind/Avoidance still
+//                   have real geometry to build from even when Eval/Opt
+//                   themselves aren't regenerated.
+//                 - Step4 (z_Avoidance), Step9 (rings), and Step10 (rind)
+//                   are skipped outright when unticked, each logging a
+//                   clear SKIP reason instead of silently doing nothing.
+//                 - Only applies to the Generic tab; Breast Opto has no
+//                   selective-generation option and always runs its full
+//                   pipeline, matching every "Generic only" change so far
+//                   this session.
+//                 - Note: the live structure-count estimator
+//                   (UpdateStructureCount) does not yet account for
+//                   selective generation, so its peak-count warning may
+//                   over-estimate when categories are unticked.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -409,8 +438,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.7.0.0")]
-[assembly: AssemblyFileVersion("5.7.0.0")]
+[assembly: AssemblyVersion("5.8.0.0")]
+[assembly: AssemblyFileVersion("5.8.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -674,6 +703,18 @@ namespace VMS.TPS
                 }
             }
 
+            // Generic tab only, and only when UseSelectiveGeneration is ticked:
+            // whether the given AutoStructureRow ("Eval"/"Opt"/"Rings"/"Rind"/
+            // "Avoidance") is selected to be (re)built this run. Always true
+            // otherwise (Breast Opto, RCC, or selective generation left off),
+            // matching the original "always generate everything" behavior.
+            private bool IsAutoStructureSelected(string name)
+            {
+                if (!_vm.IsGenericTab || !_vm.UseSelectiveGeneration) return true;
+                var row = _vm.AutoStructureRows.FirstOrDefault(r => string.Equals(r.Name, name, StringComparison.OrdinalIgnoreCase));
+                return row?.IsSelected ?? true;
+            }
+
             public void Run()
             {
                 var selectedExternal = _vm.SelectedExternal ?? FindExternalFallback(_ss);
@@ -776,6 +817,17 @@ namespace VMS.TPS
 
                         bool isGeneric = _vm.IsGenericTab;
 
+                        // Generic tab, selective generation only: which auto
+                        // structure categories are actually ticked this run.
+                        // Unticked ones are skipped in Step1/Step2 (falling back
+                        // to any already-existing structure) or skipped outright
+                        // in Step4/Step9/Step10 (see IsAutoStructureSelected).
+                        bool doEval = IsAutoStructureSelected("Eval");
+                        bool doOpt = IsAutoStructureSelected("Opt");
+                        bool doRings = IsAutoStructureSelected("Rings");
+                        bool doRind = IsAutoStructureSelected("Rind");
+                        bool doAvoidance = IsAutoStructureSelected("Avoidance");
+
                         // Each step runs through RunStep() so an exception in one
                         // (e.g. Step3a) can't silently abort every step after it -
                         // previously all of Step1-Step10 shared one try/catch around
@@ -783,15 +835,17 @@ namespace VMS.TPS
                         // structures (avoidance, rings, rind) never even attempted
                         // and the only sign was one generic "Script FAILED" dialog.
                         RunStep("1) z_PTV_eval_{dose}_{suffix}",
-                            () => Step1_EvalPtv(groupKeys, targetsByGroup, selectedExternal, bodyMinus3));
+                            () => Step1_EvalPtv(groupKeys, targetsByGroup, selectedExternal, bodyMinus3, doEval));
                         RunStep("2) z_PTV_opt_{dose}_{suffix}",
-                            () => Step2_OptPtv(groupKeys, selectedExternal, isGeneric));
+                            () => Step2_OptPtv(groupKeys, selectedExternal, isGeneric, doOpt));
 
                         // Step3a's per-dose-level sums (z_PTV_opt_{dose}_sum) still
                         // have to exist for Step6_Overlaps either way, but Generic
                         // only wants the single global z_PTV_opt_sum (Step3b) as a
                         // real, visible structure - so on Generic, Step3a builds
                         // them as globalTg-tracked temps instead of kept structures.
+                        // Not gated by selective generation - Step6's Ovl feature
+                        // isn't one of the selectable auto structure categories.
                         RunStep("3a) z_PTV_opt_{dose}_sum",
                             () => Step3a_DoseOptPtvSum(groupKeys, doseLevels, selectedExternal, isGeneric, globalTg));
 
@@ -800,11 +854,18 @@ namespace VMS.TPS
                             () => optSum = Step3b_GlobalOptPtvSum(selectedTargets, selectedExternal));
 
                         if (isGeneric)
-                            RunStep("4) z_Avoidance",
-                                () => Step4_Avoidance_Generic(groupKeys, optSum, selectedExternal));
+                        {
+                            if (doAvoidance)
+                                RunStep("4) z_Avoidance",
+                                    () => Step4_Avoidance_Generic(groupKeys, optSum, selectedExternal));
+                            else
+                                _progress.AppendLine("\n-- 4) z_Avoidance --\n  SKIP: z_Avoidance (not selected)");
+                        }
                         else
+                        {
                             RunStep("4) zAvoidance_{dose}(_{suffix})",
                                 () => Step4_Avoidance(groupKeys, doseLevels, targetDosePairs, selectedExternal));
+                        }
 
                         // Step5: pass physicalBolus (null if not used).
                         // When non-null, Step5 builds Body_with_Bolus = body Or physicalBolus
@@ -822,10 +883,17 @@ namespace VMS.TPS
 
                         if (isGeneric)
                         {
-                            RunStep("9) z_Ring_1 / z_Ring_2 (RCC ring pipeline) / z_Ring_{dose}",
-                                () => Step9_RccRings_Generic(groupKeys, optSum, selectedExternal));
-                            RunStep("10) z_Rind_{dose}",
-                                () => Step10_Rind_Generic(groupKeys, selectedExternal));
+                            if (doRings)
+                                RunStep("9) z_Ring_1 / z_Ring_2 (RCC ring pipeline) / z_Ring_{dose}",
+                                    () => Step9_RccRings_Generic(groupKeys, optSum, selectedExternal));
+                            else
+                                _progress.AppendLine("\n-- 9) z_Ring_1 / z_Ring_2 / z_Ring_{dose} --\n  SKIP: rings (not selected)");
+
+                            if (doRind)
+                                RunStep("10) z_Rind_{dose}",
+                                    () => Step10_Rind_Generic(groupKeys, selectedExternal));
+                            else
+                                _progress.AppendLine("\n-- 10) z_Rind_{dose} --\n  SKIP: rind (not selected)");
                         }
                         else
                         {
@@ -863,7 +931,8 @@ namespace VMS.TPS
                 List<OptKey> groupKeys,
                 Dictionary<OptKey, List<Structure>> targetsByGroup,
                 Structure ext,
-                SegmentVolume bodyMinus3)
+                SegmentVolume bodyMinus3,
+                bool rebuild)
             {
                 LogSection("1) z_PTV_eval_{dose}_{suffix}");
                 foreach (var k in groupKeys)
@@ -873,6 +942,26 @@ namespace VMS.TPS
                     string doseStr = k.DoseGy.ToString(System.Globalization.CultureInfo.InvariantCulture);
                     string sfxStr = string.IsNullOrWhiteSpace(k.Suffix) ? "" : "_" + k.Suffix;
                     string evalId = TruncId($"z_PTV_eval_{doseStr}{sfxStr}");
+
+                    // Selective generation (Generic only): Eval unticked - reuse
+                    // whatever z_PTV_eval structure already exists (from an
+                    // earlier full run) instead of rebuilding it, so Opt/Ring/
+                    // Rind/Avoidance still have real geometry to work from.
+                    if (!rebuild)
+                    {
+                        var existing = _ss.Structures.FirstOrDefault(s =>
+                            !s.IsEmpty && string.Equals(s.Id, evalId, StringComparison.OrdinalIgnoreCase));
+                        if (existing != null)
+                        {
+                            _zEval[k] = existing;
+                            _progress.AppendLine($"  REUSE: {evalId} (Eval not selected - using existing structure)");
+                        }
+                        else
+                        {
+                            _progress.AppendLine($"  SKIP: {evalId} (Eval not selected, and no existing structure to reuse)");
+                        }
+                        continue;
+                    }
 
                     using (var tg = new TempGuard(_ss))
                     {
@@ -909,7 +998,7 @@ namespace VMS.TPS
             // ------------------------------------------------------------------
             // STEP 2: z_PTV_opt_{dose}_{suffix}
             // ------------------------------------------------------------------
-            private void Step2_OptPtv(List<OptKey> groupKeys, Structure ext, bool isGeneric)
+            private void Step2_OptPtv(List<OptKey> groupKeys, Structure ext, bool isGeneric, bool rebuild)
             {
                 LogSection("2) z_PTV_opt_{dose}_{suffix}");
                 foreach (var k in groupKeys)
@@ -919,6 +1008,26 @@ namespace VMS.TPS
                     string doseStr = k.DoseGy.ToString(System.Globalization.CultureInfo.InvariantCulture);
                     string sfxStr = string.IsNullOrWhiteSpace(k.Suffix) ? "" : "_" + k.Suffix;
                     string optId = TruncId($"z_PTV_opt_{doseStr}{sfxStr}");
+
+                    // Selective generation (Generic only): Opt unticked - reuse
+                    // whatever z_PTV_opt structure already exists instead of
+                    // rebuilding it, so Ring/Rind/Avoidance still have real
+                    // geometry to work from.
+                    if (!rebuild)
+                    {
+                        var existing = _ss.Structures.FirstOrDefault(s =>
+                            !s.IsEmpty && string.Equals(s.Id, optId, StringComparison.OrdinalIgnoreCase));
+                        if (existing != null)
+                        {
+                            _zOpt[k] = existing;
+                            _progress.AppendLine($"  REUSE: {optId} (Opt not selected - using existing structure)");
+                        }
+                        else
+                        {
+                            _progress.AppendLine($"  SKIP: {optId} (Opt not selected, and no existing structure to reuse)");
+                        }
+                        continue;
+                    }
 
                     using (var tg = new TempGuard(_ss))
                     {
@@ -2152,10 +2261,14 @@ namespace VMS.TPS
             // pipeline and has no "other group" subtraction step.
             private void BuildGenericHighestDoseRing(OptKey highestKey, double gapMm, Structure ext)
             {
-                if (!_zOpt.TryGetValue(highestKey, out var highestOpt)) return;
-
                 string doseStr = highestKey.DoseGy.ToString(System.Globalization.CultureInfo.InvariantCulture);
                 string ringId = TruncId($"z_Ring_{doseStr}");
+
+                if (!_zOpt.TryGetValue(highestKey, out var highestOpt))
+                {
+                    _progress.AppendLine($"  SKIP: {ringId} (highest-dose PTV_Opt not available - Opt wasn't (re)built and no existing structure was found)");
+                    return;
+                }
 
                 try
                 {
@@ -2952,6 +3065,20 @@ namespace VMS.TPS
             public List<TargetDoseRow> TargetDoseRows { get; } = new List<TargetDoseRow>();
             public List<OrganRow> OrganRows { get; } = new List<OrganRow>();
 
+            // Generic tab only: when UseSelectiveGeneration is on, only the
+            // ticked rows below are (re)built by Generate Structures; unticked
+            // ones are skipped entirely, falling back to whatever already
+            // exists in the structure set (see StructureProcessor.Run()).
+            public bool UseSelectiveGeneration { get; set; } = false;
+            public List<AutoStructureRow> AutoStructureRows { get; } = new List<AutoStructureRow>
+            {
+                new AutoStructureRow { Name = "Eval" },
+                new AutoStructureRow { Name = "Opt" },
+                new AutoStructureRow { Name = "Rings" },
+                new AutoStructureRow { Name = "Rind" },
+                new AutoStructureRow { Name = "Avoidance" }
+            };
+
             public UiModel(
                 List<Structure> targets,
                 List<Structure> oars,
@@ -3148,6 +3275,26 @@ namespace VMS.TPS
             public double? ParsedNestedThicknessMm => double.TryParse(_nestedThicknessMm,
                 System.Globalization.NumberStyles.Any,
                 System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : (double?)null;
+
+            public event PropertyChangedEventHandler PropertyChanged;
+            private void OnPC(string name) =>
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+        }
+
+        // Generic tab only: one row per auto-generated structure category
+        // (Eval/Opt/Rings/Rind/Avoidance) in the "Auto Structures" table,
+        // ticked on by default so leaving UseSelectiveGeneration off behaves
+        // exactly like generating everything, matching the pre-existing
+        // behavior. See StructureProcessor.Run().
+        private sealed class AutoStructureRow : INotifyPropertyChanged
+        {
+            private bool _isSelected = true;
+            public string Name { get; set; }
+            public bool IsSelected
+            {
+                get => _isSelected;
+                set { if (_isSelected != value) { _isSelected = value; OnPC(nameof(IsSelected)); } }
+            }
 
             public event PropertyChangedEventHandler PropertyChanged;
             private void OnPC(string name) =>
@@ -3492,7 +3639,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.7.0.0";
+                Title = "Generic Crop Structure Generator - v5.8.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
@@ -3735,6 +3882,7 @@ namespace VMS.TPS
                 private bool IsGenericKind => _kind == TabKind.Generic;
 
                 private DataGrid _dgTargets, _dgOrgans, _dgCrop;
+                private DataGrid _dgAutoStructures;   // Generic-only: selective Eval/Opt/Rings/Rind/Avoidance generation
                 private ComboBox _cbExternal, _cbTargetFilter, _cbMode, _cbPhysicalThickness;
 
                 // Only the Targets columns that SwitchMode toggles Visibility on
@@ -4157,8 +4305,73 @@ namespace VMS.TPS
                         leftPanel.Children.Add(zonePanel);
                     }
 
+                    if (IsGenericKind)
+                    {
+                        var autoPanel = BuildAutoStructuresPanel();
+                        DockPanel.SetDock(autoPanel, Dock.Bottom);
+                        leftPanel.Children.Add(autoPanel);
+                    }
+
                     leftPanel.Children.Add(_dgTargets);
                     return leftPanel;
+                }
+
+                // Generic-only: lets the user pick which auto-generated
+                // structure categories Generate Structures actually (re)builds
+                // this run, instead of always running the whole pipeline.
+                // The table only takes effect when UseSelectiveGeneration is
+                // ticked - unticked categories are skipped entirely, and
+                // StructureProcessor falls back to whatever already exists in
+                // the structure set from an earlier run (see Run()).
+                private UIElement BuildAutoStructuresPanel()
+                {
+                    var section = new StackPanel { Orientation = Orientation.Vertical, Margin = new Thickness(0, 10, 0, 0) };
+
+                    var cbSelective = new CheckBox
+                    {
+                        Content = "Generate selected structures only",
+                        Foreground = (Brush)_owner.FindResource("TextSecondary"),
+                        FontWeight = FontWeights.Bold,
+                        IsChecked = _vm.UseSelectiveGeneration,
+                        Margin = new Thickness(0, 0, 0, 8),
+                        ToolTip = "When off (default), Generate Structures always builds everything below.\n" +
+                                  "When on, only the ticked rows are (re)built - unticked ones are skipped, " +
+                                  "reusing whatever already exists in the structure set from an earlier run."
+                    };
+                    section.Children.Add(cbSelective);
+
+                    _dgAutoStructures = new DataGrid
+                    {
+                        AutoGenerateColumns = false,
+                        CanUserAddRows = false,
+                        CanUserDeleteRows = false,
+                        HeadersVisibility = DataGridHeadersVisibility.Column,
+                        ItemsSource = _vm.AutoStructureRows,
+                        CellStyle = _singleClickCellStyle,
+                        MaxHeight = 160,
+                        IsEnabled = _vm.UseSelectiveGeneration
+                    };
+                    _dgAutoStructures.Columns.Add(new DataGridTextColumn
+                    {
+                        Header = "Auto Structure",
+                        Binding = new Binding(nameof(AutoStructureRow.Name)),
+                        IsReadOnly = true,
+                        Width = new DataGridLength(1, DataGridLengthUnitType.Star),
+                        ElementStyle = (Style)_owner.FindResource(typeof(TextBlock))
+                    });
+                    _dgAutoStructures.Columns.Add(_owner.MakeSingleClickCheckColumn(
+                        _owner.MakeHeaderCheckbox("Generate", isChecked =>
+                        {
+                            foreach (var r in _vm.AutoStructureRows) r.IsSelected = isChecked;
+                            _dgAutoStructures.Items.Refresh();
+                        }),
+                        nameof(AutoStructureRow.IsSelected), 85));
+
+                    cbSelective.Checked += (s, e) => { _vm.UseSelectiveGeneration = true; _dgAutoStructures.IsEnabled = true; };
+                    cbSelective.Unchecked += (s, e) => { _vm.UseSelectiveGeneration = false; _dgAutoStructures.IsEnabled = false; };
+
+                    section.Children.Add(_dgAutoStructures);
+                    return _owner.CreateCard(section);
                 }
 
                 // RCC-only: the read-only "Crop Distance Matrix" (one row per OAR
