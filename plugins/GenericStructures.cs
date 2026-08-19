@@ -414,6 +414,35 @@
 //                   (UpdateStructureCount) does not yet account for
 //                   selective generation, so its peak-count warning may
 //                   over-estimate when categories are unticked.
+//   v5.9.0.0  – Generic: redesigned the Auto Structures table from 5 static
+//               category rows to a live list of the exact structure IDs the
+//               pipeline will produce, and extended selective generation
+//               down to individual structures instead of whole categories:
+//                 - Tick column moved before the name column.
+//                 - AutoStructureRow.Name now holds a real result ID
+//                   (e.g. "z_PTV_eval_60_a", "z_Heart_Ovl_60", "PRV_Cord")
+//                   instead of a fixed category label; the table is rebuilt
+//                   by RefreshAutoStructurePreview() on every Targets/Organs
+//                   grid edit, mirroring the RCC tab's RefreshRccPlan() live
+//                   preview, with per-ID tick state preserved across
+//                   rebuilds.
+//                 - If no PTV row is ticked with a valid dose, the table is
+//                   emptied and a warning banner explains that a PTV with a
+//                   dose must be ticked first to preview what will be
+//                   generated.
+//                 - Per-OAR Ovl/Opt/PRV outputs (Step6/7/8) are now
+//                   individually selectable too, not just the five PTV-level
+//                   categories from v5.8.0.0 - each now computes its result
+//                   ID up front and checks IsAutoStructureSelected(id)
+//                   before doing any geometry work, logging SKIP otherwise.
+//                 - StructureProcessor.IsAutoStructureSelected(name) is now
+//                   the single gate used everywhere (Step1, Step2, Step4,
+//                   the ring builders, Step10, Step6, Step7, Step8) -
+//                   replaced the old per-category `rebuild`/doRings/doRind
+//                   flags entirely.
+//                 - Same reuse-from-existing-structure fallback as v5.8.0.0
+//                   still applies to Eval/Opt when unticked, so downstream
+//                   steps keep real geometry to build from.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -438,8 +467,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.8.0.0")]
-[assembly: AssemblyFileVersion("5.8.0.0")]
+[assembly: AssemblyVersion("5.9.0.0")]
+[assembly: AssemblyFileVersion("5.9.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -817,27 +846,21 @@ namespace VMS.TPS
 
                         bool isGeneric = _vm.IsGenericTab;
 
-                        // Generic tab, selective generation only: which auto
-                        // structure categories are actually ticked this run.
-                        // Unticked ones are skipped in Step1/Step2 (falling back
-                        // to any already-existing structure) or skipped outright
-                        // in Step4/Step9/Step10 (see IsAutoStructureSelected).
-                        bool doEval = IsAutoStructureSelected("Eval");
-                        bool doOpt = IsAutoStructureSelected("Opt");
-                        bool doRings = IsAutoStructureSelected("Rings");
-                        bool doRind = IsAutoStructureSelected("Rind");
-                        bool doAvoidance = IsAutoStructureSelected("Avoidance");
-
                         // Each step runs through RunStep() so an exception in one
                         // (e.g. Step3a) can't silently abort every step after it -
                         // previously all of Step1-Step10 shared one try/catch around
                         // the whole Run() body, so an early failure meant later
                         // structures (avoidance, rings, rind) never even attempted
                         // and the only sign was one generic "Script FAILED" dialog.
+                        // Selective generation (Generic only): each step below
+                        // checks IsAutoStructureSelected(resultId) per structure
+                        // it's about to build, so unticked structures are either
+                        // skipped with a fallback lookup (Eval/Opt) or skipped
+                        // outright (everything else) - see each Step method.
                         RunStep("1) z_PTV_eval_{dose}_{suffix}",
-                            () => Step1_EvalPtv(groupKeys, targetsByGroup, selectedExternal, bodyMinus3, doEval));
+                            () => Step1_EvalPtv(groupKeys, targetsByGroup, selectedExternal, bodyMinus3));
                         RunStep("2) z_PTV_opt_{dose}_{suffix}",
-                            () => Step2_OptPtv(groupKeys, selectedExternal, isGeneric, doOpt));
+                            () => Step2_OptPtv(groupKeys, selectedExternal, isGeneric));
 
                         // Step3a's per-dose-level sums (z_PTV_opt_{dose}_sum) still
                         // have to exist for Step6_Overlaps either way, but Generic
@@ -854,18 +877,11 @@ namespace VMS.TPS
                             () => optSum = Step3b_GlobalOptPtvSum(selectedTargets, selectedExternal));
 
                         if (isGeneric)
-                        {
-                            if (doAvoidance)
-                                RunStep("4) z_Avoidance",
-                                    () => Step4_Avoidance_Generic(groupKeys, optSum, selectedExternal));
-                            else
-                                _progress.AppendLine("\n-- 4) z_Avoidance --\n  SKIP: z_Avoidance (not selected)");
-                        }
+                            RunStep("4) z_Avoidance",
+                                () => Step4_Avoidance_Generic(groupKeys, optSum, selectedExternal));
                         else
-                        {
                             RunStep("4) zAvoidance_{dose}(_{suffix})",
                                 () => Step4_Avoidance(groupKeys, doseLevels, targetDosePairs, selectedExternal));
-                        }
 
                         // Step5: pass physicalBolus (null if not used).
                         // When non-null, Step5 builds Body_with_Bolus = body Or physicalBolus
@@ -883,17 +899,15 @@ namespace VMS.TPS
 
                         if (isGeneric)
                         {
-                            if (doRings)
-                                RunStep("9) z_Ring_1 / z_Ring_2 (RCC ring pipeline) / z_Ring_{dose}",
-                                    () => Step9_RccRings_Generic(groupKeys, optSum, selectedExternal));
-                            else
-                                _progress.AppendLine("\n-- 9) z_Ring_1 / z_Ring_2 / z_Ring_{dose} --\n  SKIP: rings (not selected)");
+                            // Ring/Rind selection is now handled per-structure inside
+                            // Step9_RccRings_Generic / Step10_Rind_Generic via
+                            // IsAutoStructureSelected(id), so both steps always run and
+                            // each decides per-ID whether to build or skip.
+                            RunStep("9) z_Ring_1 / z_Ring_2 (RCC ring pipeline) / z_Ring_{dose}",
+                                () => Step9_RccRings_Generic(groupKeys, optSum, selectedExternal));
 
-                            if (doRind)
-                                RunStep("10) z_Rind_{dose}",
-                                    () => Step10_Rind_Generic(groupKeys, selectedExternal));
-                            else
-                                _progress.AppendLine("\n-- 10) z_Rind_{dose} --\n  SKIP: rind (not selected)");
+                            RunStep("10) z_Rind_{dose}",
+                                () => Step10_Rind_Generic(groupKeys, selectedExternal));
                         }
                         else
                         {
@@ -931,8 +945,7 @@ namespace VMS.TPS
                 List<OptKey> groupKeys,
                 Dictionary<OptKey, List<Structure>> targetsByGroup,
                 Structure ext,
-                SegmentVolume bodyMinus3,
-                bool rebuild)
+                SegmentVolume bodyMinus3)
             {
                 LogSection("1) z_PTV_eval_{dose}_{suffix}");
                 foreach (var k in groupKeys)
@@ -943,11 +956,12 @@ namespace VMS.TPS
                     string sfxStr = string.IsNullOrWhiteSpace(k.Suffix) ? "" : "_" + k.Suffix;
                     string evalId = TruncId($"z_PTV_eval_{doseStr}{sfxStr}");
 
-                    // Selective generation (Generic only): Eval unticked - reuse
-                    // whatever z_PTV_eval structure already exists (from an
-                    // earlier full run) instead of rebuilding it, so Opt/Ring/
-                    // Rind/Avoidance still have real geometry to work from.
-                    if (!rebuild)
+                    // Selective generation (Generic only): this exact structure
+                    // unticked - reuse whatever z_PTV_eval structure already
+                    // exists (from an earlier full run) instead of rebuilding
+                    // it, so Opt/Ring/Rind/Avoidance still have real geometry
+                    // to work from.
+                    if (!IsAutoStructureSelected(evalId))
                     {
                         var existing = _ss.Structures.FirstOrDefault(s =>
                             !s.IsEmpty && string.Equals(s.Id, evalId, StringComparison.OrdinalIgnoreCase));
@@ -998,7 +1012,7 @@ namespace VMS.TPS
             // ------------------------------------------------------------------
             // STEP 2: z_PTV_opt_{dose}_{suffix}
             // ------------------------------------------------------------------
-            private void Step2_OptPtv(List<OptKey> groupKeys, Structure ext, bool isGeneric, bool rebuild)
+            private void Step2_OptPtv(List<OptKey> groupKeys, Structure ext, bool isGeneric)
             {
                 LogSection("2) z_PTV_opt_{dose}_{suffix}");
                 foreach (var k in groupKeys)
@@ -1009,11 +1023,11 @@ namespace VMS.TPS
                     string sfxStr = string.IsNullOrWhiteSpace(k.Suffix) ? "" : "_" + k.Suffix;
                     string optId = TruncId($"z_PTV_opt_{doseStr}{sfxStr}");
 
-                    // Selective generation (Generic only): Opt unticked - reuse
-                    // whatever z_PTV_opt structure already exists instead of
-                    // rebuilding it, so Ring/Rind/Avoidance still have real
-                    // geometry to work from.
-                    if (!rebuild)
+                    // Selective generation (Generic only): this exact structure
+                    // unticked - reuse whatever z_PTV_opt structure already
+                    // exists instead of rebuilding it, so Ring/Rind/Avoidance
+                    // still have real geometry to work from.
+                    if (!IsAutoStructureSelected(optId))
                     {
                         var existing = _ss.Structures.FirstOrDefault(s =>
                             !s.IsEmpty && string.Equals(s.Id, optId, StringComparison.OrdinalIgnoreCase));
@@ -1268,12 +1282,17 @@ namespace VMS.TPS
                 List<OptKey> groupKeys, Structure optSum, Structure ext)
             {
                 LogSection("4) z_Avoidance");
+                const string avoidId = "z_Avoidance";
                 if (groupKeys.Count == 0 || optSum == null) return;
+                if (!IsAutoStructureSelected(avoidId))
+                {
+                    _progress.AppendLine($"  SKIP: {avoidId} (not selected)");
+                    return;
+                }
 
                 double highestRx = groupKeys.Max(k => k.DoseGy);
                 double referenceDoseGy = GENERIC_AVOIDANCE_ISO_FRACTION * highestRx;
 
-                const string avoidId = "z_Avoidance";
                 try
                 {
                     using (var tg = new TempGuard(_ss))
@@ -1836,14 +1855,19 @@ namespace VMS.TPS
 
                     foreach (var req in ovlRequests)
                     {
-                        string ovlDisplayName = $"z_{req.OarId}_Ovl_{doseStr}";
+                        var ovlId = BuildId("z_", req.OarId, $"_Ovl_{doseStr}");
+                        if (!IsAutoStructureSelected(ovlId))
+                        {
+                            _progress.AppendLine($"  SKIP: {ovlId} (not selected)");
+                            continue;
+                        }
                         try
                         {
                             var oar = _ss.Structures.FirstOrDefault(s =>
                                 !s.IsEmpty && string.Equals(s.Id, req.OarId, StringComparison.OrdinalIgnoreCase));
                             if (oar == null || oar.IsEmpty)
                             {
-                                _progress.AppendLine($"  SKIP: {ovlDisplayName} (OAR not found or empty)");
+                                _progress.AppendLine($"  SKIP: {ovlId} (OAR not found or empty)");
                                 continue;
                             }
 
@@ -1851,7 +1875,6 @@ namespace VMS.TPS
                             {
                                 var optSeg = CloneSegViaTempTracked(_ss, optSumSt.SegmentVolume, "zTmpOptOvlp", tg);
                                 var oarSeg = CloneSegViaTempTracked(_ss, oar.SegmentVolume, "zTmpOarOvlp", tg);
-                                var ovlId = BuildId("z_", req.OarId, $"_Ovl_{doseStr}");
                                 var opToUse = OVERLAP_IS_INTERSECTION ? BoolOp.And : BoolOp.Or;
                                 var actionName = OVERLAP_IS_INTERSECTION ? "And" : "Or";
 
@@ -1895,7 +1918,7 @@ namespace VMS.TPS
                         }
                         catch (Exception exOvl)
                         {
-                            _progress.AppendLine($"  FAIL: {ovlDisplayName} -> {exOvl.Message}");
+                            _progress.AppendLine($"  FAIL: {ovlId} -> {exOvl.Message}");
                         }
                     }
                 }
@@ -1954,20 +1977,25 @@ namespace VMS.TPS
 
                     foreach (var req in optRequests)
                     {
+                        var optId = BuildId("z_", req.OarId, "_Opt");
+                        if (!IsAutoStructureSelected(optId))
+                        {
+                            _progress.AppendLine($"  SKIP: {optId} (not selected)");
+                            continue;
+                        }
                         try
                         {
                             var oar = _ss.Structures.FirstOrDefault(s =>
                                 !s.IsEmpty && string.Equals(s.Id, req.OarId, StringComparison.OrdinalIgnoreCase));
                             if (oar == null || oar.IsEmpty)
                             {
-                                _progress.AppendLine($"  SKIP: z_{req.OarId}_Opt (OAR not found or empty)");
+                                _progress.AppendLine($"  SKIP: {optId} (OAR not found or empty)");
                                 continue;
                             }
 
                             using (var innerTg = new TempGuard(_ss))
                             {
                                 var seg = CloneSegViaTempTracked(_ss, oar.SegmentVolume, "zTmpOar", innerTg);
-                                var optId = BuildId("z_", req.OarId, "_Opt");
 
                                 if (evalPlus2UnionSeg != null)
                                     seg = SafeBoolean(_ss, seg, evalPlus2UnionSeg, BoolOp.Sub,
@@ -1996,7 +2024,7 @@ namespace VMS.TPS
                         }
                         catch (Exception exOpt)
                         {
-                            _progress.AppendLine($"  FAIL: z_{req.OarId}_Opt -> {exOpt.Message}");
+                            _progress.AppendLine($"  FAIL: {optId} -> {exOpt.Message}");
                         }
                     }
                 }
@@ -2015,13 +2043,19 @@ namespace VMS.TPS
 
                 foreach (var req in prvRequests)
                 {
+                    var prvId = BuildId("PRV_", req.OarId);
+                    if (!IsAutoStructureSelected(prvId))
+                    {
+                        _progress.AppendLine($"  SKIP: {prvId} (not selected)");
+                        continue;
+                    }
                     try
                     {
                         var oar = _ss.Structures.FirstOrDefault(s =>
                             !s.IsEmpty && string.Equals(s.Id, req.OarId, StringComparison.OrdinalIgnoreCase));
                         if (oar == null || oar.IsEmpty)
                         {
-                            _progress.AppendLine($"  SKIP: PRV_{req.OarId} (OAR not found or empty)");
+                            _progress.AppendLine($"  SKIP: {prvId} (OAR not found or empty)");
                             continue;
                         }
 
@@ -2053,7 +2087,6 @@ namespace VMS.TPS
                                 prvSeg = SafeMargin(oarTemp.SegmentVolume, marginMm);
                             }
 
-                            var prvId = BuildId("PRV_", req.OarId);
                             SegmentVolume cappedSeg;
                             try { cappedSeg = prvSeg.And(extTemp.SegmentVolume); }
                             catch
@@ -2084,7 +2117,7 @@ namespace VMS.TPS
                     }
                     catch (Exception exPrv)
                     {
-                        _progress.AppendLine($"  FAIL: PRV_{req.OarId} -> {exPrv.Message}");
+                        _progress.AppendLine($"  FAIL: {prvId} -> {exPrv.Message}");
                     }
                 }
             }
@@ -2264,6 +2297,12 @@ namespace VMS.TPS
                 string doseStr = highestKey.DoseGy.ToString(System.Globalization.CultureInfo.InvariantCulture);
                 string ringId = TruncId($"z_Ring_{doseStr}");
 
+                if (!IsAutoStructureSelected(ringId))
+                {
+                    _progress.AppendLine($"  SKIP: {ringId} (not selected)");
+                    return;
+                }
+
                 if (!_zOpt.TryGetValue(highestKey, out var highestOpt))
                 {
                     _progress.AppendLine($"  SKIP: {ringId} (highest-dose PTV_Opt not available - Opt wasn't (re)built and no existing structure was found)");
@@ -2318,6 +2357,11 @@ namespace VMS.TPS
                 Structure optSum, Structure ext)
             {
                 const string ringId = "z_Ring_1";
+                if (!IsAutoStructureSelected(ringId))
+                {
+                    _progress.AppendLine($"  SKIP: {ringId} (not selected)");
+                    return null;
+                }
                 try
                 {
                     using (var tg = new TempGuard(_ss))
@@ -2374,6 +2418,11 @@ namespace VMS.TPS
                 Structure optSum, Structure ext, Structure ring1St)
             {
                 const string ringId = "z_Ring_2";
+                if (!IsAutoStructureSelected(ringId))
+                {
+                    _progress.AppendLine($"  SKIP: {ringId} (not selected)");
+                    return;
+                }
                 try
                 {
                     using (var tg = new TempGuard(_ss))
@@ -2440,11 +2489,20 @@ namespace VMS.TPS
                 LogSection("10) z_Rind_{dose}");
                 foreach (var k in groupKeys)
                 {
-                    if (!_zOpt.TryGetValue(k, out var optSt)) continue;
-
                     string doseStr = k.DoseGy.ToString(System.Globalization.CultureInfo.InvariantCulture);
                     string sfxStr = string.IsNullOrWhiteSpace(k.Suffix) ? "" : "_" + k.Suffix;
                     string rindId = TruncId($"z_Rind_{doseStr}{sfxStr}");
+
+                    if (!IsAutoStructureSelected(rindId))
+                    {
+                        _progress.AppendLine($"  SKIP: {rindId} (not selected)");
+                        continue;
+                    }
+                    if (!_zOpt.TryGetValue(k, out var optSt))
+                    {
+                        _progress.AppendLine($"  SKIP: {rindId} (PTV_Opt not available)");
+                        continue;
+                    }
 
                     try
                     {
@@ -3069,15 +3127,11 @@ namespace VMS.TPS
             // ticked rows below are (re)built by Generate Structures; unticked
             // ones are skipped entirely, falling back to whatever already
             // exists in the structure set (see StructureProcessor.Run()).
+            // Populated dynamically by SiteTabController.RefreshAutoStructurePreview()
+            // with the real structure ids the pipeline would generate for the
+            // currently ticked targets/organs - not a fixed list.
             public bool UseSelectiveGeneration { get; set; } = false;
-            public List<AutoStructureRow> AutoStructureRows { get; } = new List<AutoStructureRow>
-            {
-                new AutoStructureRow { Name = "Eval" },
-                new AutoStructureRow { Name = "Opt" },
-                new AutoStructureRow { Name = "Rings" },
-                new AutoStructureRow { Name = "Rind" },
-                new AutoStructureRow { Name = "Avoidance" }
-            };
+            public List<AutoStructureRow> AutoStructureRows { get; } = new List<AutoStructureRow>();
 
             public UiModel(
                 List<Structure> targets,
@@ -3639,7 +3693,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.8.0.0";
+                Title = "Generic Crop Structure Generator - v5.9.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
@@ -3882,7 +3936,8 @@ namespace VMS.TPS
                 private bool IsGenericKind => _kind == TabKind.Generic;
 
                 private DataGrid _dgTargets, _dgOrgans, _dgCrop;
-                private DataGrid _dgAutoStructures;   // Generic-only: selective Eval/Opt/Rings/Rind/Avoidance generation
+                private DataGrid _dgAutoStructures;   // Generic-only: selective per-structure generation
+                private TextBlock _txtAutoStructuresWarning;
                 private ComboBox _cbExternal, _cbTargetFilter, _cbMode, _cbPhysicalThickness;
 
                 // Only the Targets columns that SwitchMode toggles Visibility on
@@ -3939,6 +3994,7 @@ namespace VMS.TPS
                                 BuildCropGrid(_vm.TargetDoseRows.Where(r => r.IsSelected).ToList());
                         }
                         UpdateStructureCount();
+                        if (IsGenericKind) RefreshAutoStructurePreview();
                     };
 
                     foreach (var row in _vm.TargetDoseRows)
@@ -3950,6 +4006,7 @@ namespace VMS.TPS
 
                     if (IsRcc) RefreshRccPlan();
                     else UpdateStructureCount();
+                    if (IsGenericKind) RefreshAutoStructurePreview();
                 }
 
                 // ----------------------------------------------------------------
@@ -4316,13 +4373,17 @@ namespace VMS.TPS
                     return leftPanel;
                 }
 
-                // Generic-only: lets the user pick which auto-generated
-                // structure categories Generate Structures actually (re)builds
-                // this run, instead of always running the whole pipeline.
-                // The table only takes effect when UseSelectiveGeneration is
-                // ticked - unticked categories are skipped entirely, and
-                // StructureProcessor falls back to whatever already exists in
-                // the structure set from an earlier run (see Run()).
+                // Generic-only: lets the user pick which specific structures
+                // Generate Structures actually (re)builds this run, instead of
+                // always running the whole pipeline. Rows are the REAL
+                // structure ids the pipeline would create for the currently
+                // ticked targets/organs (kept in sync by
+                // RefreshAutoStructurePreview, called whenever a Target/Organ
+                // row changes). The table only takes effect when
+                // UseSelectiveGeneration is ticked - unticked rows are skipped
+                // entirely, and StructureProcessor falls back to whatever
+                // already exists in the structure set from an earlier run
+                // (see Run()/IsAutoStructureSelected).
                 private UIElement BuildAutoStructuresPanel()
                 {
                     var section = new StackPanel { Orientation = Orientation.Vertical, Margin = new Thickness(0, 10, 0, 0) };
@@ -4335,10 +4396,20 @@ namespace VMS.TPS
                         IsChecked = _vm.UseSelectiveGeneration,
                         Margin = new Thickness(0, 0, 0, 8),
                         ToolTip = "When off (default), Generate Structures always builds everything below.\n" +
-                                  "When on, only the ticked rows are (re)built - unticked ones are skipped, " +
+                                  "When on, only the ticked structures are (re)built - unticked ones are skipped, " +
                                   "reusing whatever already exists in the structure set from an earlier run."
                     };
                     section.Children.Add(cbSelective);
+
+                    _txtAutoStructuresWarning = new TextBlock
+                    {
+                        Text = "Tick at least one PTV with a valid dose in the Targets table above to preview the structures that will be generated.",
+                        Foreground = (Brush)_owner.FindResource("WarnYellow"),
+                        TextWrapping = TextWrapping.Wrap,
+                        Margin = new Thickness(0, 0, 0, 8),
+                        Visibility = Visibility.Collapsed
+                    };
+                    section.Children.Add(_txtAutoStructuresWarning);
 
                     _dgAutoStructures = new DataGrid
                     {
@@ -4348,30 +4419,112 @@ namespace VMS.TPS
                         HeadersVisibility = DataGridHeadersVisibility.Column,
                         ItemsSource = _vm.AutoStructureRows,
                         CellStyle = _singleClickCellStyle,
-                        MaxHeight = 160,
+                        MaxHeight = 220,
                         IsEnabled = _vm.UseSelectiveGeneration
                     };
+                    AddBoolColumn(_dgAutoStructures, _vm.AutoStructureRows, "Gen",
+                        (r, v) => r.IsSelected = v, nameof(AutoStructureRow.IsSelected), 55, () => { });
                     _dgAutoStructures.Columns.Add(new DataGridTextColumn
                     {
-                        Header = "Auto Structure",
+                        Header = "Structure that will be generated",
                         Binding = new Binding(nameof(AutoStructureRow.Name)),
                         IsReadOnly = true,
                         Width = new DataGridLength(1, DataGridLengthUnitType.Star),
                         ElementStyle = (Style)_owner.FindResource(typeof(TextBlock))
                     });
-                    _dgAutoStructures.Columns.Add(_owner.MakeSingleClickCheckColumn(
-                        _owner.MakeHeaderCheckbox("Generate", isChecked =>
-                        {
-                            foreach (var r in _vm.AutoStructureRows) r.IsSelected = isChecked;
-                            _dgAutoStructures.Items.Refresh();
-                        }),
-                        nameof(AutoStructureRow.IsSelected), 85));
 
                     cbSelective.Checked += (s, e) => { _vm.UseSelectiveGeneration = true; _dgAutoStructures.IsEnabled = true; };
                     cbSelective.Unchecked += (s, e) => { _vm.UseSelectiveGeneration = false; _dgAutoStructures.IsEnabled = false; };
 
                     section.Children.Add(_dgAutoStructures);
                     return _owner.CreateCard(section);
+                }
+
+                // Rebuilds _vm.AutoStructureRows with the real structure ids
+                // StructureProcessor.Run() would (re)build for the currently
+                // ticked targets/organs - PTV_Eval/Opt/Rind per dose group,
+                // the global Opt_Sum, all 3 rings, Avoidance, and per-OAR
+                // Ovl/Opt/PRV for whichever organs are ticked. Each id's prior
+                // IsSelected state is preserved across refreshes (new ids
+                // default to selected) so ticking a structure off survives
+                // unrelated edits elsewhere in the tab.
+                private void RefreshAutoStructurePreview()
+                {
+                    if (_dgAutoStructures == null) return;
+
+                    _dgTargets?.CommitEdit(DataGridEditingUnit.Cell, true);
+                    _dgTargets?.CommitEdit(DataGridEditingUnit.Row, true);
+                    _dgOrgans?.CommitEdit(DataGridEditingUnit.Cell, true);
+                    _dgOrgans?.CommitEdit(DataGridEditingUnit.Row, true);
+
+                    var prevSelection = _vm.AutoStructureRows
+                        .ToDictionary(r => r.Name, r => r.IsSelected, StringComparer.OrdinalIgnoreCase);
+                    _vm.AutoStructureRows.Clear();
+
+                    void AddRow(string id)
+                    {
+                        if (string.IsNullOrEmpty(id)) return;
+                        if (_vm.AutoStructureRows.Any(r => string.Equals(r.Name, id, StringComparison.OrdinalIgnoreCase)))
+                            return;
+                        bool selected = !prevSelection.TryGetValue(id, out var prev) || prev;
+                        _vm.AutoStructureRows.Add(new AutoStructureRow { Name = id, IsSelected = selected });
+                    }
+
+                    var validTargets = _vm.TargetDoseRows
+                        .Where(r => r.IsSelected && r.ParsedDoseGy.HasValue && r.ParsedDoseGy.Value > 0)
+                        .ToList();
+
+                    if (validTargets.Count == 0)
+                    {
+                        if (_txtAutoStructuresWarning != null) _txtAutoStructuresWarning.Visibility = Visibility.Visible;
+                        _dgAutoStructures.ItemsSource = null;
+                        _dgAutoStructures.ItemsSource = _vm.AutoStructureRows;
+                        return;
+                    }
+                    if (_txtAutoStructuresWarning != null) _txtAutoStructuresWarning.Visibility = Visibility.Collapsed;
+
+                    var groupKeys = validTargets
+                        .Select(r => new OptKey(r.ParsedDoseGy.Value, (r.Suffix ?? "").Trim()))
+                        .Distinct()
+                        .OrderByDescending(k => k.DoseGy)
+                        .ThenBy(k => k.Suffix, StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+
+                    foreach (var k in groupKeys)
+                    {
+                        string doseStr = k.DoseGy.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                        string sfxStr = string.IsNullOrWhiteSpace(k.Suffix) ? "" : "_" + k.Suffix;
+                        AddRow(TruncId($"z_PTV_eval_{doseStr}{sfxStr}"));
+                        AddRow(TruncId($"z_PTV_opt_{doseStr}{sfxStr}"));
+                    }
+
+                    AddRow(ID_OPT_TV_SUM);
+
+                    AddRow("z_Ring_1");
+                    AddRow("z_Ring_2");
+                    string highestDoseStr = groupKeys[0].DoseGy.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                    AddRow(TruncId($"z_Ring_{highestDoseStr}"));
+
+                    foreach (var k in groupKeys)
+                    {
+                        string doseStr = k.DoseGy.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                        string sfxStr = string.IsNullOrWhiteSpace(k.Suffix) ? "" : "_" + k.Suffix;
+                        AddRow(TruncId($"z_Rind_{doseStr}{sfxStr}"));
+                    }
+
+                    AddRow("z_Avoidance");
+
+                    var doseLevels = groupKeys.Select(k => k.DoseGy).Distinct().ToList();
+                    foreach (var oar in _vm.OrganRows.Where(o => o.CreateOvl))
+                        foreach (var d in doseLevels)
+                            AddRow(BuildId("z_", oar.OarId, $"_Ovl_{d.ToString(System.Globalization.CultureInfo.InvariantCulture)}"));
+                    foreach (var oar in _vm.OrganRows.Where(o => o.CreateOpt))
+                        AddRow(BuildId("z_", oar.OarId, "_Opt"));
+                    foreach (var oar in _vm.OrganRows.Where(o => o.CreatePrv && o.ParsedPrvMarginMm.GetValueOrDefault() > 0))
+                        AddRow(BuildId("PRV_", oar.OarId));
+
+                    _dgAutoStructures.ItemsSource = null;
+                    _dgAutoStructures.ItemsSource = _vm.AutoStructureRows;
                 }
 
                 // RCC-only: the read-only "Crop Distance Matrix" (one row per OAR
