@@ -443,6 +443,25 @@
 //                 - Same reuse-from-existing-structure fallback as v5.8.0.0
 //                   still applies to Eval/Opt when unticked, so downstream
 //                   steps keep real geometry to build from.
+//   v5.10.0.0 – Generic: Auto Structures table follow-up fixes:
+//                 - The list now renders as two side-by-side grids instead
+//                   of one tall single-column list, so roughly twice as
+//                   many structure ids are visible before scrolling is
+//                   needed (the likely cause of Ovl/Opt/PRV rows appearing
+//                   to be "missing" when they were really just below the
+//                   fold). Both halves share one "Gen" header
+//                   select-all/none checkbox.
+//                 - AutoStructureRow.IsSelected now defaults to false - new
+//                   rows start unticked instead of auto-ticked, so opting a
+//                   structure in is always a deliberate action. Existing
+//                   rows still keep whatever tick state the user set across
+//                   refreshes.
+//                 - z_PTV_opt_sum (Step3b_GlobalOptPtvSum) is now gated by
+//                   IsAutoStructureSelected too - previously it always
+//                   built regardless of its tick state in the table. Same
+//                   reuse-existing-structure fallback as Eval/Opt/other
+//                   steps when unticked, since Step4/rings/rind consume it
+//                   downstream (both already null-check it).
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -467,8 +486,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.9.0.0")]
-[assembly: AssemblyFileVersion("5.9.0.0")]
+[assembly: AssemblyVersion("5.10.0.0")]
+[assembly: AssemblyFileVersion("5.10.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -1162,6 +1181,24 @@ namespace VMS.TPS
             private Structure Step3b_GlobalOptPtvSum(List<Structure> selectedTargets, Structure ext)
             {
                 LogSection("3b) z_PTV_opt_sum");
+
+                // Selective generation (Generic only): z_PTV_opt_sum feeds
+                // Step4/Ring/Rind downstream, so when it's unticked reuse
+                // whatever already exists instead of skipping outright -
+                // same fallback pattern as Step1/Step2.
+                if (!IsAutoStructureSelected(ID_OPT_TV_SUM))
+                {
+                    var existingSum = _ss.Structures.FirstOrDefault(s =>
+                        !s.IsEmpty && string.Equals(s.Id, ID_OPT_TV_SUM, StringComparison.OrdinalIgnoreCase));
+                    if (existingSum != null)
+                    {
+                        _progress.AppendLine($"  REUSE: {ID_OPT_TV_SUM} (not selected - using existing structure)");
+                        return existingSum;
+                    }
+                    _progress.AppendLine($"  SKIP: {ID_OPT_TV_SUM} (not selected, and no existing structure to reuse)");
+                    return null;
+                }
+
                 using (var tg = new TempGuard(_ss))
                 {
                     var tvUnionSt = tg.Add(UnionManyToTemp(_ss, selectedTargets, _fb,
@@ -3335,14 +3372,15 @@ namespace VMS.TPS
                 PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
         }
 
-        // Generic tab only: one row per auto-generated structure category
-        // (Eval/Opt/Rings/Rind/Avoidance) in the "Auto Structures" table,
-        // ticked on by default so leaving UseSelectiveGeneration off behaves
-        // exactly like generating everything, matching the pre-existing
-        // behavior. See StructureProcessor.Run().
+        // Generic tab only: one row per real structure id the pipeline would
+        // (re)build for the currently ticked targets/organs, shown in the
+        // "Auto Structures" table. Unticked by default (the user opts each
+        // one in) - this row only matters once UseSelectiveGeneration is
+        // ticked; while it's off, Generate Structures still builds
+        // everything regardless of these ticks. See StructureProcessor.Run().
         private sealed class AutoStructureRow : INotifyPropertyChanged
         {
-            private bool _isSelected = true;
+            private bool _isSelected;
             public string Name { get; set; }
             public bool IsSelected
             {
@@ -3693,7 +3731,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.9.0.0";
+                Title = "Generic Crop Structure Generator - v5.10.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
@@ -3936,7 +3974,7 @@ namespace VMS.TPS
                 private bool IsGenericKind => _kind == TabKind.Generic;
 
                 private DataGrid _dgTargets, _dgOrgans, _dgCrop;
-                private DataGrid _dgAutoStructures;   // Generic-only: selective per-structure generation
+                private DataGrid _dgAutoStructuresLeft, _dgAutoStructuresRight;   // Generic-only: selective per-structure generation, 2-column list
                 private TextBlock _txtAutoStructuresWarning;
                 private ComboBox _cbExternal, _cbTargetFilter, _cbMode, _cbPhysicalThickness;
 
@@ -4411,32 +4449,72 @@ namespace VMS.TPS
                     };
                     section.Children.Add(_txtAutoStructuresWarning);
 
-                    _dgAutoStructures = new DataGrid
+                    // Two side-by-side grids instead of one tall single-column
+                    // list, so roughly twice as many structure ids are visible
+                    // without scrolling. Both halves share one "Gen" header
+                    // checkbox action (ticks/unticks the whole list, not just
+                    // whichever half it's clicked on) so bulk select/deselect
+                    // still behaves as one control from the user's point of view.
+                    DataGridTemplateColumn MakeCheckColumn() =>
+                        _owner.MakeSingleClickCheckColumn(
+                            _owner.MakeHeaderCheckbox("Gen", isChecked =>
+                            {
+                                foreach (var r in _vm.AutoStructureRows) r.IsSelected = isChecked;
+                                _dgAutoStructuresLeft?.Items.Refresh();
+                                _dgAutoStructuresRight?.Items.Refresh();
+                            }),
+                            nameof(AutoStructureRow.IsSelected), 45);
+
+                    DataGrid MakeHalfGrid()
                     {
-                        AutoGenerateColumns = false,
-                        CanUserAddRows = false,
-                        CanUserDeleteRows = false,
-                        HeadersVisibility = DataGridHeadersVisibility.Column,
-                        ItemsSource = _vm.AutoStructureRows,
-                        CellStyle = _singleClickCellStyle,
-                        MaxHeight = 220,
-                        IsEnabled = _vm.UseSelectiveGeneration
+                        var g = new DataGrid
+                        {
+                            AutoGenerateColumns = false,
+                            CanUserAddRows = false,
+                            CanUserDeleteRows = false,
+                            HeadersVisibility = DataGridHeadersVisibility.Column,
+                            CellStyle = _singleClickCellStyle,
+                            MaxHeight = 260,
+                            IsEnabled = _vm.UseSelectiveGeneration
+                        };
+                        g.Columns.Add(MakeCheckColumn());
+                        g.Columns.Add(new DataGridTextColumn
+                        {
+                            Header = "Structure",
+                            Binding = new Binding(nameof(AutoStructureRow.Name)),
+                            IsReadOnly = true,
+                            Width = new DataGridLength(1, DataGridLengthUnitType.Star),
+                            ElementStyle = (Style)_owner.FindResource(typeof(TextBlock))
+                        });
+                        return g;
+                    }
+
+                    _dgAutoStructuresLeft = MakeHalfGrid();
+                    _dgAutoStructuresRight = MakeHalfGrid();
+                    _dgAutoStructuresRight.Margin = new Thickness(6, 0, 0, 0);
+
+                    var columns = new Grid();
+                    columns.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                    columns.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+                    Grid.SetColumn(_dgAutoStructuresLeft, 0);
+                    Grid.SetColumn(_dgAutoStructuresRight, 1);
+                    columns.Children.Add(_dgAutoStructuresLeft);
+                    columns.Children.Add(_dgAutoStructuresRight);
+
+                    cbSelective.Checked += (s, e) =>
+                    {
+                        _vm.UseSelectiveGeneration = true;
+                        _dgAutoStructuresLeft.IsEnabled = true;
+                        _dgAutoStructuresRight.IsEnabled = true;
                     };
-                    AddBoolColumn(_dgAutoStructures, _vm.AutoStructureRows, "Gen",
-                        (r, v) => r.IsSelected = v, nameof(AutoStructureRow.IsSelected), 55, () => { });
-                    _dgAutoStructures.Columns.Add(new DataGridTextColumn
+                    cbSelective.Unchecked += (s, e) =>
                     {
-                        Header = "Structure that will be generated",
-                        Binding = new Binding(nameof(AutoStructureRow.Name)),
-                        IsReadOnly = true,
-                        Width = new DataGridLength(1, DataGridLengthUnitType.Star),
-                        ElementStyle = (Style)_owner.FindResource(typeof(TextBlock))
-                    });
+                        _vm.UseSelectiveGeneration = false;
+                        _dgAutoStructuresLeft.IsEnabled = false;
+                        _dgAutoStructuresRight.IsEnabled = false;
+                    };
 
-                    cbSelective.Checked += (s, e) => { _vm.UseSelectiveGeneration = true; _dgAutoStructures.IsEnabled = true; };
-                    cbSelective.Unchecked += (s, e) => { _vm.UseSelectiveGeneration = false; _dgAutoStructures.IsEnabled = false; };
-
-                    section.Children.Add(_dgAutoStructures);
+                    section.Children.Add(columns);
                     return _owner.CreateCard(section);
                 }
 
@@ -4445,12 +4523,12 @@ namespace VMS.TPS
                 // ticked targets/organs - PTV_Eval/Opt/Rind per dose group,
                 // the global Opt_Sum, all 3 rings, Avoidance, and per-OAR
                 // Ovl/Opt/PRV for whichever organs are ticked. Each id's prior
-                // IsSelected state is preserved across refreshes (new ids
-                // default to selected) so ticking a structure off survives
-                // unrelated edits elsewhere in the tab.
+                // IsSelected state is preserved across refreshes; new ids
+                // (never seen before) default to unticked, so opting in is
+                // always a deliberate action rather than something to undo.
                 private void RefreshAutoStructurePreview()
                 {
-                    if (_dgAutoStructures == null) return;
+                    if (_dgAutoStructuresLeft == null || _dgAutoStructuresRight == null) return;
 
                     _dgTargets?.CommitEdit(DataGridEditingUnit.Cell, true);
                     _dgTargets?.CommitEdit(DataGridEditingUnit.Row, true);
@@ -4466,7 +4544,7 @@ namespace VMS.TPS
                         if (string.IsNullOrEmpty(id)) return;
                         if (_vm.AutoStructureRows.Any(r => string.Equals(r.Name, id, StringComparison.OrdinalIgnoreCase)))
                             return;
-                        bool selected = !prevSelection.TryGetValue(id, out var prev) || prev;
+                        bool selected = prevSelection.TryGetValue(id, out var prev) && prev;
                         _vm.AutoStructureRows.Add(new AutoStructureRow { Name = id, IsSelected = selected });
                     }
 
@@ -4477,8 +4555,8 @@ namespace VMS.TPS
                     if (validTargets.Count == 0)
                     {
                         if (_txtAutoStructuresWarning != null) _txtAutoStructuresWarning.Visibility = Visibility.Visible;
-                        _dgAutoStructures.ItemsSource = null;
-                        _dgAutoStructures.ItemsSource = _vm.AutoStructureRows;
+                        _dgAutoStructuresLeft.ItemsSource = null;
+                        _dgAutoStructuresRight.ItemsSource = null;
                         return;
                     }
                     if (_txtAutoStructuresWarning != null) _txtAutoStructuresWarning.Visibility = Visibility.Collapsed;
@@ -4523,8 +4601,11 @@ namespace VMS.TPS
                     foreach (var oar in _vm.OrganRows.Where(o => o.CreatePrv && o.ParsedPrvMarginMm.GetValueOrDefault() > 0))
                         AddRow(BuildId("PRV_", oar.OarId));
 
-                    _dgAutoStructures.ItemsSource = null;
-                    _dgAutoStructures.ItemsSource = _vm.AutoStructureRows;
+                    int half = (_vm.AutoStructureRows.Count + 1) / 2;
+                    _dgAutoStructuresLeft.ItemsSource = null;
+                    _dgAutoStructuresLeft.ItemsSource = _vm.AutoStructureRows.Take(half).ToList();
+                    _dgAutoStructuresRight.ItemsSource = null;
+                    _dgAutoStructuresRight.ItemsSource = _vm.AutoStructureRows.Skip(half).ToList();
                 }
 
                 // RCC-only: the read-only "Crop Distance Matrix" (one row per OAR
