@@ -689,6 +689,31 @@
 //               just "Generate selected structures only" plus the
 //               granular per-id table. Window height increase from
 //               v5.17.0.0 (800->960) is unaffected.
+//   v5.18.0.0 – Added a modeless progress window (ProgressWindow, new
+//               script-level class) shown during every long-running
+//               generation pass on every tab/mode: Eval (StructureProcessor.
+//               Run(), reports at each of its 10-11 RunStep() stages),
+//               Crop on both Generic (DoRccStyleCrop - reports per PTV, plus
+//               live per-organ status text during the union loop that's the
+//               slow part) and Breast Opto (DoCrop - reports per PTV),
+//               Nested (DoNestedCreate - reports per organ, plus per-shell-
+//               level status text), and RCC's own Generate Structure
+//               (DoRccGenerateStructure - reports at each of its 8 pipeline
+//               stages). Since every one of those runs fully synchronously
+//               on the UI thread (ESAPI Structure/StructureSet objects
+//               aren't safe to touch off it), the window has no background
+//               worker - Report() pumps the dispatcher at Background
+//               priority after each update so the bar/text actually
+//               repaint mid-operation. Generic Nested mode: ticking
+//               "Nested" for an organ no longer auto-ticks that PTV's
+//               z_PTV_opt row in the Auto Structures ("Generate selected
+//               structures only") table - removed SyncNestedAutoStructure-
+//               Selection and its call sites entirely, since DoNestedCreate/
+//               EnsurePtvOpt already build/find that PTV_Opt on their own,
+//               independent of the Auto Structures table, so the auto-tick
+//               was just a confusing side effect with no real purpose. The
+//               "PTV (z_PTV_opt)" picker column on the Organs grid is
+//               unchanged.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -714,8 +739,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.17.1.0")]
-[assembly: AssemblyFileVersion("5.17.1.0")]
+[assembly: AssemblyVersion("5.18.0.0")]
+[assembly: AssemblyFileVersion("5.18.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -832,6 +857,69 @@ namespace VMS.TPS
         }
 
         // ==================================================================
+        // PROGRESS WINDOW
+        // ==================================================================
+        // Lightweight modeless progress indicator shown during any long-
+        // running structure-generation pass - Eval/Crop/Nested on Generic,
+        // Eval/Crop on Breast Opto, and RCC's own Generate Structure.
+        // Every one of those runs fully synchronously on the UI thread
+        // (ESAPI Structure/StructureSet objects are created/read/removed
+        // throughout, so this can't safely be pushed onto a background
+        // thread) - there is no worker updating this window concurrently.
+        // Report() instead pumps the dispatcher at Background priority
+        // after each update, forcing the pending layout/render pass to
+        // actually happen before the caller resumes its synchronous work,
+        // so the bar/text visibly move instead of only flashing once at
+        // the very end.
+        private sealed class ProgressWindow : Window
+        {
+            private readonly ProgressBar _bar;
+            private readonly TextBlock _status;
+
+            public ProgressWindow(Window owner, string title)
+            {
+                Title = title;
+                Width = 440;
+                SizeToContent = SizeToContent.Height;
+                ResizeMode = ResizeMode.NoResize;
+                WindowStyle = WindowStyle.ToolWindow;
+                ShowInTaskbar = false;
+                Topmost = true;
+
+                if (owner != null && owner.IsLoaded)
+                {
+                    Owner = owner;
+                    WindowStartupLocation = WindowStartupLocation.CenterOwner;
+                }
+                else
+                {
+                    WindowStartupLocation = WindowStartupLocation.CenterScreen;
+                }
+
+                var panel = new StackPanel { Margin = new Thickness(18) };
+                _status = new TextBlock
+                {
+                    Text = "Starting...",
+                    Margin = new Thickness(0, 0, 0, 12),
+                    TextWrapping = TextWrapping.Wrap
+                };
+                panel.Children.Add(_status);
+
+                _bar = new ProgressBar { Minimum = 0, Maximum = 100, Value = 0, Height = 18 };
+                panel.Children.Add(_bar);
+
+                Content = panel;
+            }
+
+            public void Report(string status, int percent)
+            {
+                if (!string.IsNullOrEmpty(status)) _status.Text = status;
+                _bar.Value = Math.Max(0, Math.Min(100, percent));
+                Dispatcher.Invoke(() => { }, System.Windows.Threading.DispatcherPriority.Background);
+            }
+        }
+
+        // ==================================================================
         // ENTRY POINT
         // ==================================================================
         public void Execute(ScriptContext context)
@@ -885,8 +973,18 @@ namespace VMS.TPS
 
             if (win.ShowDialog() != true || win.ConfirmedVm == null) return;
 
-            var processor = new StructureProcessor(ss, win.ConfirmedVm, targetCandidates);
-            processor.Run();
+            var progressWin = new ProgressWindow(null, "Generating Structures");
+            progressWin.Show();
+            try
+            {
+                var processor = new StructureProcessor(ss, win.ConfirmedVm, targetCandidates,
+                    (label, pct) => progressWin.Report(label, pct));
+                processor.Run();
+            }
+            finally
+            {
+                progressWin.Close();
+            }
         }
 
         // ==================================================================
@@ -943,12 +1041,22 @@ namespace VMS.TPS
             // Keyed by dose only – see KNOWN LIMITATIONS note at top of file
             private readonly Dictionary<double, Structure> _zOptDoseSum = new Dictionary<double, Structure>();
 
+            // Optional progress callback (label, percent 0-100) - fired once
+            // at the start of every RunStep() below. Null in any context that
+            // doesn't want a progress window (there is none currently, but
+            // keeping it optional avoids forcing every caller/test to supply one).
+            private readonly Action<string, int> _onProgress;
+            private int _stepIndex;
+            private int _totalSteps;
+
             public StructureProcessor(
-                StructureSet ss, UiModel vm, List<Structure> targetCandidates)
+                StructureSet ss, UiModel vm, List<Structure> targetCandidates,
+                Action<string, int> onProgress = null)
             {
                 _ss = ss;
                 _vm = vm;
                 _targetCandidates = targetCandidates;
+                _onProgress = onProgress;
             }
 
             private void LogCreated(string id)
@@ -967,9 +1075,17 @@ namespace VMS.TPS
             // an unexpected exception from a boolean/margin op) is logged and the
             // REST of the pipeline still runs, instead of one early step's crash
             // silently aborting every step after it (as a shared try/catch around
-            // the whole Run() body would do).
+            // the whole Run() body would do). Also reports progress (this step's
+            // label, and the percent complete BEFORE it runs, based on _totalSteps
+            // set at the top of Run()) to whatever's watching via _onProgress.
             private void RunStep(string label, Action step)
             {
+                _stepIndex++;
+                if (_onProgress != null)
+                {
+                    int pct = _totalSteps > 0 ? (int)((_stepIndex - 1) * 100.0 / _totalSteps) : 0;
+                    _onProgress(label, pct);
+                }
                 try { step(); }
                 catch (Exception ex)
                 {
@@ -1139,6 +1255,7 @@ namespace VMS.TPS
                                             null, _fb, "BodyMinus3", globalTg);
 
                         bool isGeneric = _vm.IsGenericTab;
+                        _totalSteps = isGeneric ? 11 : 10;
 
                         // Each step runs through RunStep() so an exception in one
                         // (e.g. Step3a) can't silently abort every step after it -
@@ -1212,6 +1329,8 @@ namespace VMS.TPS
                                 () => Step9_Rings(doseLevels, selectedExternal, extMinus3));
                         }
                     }
+
+                    _onProgress?.Invoke("Done", 100);
 
                     MessageBox.Show(
                         $"Script complete.\n\nTotal structures created: {_createdCount}\n\nDetails:\n{_progress}",
@@ -3970,7 +4089,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.17.1.0";
+                Title = "Generic Crop Structure Generator - v5.18.0.0";
                 Width = 1250;
                 Height = 960;
                 MinWidth = 1000;
@@ -4286,14 +4405,7 @@ namespace VMS.TPS
                         {
                             RefreshAutoStructurePreview();
                             if (_inCropMode) RefreshRccMatrix();
-                            if (_inNestedMode)
-                            {
-                                RefreshNestedPtvOptions();
-                                var orgRow = s as OrganRow;
-                                if (orgRow != null &&
-                                    (e.PropertyName == nameof(OrganRow.NestedSparing) || e.PropertyName == nameof(OrganRow.NestedPtvOption)))
-                                    SyncNestedAutoStructureSelection(orgRow);
-                            }
+                            if (_inNestedMode) RefreshNestedPtvOptions();
                         }
                     };
 
@@ -5135,14 +5247,14 @@ namespace VMS.TPS
                 // Structures table would list - see RefreshNestedPtvOptions)
                 // and a shell-thickness input (reuses OrganRow.
                 // NestedThicknessMm, RCC's own §7 field) instead of Ovl/Opt/
-                // PRV. Ticking "Nested" once a PTV is picked also auto-selects
-                // that PTV's z_PTV_opt row in the Auto Structures table (see
-                // _rowPropertyChanged) so Generate Structures keeps it.
+                // PRV. Ticking "Nested" no longer touches the Auto Structures
+                // table - DoNestedCreate/EnsurePtvOpt build/find the picked
+                // PTV_Opt on their own, independent of it.
                 private void AddOrganNestedColumns()
                 {
                     AddBoolColumn(_dgOrgans, _vm.OrganRows, "Nested",
                         (r, v) => r.NestedSparing = v, nameof(OrganRow.NestedSparing), 70,
-                        () => { foreach (var r in _vm.OrganRows) SyncNestedAutoStructureSelection(r); });
+                        () => { });
 
                     _dgOrgans.Columns.Add(new DataGridComboBoxColumn
                     {
@@ -5212,23 +5324,6 @@ namespace VMS.TPS
                             if (oar.NestedPtvOption == null)
                                 oar.NestedPtvOption = highestDose;
                     }
-                }
-
-                // If `row` is ticked "Nested" with a PTV picked, ticks the
-                // matching z_PTV_opt row in the Auto Structures table (so
-                // Generate Structures actually keeps it) and turns on "Generate
-                // selected structures only" if it wasn't already - matching the
-                // same auto-select-on-tick convention Ovl/Opt/PRV already use.
-                private void SyncNestedAutoStructureSelection(OrganRow row)
-                {
-                    if (!row.NestedSparing || row.NestedPtvOption == null) return;
-
-                    if (_cbUseSelective != null && _cbUseSelective.IsChecked != true)
-                        _cbUseSelective.IsChecked = true;
-
-                    var match = _vm.AutoStructureRows.FirstOrDefault(r =>
-                        string.Equals(r.Name, row.NestedPtvOption.DisplayId, StringComparison.OrdinalIgnoreCase));
-                    if (match != null) match.IsSelected = true;
                 }
 
                 // --- BOTTOM BAR ---
@@ -5392,9 +5487,12 @@ namespace VMS.TPS
                         // "the nested will have selected option ticked
                         // automatically": entering Nested mode turns on
                         // "Generate selected structures only" itself (so the
-                        // Auto Structures table is live/enabled), and ticking
-                        // "Nested" for an organ with a PTV picked auto-selects
-                        // that PTV's z_PTV_opt row in it (SyncNestedAutoStructureSelection).
+                        // Auto Structures table is live/enabled). Ticking
+                        // "Nested" for an organ no longer touches the Auto
+                        // Structures table itself - Nested's own generation
+                        // (DoNestedCreate/EnsurePtvOpt) builds/finds its PTV_Opt
+                        // independently of it, so auto-ticking a row there was
+                        // just a confusing side effect with no real purpose.
                         if (_cbUseSelective != null && _cbUseSelective.IsChecked != true)
                             _cbUseSelective.IsChecked = true;
                         _dgOrgans.Visibility = Visibility.Visible;
@@ -5543,8 +5641,15 @@ namespace VMS.TPS
                     }
 
                     int ptvIndex = 0;
+                    var progressWin = new ProgressWindow(_owner, "Cropping PTVs");
+                    progressWin.Show();
+                    try
+                    {
                     foreach (var tdr in selectedTargets)
                     {
+                        progressWin.Report($"Cropping {tdr.TargetId} ({ptvIndex + 1}/{selectedTargets.Count})...",
+                            (int)(ptvIndex * 100.0 / selectedTargets.Count));
+
                         var target = _ss.Structures.FirstOrDefault(s =>
                             !s.IsEmpty && string.Equals(s.Id, tdr.TargetId, StringComparison.OrdinalIgnoreCase));
                         if (target == null) { ptvIndex++; continue; }
@@ -5655,6 +5760,11 @@ namespace VMS.TPS
                         }
                         ptvIndex++;
                     }
+                    }
+                    finally
+                    {
+                        progressWin.Close();
+                    }
 
                     var msg = new StringBuilder();
                     msg.AppendLine($"Cropped {created.Count} PTV(s):");
@@ -5720,8 +5830,17 @@ namespace VMS.TPS
                     var created = new List<string>();
                     var errors = new List<string>();
 
+                    var progressWin = new ProgressWindow(_owner, "Cropping PTVs (RCC formula)");
+                    progressWin.Show();
+                    try
+                    {
+                    int tdrIndex = 0;
                     foreach (var tdr in selectedTargets)
                     {
+                        int basePct = (int)(tdrIndex * 100.0 / selectedTargets.Count);
+                        progressWin.Report($"Cropping {tdr.TargetId} ({tdrIndex + 1}/{selectedTargets.Count})...", basePct);
+                        tdrIndex++;
+
                         var target = _ss.Structures.FirstOrDefault(s =>
                             !s.IsEmpty && string.Equals(s.Id, tdr.TargetId, StringComparison.OrdinalIgnoreCase));
                         if (target == null) continue;
@@ -5745,8 +5864,13 @@ namespace VMS.TPS
                             Structure expandedOarsUnionSt = null;
                             var pairLabels = new List<string>();
 
+                            int pairIndex = 0;
                             foreach (var pair in cropPairs)
                             {
+                                progressWin.Report(
+                                    $"Cropping {tdr.TargetId}: unioning {pair.Key.OarId} ({++pairIndex}/{cropPairs.Count})...",
+                                    basePct);
+
                                 var oarSt = _ss.Structures.FirstOrDefault(s =>
                                     !s.IsEmpty && string.Equals(s.Id, pair.Key.OarId, StringComparison.OrdinalIgnoreCase));
                                 if (oarSt == null) continue;
@@ -5833,6 +5957,11 @@ namespace VMS.TPS
                             }
                         }
                     }
+                    }
+                    finally
+                    {
+                        progressWin.Close();
+                    }
 
                     var msg = new StringBuilder();
                     msg.AppendLine($"Cropped {created.Count} PTV(s):");
@@ -5905,8 +6034,17 @@ namespace VMS.TPS
                     var allCreated = new List<string>();
                     var notes = new List<string>();
 
+                    var progressWin = new ProgressWindow(_owner, "Creating Nested Structures");
+                    progressWin.Show();
+                    try
+                    {
+                    int oarIndex = 0;
                     foreach (var oar in requests)
                     {
+                        int oarBasePct = (int)(oarIndex * 100.0 / requests.Count);
+                        progressWin.Report($"{oar.OarId} ({oarIndex + 1}/{requests.Count})...", oarBasePct);
+                        oarIndex++;
+
                         var oarSt = _ss.Structures.FirstOrDefault(s =>
                             !s.IsEmpty && string.Equals(s.Id, oar.OarId, StringComparison.OrdinalIgnoreCase));
                         if (oarSt == null)
@@ -5964,6 +6102,9 @@ namespace VMS.TPS
                                     // instead of failing safely.
                                     for (int level = 1; level <= RCC_NESTED_MAX_LEVELS; level++)
                                     {
+                                        progressWin.Report(
+                                            $"{oar.OarId}: building shell level {level}...", oarBasePct);
+
                                         bool levelOk;
                                         SegmentVolume pieceSeg = null;
                                         using (var levelTg = new TempGuard(_ss))
@@ -6031,6 +6172,11 @@ namespace VMS.TPS
                         notes.Add(created.Count > 0
                             ? $"{oar.OarId} ({created.Count} shells): stopped - {stopReason}."
                             : $"{oar.OarId}: nothing created - {stopReason}.");
+                    }
+                    }
+                    finally
+                    {
+                        progressWin.Close();
                     }
 
                     var msg = allCreated.Count > 0
@@ -6824,14 +6970,25 @@ namespace VMS.TPS
                     var created = new List<string>();
                     var errors = new List<string>();
 
+                    var progressWin = new ProgressWindow(_owner, "Generating Structure");
+                    progressWin.Show();
+                    int stage = 0;
+                    const int totalStages = 8;
+                    void Progress(string label) =>
+                        progressWin.Report(label, (int)(stage++ * 100.0 / totalStages));
+                    try
+                    {
                     // Steps 1-2: PTV_Eval / PTV_Opt per target.
+                    Progress("Building PTV_Eval / PTV_Opt...");
                     var optByTarget = BuildRccEvalOptStructures(pipelineTargets, ext, created, errors);
 
                     // §2: OAR max-dose crop, applied to Opt in place - required for
                     // both the single-target and multi-target pipelines alike.
+                    Progress("Applying OAR max-dose crop...");
                     ApplyRccMaxDoseCropToOpt(plan, optByTarget, ext, created, errors);
 
                     // PTV_Opt_Sum, built from the (now OAR-cropped) Opt structures.
+                    Progress("Building PTV_Opt_Sum...");
                     var optSum = BuildRccOptSum(optByTarget, ext, created, errors);
 
                     if (pipelineTargets.Count >= 2)
@@ -6839,11 +6996,13 @@ namespace VMS.TPS
                         // Steps 3-4: Ring1 (Zone B) then Ring2 (Zone C, outside
                         // ring1) - only meaningful once there's another PTV to
                         // fall off around.
+                        Progress("Building Ring 1 / Ring 2...");
                         var ring1St = BuildRccRing1(plan, optSum, optByTarget, ext, created, errors);
                         BuildRccRing2(plan, optSum, optByTarget, ext, ring1St, created, errors);
 
                         // Step 5: SIB-shave each lower-dose target's Opt from the
                         // next higher-dose target's Opt, in place.
+                        Progress("SIB shave...");
                         ApplyRccSibShaveToOpt(plan, optByTarget, ext, created, errors);
                     }
 
@@ -6855,6 +7014,7 @@ namespace VMS.TPS
                     if (plan.NestedRings.Count > 0)
                     {
                         // Step A: crop each (target, OAR) pair's PTV_Opt in place.
+                        Progress("Nested OAR crop...");
                         foreach (var nr in plan.NestedRings)
                         {
                             try
@@ -6886,6 +7046,7 @@ namespace VMS.TPS
                         // (unioned across every ticked target that OAR overlaps),
                         // stepped outward from the raw OAR/target geometry - not the
                         // now-further-cropped Opt boundary from Step A above.
+                        Progress("Nested OAR shells...");
                         foreach (var oarGroup in plan.NestedRings.GroupBy(nr => nr.Oar.OarId, StringComparer.OrdinalIgnoreCase))
                         {
                             var oar = oarGroup.First().Oar;
@@ -6902,7 +7063,15 @@ namespace VMS.TPS
                     // pipeline only.
 
                     // Step 6: Rind = each target's FINAL PTV_Opt contracted inward.
+                    Progress("Building Rind...");
                     BuildRccRind(optByTarget, ext, created, errors);
+
+                    progressWin.Report("Done", 100);
+                    }
+                    finally
+                    {
+                        progressWin.Close();
+                    }
 
                     if (errors.Count > 0)
                     {
