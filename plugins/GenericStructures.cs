@@ -641,6 +641,14 @@
 //                   worded reason (it was already unreachable in practice
 //                   since thickness is always >0, so outer is always
 //                   strictly larger than inner).
+//   v5.15.1.0 – Generic: "Generate selected structures only" checkbox +
+//               Auto Structures table are now hidden in Crop PTV mode -
+//               selective generation only applies to the main Eval->Opt->
+//               Ring->Rind->Avoidance pipeline (StructureProcessor.Run()),
+//               not to DoRccStyleCrop, so showing it there was misleading.
+//               Still visible in standard/Eval mode and in Nested mode
+//               (which actively uses it - ticking "Nested" for an organ
+//               auto-selects that PTV's row in it).
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -666,8 +674,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.15.0.0")]
-[assembly: AssemblyFileVersion("5.15.0.0")]
+[assembly: AssemblyVersion("5.15.1.0")]
+[assembly: AssemblyFileVersion("5.15.1.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -3922,7 +3930,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.15.0.0";
+                Title = "Generic Crop Structure Generator - v5.15.1.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
@@ -4183,6 +4191,13 @@ namespace VMS.TPS
                 // preview, shown alongside the RCC-style Organs grid. See
                 // BuildGenericCropExtrasPanel/DoRccStyleCrop.
                 private UIElement _genericCropExtrasPanel;
+
+                // Generic-only: the "Generate selected structures only"
+                // checkbox + Auto Structures table, hidden in Crop mode (see
+                // SwitchMode) since selective generation only applies to the
+                // main Eval->Opt->Ring->Rind->Avoidance pipeline, not to
+                // DoRccStyleCrop.
+                private UIElement _autoStructuresPanel;
 
                 private TextBlock _txtStats;
                 private int _peakProjectedStructures;
@@ -4682,9 +4697,9 @@ namespace VMS.TPS
                         DockPanel.SetDock(_genericCropExtrasPanel, Dock.Bottom);
                         leftPanel.Children.Add(_genericCropExtrasPanel);
 
-                        var autoPanel = BuildAutoStructuresPanel();
-                        DockPanel.SetDock(autoPanel, Dock.Bottom);
-                        leftPanel.Children.Add(autoPanel);
+                        _autoStructuresPanel = BuildAutoStructuresPanel();
+                        DockPanel.SetDock(_autoStructuresPanel, Dock.Bottom);
+                        leftPanel.Children.Add(_autoStructuresPanel);
                     }
 
                     leftPanel.Children.Add(_dgTargets);
@@ -5312,6 +5327,9 @@ namespace VMS.TPS
                                     : "ORGANS  (tick what to create per organ)";
                         }
                     }
+
+                    if (IsGenericKind && _autoStructuresPanel != null)
+                        _autoStructuresPanel.Visibility = cropMode ? Visibility.Collapsed : Visibility.Visible;
 
                     if (cropMode)
                     {
