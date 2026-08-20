@@ -620,6 +620,27 @@
 //               level, so at most ~4-5 temp structures (plus whichever
 //               kept z_[organ]_[dose]_[level] pieces have already been
 //               committed) exist simultaneously instead of ~90.
+//   v5.15.0.0 – Three Nested-mode refinements:
+//                 - The PTV picker column now defaults every organ row
+//                   without a pick yet to the highest-dose candidate
+//                   (RefreshNestedPtvOptions builds candidates highest-dose-
+//                   first already, so this is just _nestedPtvOptions[0])
+//                   instead of leaving it blank.
+//                 - Shell Thickness (mm) now shows "2" explicitly for any
+//                   organ row that's still blank when Nested mode is
+//                   entered, instead of silently falling back to
+//                   RCC_NESTED_RING_STEP_MM inside DoNestedCreate with
+//                   nothing visible in the cell.
+//                 - The shell-stepping loop's two separate stop reasons
+//                   ("shell is empty" for a degenerate outer-minus-inner
+//                   subtraction, "shell no longer overlaps the organ" for an
+//                   empty ring∩organ) are now one: a level stops solely when
+//                   ring∩organ comes back empty, logged uniformly as "ring
+//                   no longer overlaps the organ" - the degenerate-ring case
+//                   folds into the same check instead of being a separately
+//                   worded reason (it was already unreachable in practice
+//                   since thickness is always >0, so outer is always
+//                   strictly larger than inner).
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -645,8 +666,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.14.1.0")]
-[assembly: AssemblyFileVersion("5.14.1.0")]
+[assembly: AssemblyVersion("5.15.0.0")]
+[assembly: AssemblyFileVersion("5.15.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -3901,7 +3922,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.14.1.0";
+                Title = "Generic Crop Structure Generator - v5.15.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
@@ -5124,6 +5145,18 @@ namespace VMS.TPS
                             Suffix = k.Suffix
                         });
                     }
+
+                    // groupKeys is sorted highest-dose-first, so the first
+                    // option built above is the highest-dose PTV - default
+                    // every organ row without a pick yet to it, so the PTV
+                    // column shows a sensible choice instead of blank.
+                    if (_nestedPtvOptions.Count > 0)
+                    {
+                        var highestDose = _nestedPtvOptions[0];
+                        foreach (var oar in _vm.OrganRows)
+                            if (oar.NestedPtvOption == null)
+                                oar.NestedPtvOption = highestDose;
+                    }
                 }
 
                 // If `row` is ticked "Nested" with a PTV picked, ticks the
@@ -5309,6 +5342,16 @@ namespace VMS.TPS
                         _dgOrgans.Visibility = Visibility.Visible;
                         _dgCrop.Visibility = Visibility.Collapsed;
                         if (_genericCropExtrasPanel != null) _genericCropExtrasPanel.Visibility = Visibility.Collapsed;
+
+                        // Show the 2mm default explicitly instead of leaving
+                        // the cell blank (DoNestedCreate already fell back to
+                        // RCC_NESTED_RING_STEP_MM when blank - this just makes
+                        // that default visible/editable up front).
+                        string defaultThickness = RCC_NESTED_RING_STEP_MM.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
+                        foreach (var oar in _vm.OrganRows)
+                            if (string.IsNullOrWhiteSpace(oar.NestedThicknessMm))
+                                oar.NestedThicknessMm = defaultThickness;
+
                         RefreshNestedPtvOptions();
                     }
                     else // standard
@@ -5857,19 +5900,20 @@ namespace VMS.TPS
 
                                             var ringSeg = SafeBoolean(_ss, outerSeg, innerSeg, BoolOp.Sub,
                                                 outerSt, innerSt, null, fb, $"Nested_Ring{level}", levelTg);
-                                            if (ringSeg == null)
-                                            {
-                                                stopReason = $"level {level}: shell is empty";
-                                                levelOk = false;
-                                            }
-                                            else
+                                            if (ringSeg != null)
                                             {
                                                 var ringSt = levelTg.Add(CreateTempFromSegment(_ss, ringSeg, "zNestRing"));
                                                 pieceSeg = SafeBoolean(_ss, ringSeg, oarSt.SegmentVolume, BoolOp.And,
                                                     ringSt, oarSt, null, fb, $"Nested_Piece{level}", levelTg);
-                                                levelOk = pieceSeg != null;
-                                                if (!levelOk) stopReason = $"level {level}: shell no longer overlaps the organ";
                                             }
+                                            // Single stopping rule: the ring no longer
+                                            // overlaps the organ - covers both an empty
+                                            // ring∩organ intersection and the (normally
+                                            // unreachable, since thickness>0 always makes
+                                            // outer strictly larger than inner) degenerate
+                                            // case where the raw ring itself came back empty.
+                                            levelOk = pieceSeg != null;
+                                            if (!levelOk) stopReason = $"level {level}: ring no longer overlaps the organ";
                                         }
                                         if (!levelOk) break;
 
