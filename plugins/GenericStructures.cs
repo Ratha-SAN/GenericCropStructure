@@ -526,6 +526,49 @@
 //                   the first time an id appears - once a row exists, its
 //                   own tick state (including a manual untick) always wins
 //                   on later refreshes.
+//   v5.13.0.0 – Generic tab: two substantial additions.
+//                 - "Crop PTV from OARs" mode's Organs grid is now identical
+//                   to the RCC tab's (Max Dose (Gy)/Small/Large/Nested §7/
+//                   Nested Thickness columns - see AddOrganCropColumns,
+//                   shared verbatim with RCC), replacing the old Ovl/Opt/PRV
+//                   columns + hand-typed per-organ-per-target mm matrix. The
+//                   Crop PTVs button (DoRccStyleCrop) now computes each
+//                   crop distance from RCC's own §2 Max-Dose formula (Rx,
+//                   OAR Max Dose, Small/Large Zone A %/mm rate - same
+//                   RccPctDiff/RccCropMm used by ComputeRccPlan/
+//                   ApplyRccMaxDoseCropToOpt on the RCC tab) instead of a
+//                   manually typed distance. A live crop-distance preview
+//                   and the Zone A rate inputs (BuildGenericCropExtrasPanel,
+//                   reusing RCC's BuildRccCropDistanceMatrixPanel/
+//                   RefreshRccMatrix verbatim) sit under the Targets table
+//                   while this mode is active. Output contract (creates/
+//                   updates a z_{target}_Crp target row) is unchanged from
+//                   the old DoCrop(). Breast Opto's "Crop PTV from OARs"
+//                   mode is completely unaffected - it still uses the
+//                   original Ovl/Opt/PRV columns and hand-typed mm matrix.
+//                 - New third PTV Mode option, "Nested" (Generic tab only).
+//                   Pick one PTV (from the Targets list) and one organ (from
+//                   the Organs list); z_PTV_opt for that PTV is (re)built on
+//                   demand from the same Eval->Opt formula Step1_EvalPtv/
+//                   Step2_OptPtv use if it doesn't already exist (see
+//                   EnsurePtvOpt - simplified to a single target, no dose-
+//                   ladder subtraction, since Nested only ever works one PTV
+//                   at a time). DoNestedCreate then: (1) crops that PTV_Opt
+//                   by the organ (PTV_Opt minus Organ) as working geometry
+//                   only, never itself kept as a structure; (2) steps
+//                   <shell thickness>mm-thick shells outward from that
+//                   cropped-PTV surface (level 1 = 0-thickness mm out, level
+//                   2 = thickness-2*thickness mm out, ...), intersecting each
+//                   shell with the organ and keeping only the ticked-organ
+//                   part; (3) stops the first time a shell no longer
+//                   overlaps the organ at all, or at a safety cap of
+//                   RCC_NESTED_MAX_LEVELS (30). Each kept piece is named
+//                   z_[organ]_[dose]_[level] (e.g. z_Parotid_L_70_1) via
+//                   BuildId's usual laterality-aware abbreviation - the
+//                   "in_PTV" wording doesn't fit Eclipse's 16-char id limit
+//                   alongside organ+laterality+dose+level, so it's dropped,
+//                   same truncation convention every other id in this script
+//                   already uses.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -550,8 +593,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.12.0.0")]
-[assembly: AssemblyFileVersion("5.12.0.0")]
+[assembly: AssemblyVersion("5.13.0.0")]
+[assembly: AssemblyFileVersion("5.13.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -3779,7 +3822,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.12.0.0";
+                Title = "Generic Crop Structure Generator - v5.13.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
@@ -4026,12 +4069,32 @@ namespace VMS.TPS
                 private Button _btnCrop, _btnDone, _btnCreate;
                 private Button _btnAutoCrop;
                 private bool _inCropMode;   // Generic / Breast Opto: crop-from-OAR sub-mode
+                private bool _inNestedMode; // Generic-only: third PTV Mode option, see DoNestedCreate
+                private TextBlock _txtOrgansHeader;
+
+                // Generic-only: Nested mode's PTV/Organ pickers + shell
+                // thickness + action button. See BuildNestedPanel/DoNestedCreate.
+                private UIElement _nestedPanel;
+                private ComboBox _cbNestedPtv, _cbNestedOar;
+                private TextBox _txtNestedThickness;
+                private Button _btnNestedCreate;
+
+                // Generic-only: Crop PTV mode's Zone A rates + live crop-distance
+                // preview, shown alongside the RCC-style Organs grid. See
+                // BuildGenericCropExtrasPanel/DoRccStyleCrop.
+                private UIElement _genericCropExtrasPanel;
 
                 private TextBlock _txtStats;
                 private int _peakProjectedStructures;
 
                 private List<CropOrganRow> _cropRows;
                 private List<TargetDoseRow> _lastSelectedTargets;
+
+                // Shared PropertyChanged handler subscribed to every TargetDoseRow
+                // and OrganRow (see constructor); kept as a field (not a local)
+                // so DoRccStyleCrop can subscribe newly-added _Crp target rows
+                // to the exact same handler instead of duplicating it.
+                private Action<object, PropertyChangedEventArgs> _rowPropertyChanged;
 
                 // ---- RCC-only state ----
                 private RccPlan _rccPlan;
@@ -4054,23 +4117,27 @@ namespace VMS.TPS
                     _kind = kind;
                     _footerText = footerText;
 
-                    Action<object, PropertyChangedEventArgs> rowPropertyChanged = (s, e) =>
+                    _rowPropertyChanged = (s, e) =>
                     {
                         if (IsRcc) { RefreshRccPlan(); return; }
 
                         if (e.PropertyName == nameof(TargetDoseRow.IsSelected))
                         {
-                            if (_inCropMode)
+                            if (_inCropMode && !IsGenericKind)
                                 BuildCropGrid(_vm.TargetDoseRows.Where(r => r.IsSelected).ToList());
                         }
                         UpdateStructureCount();
-                        if (IsGenericKind) RefreshAutoStructurePreview();
+                        if (IsGenericKind)
+                        {
+                            RefreshAutoStructurePreview();
+                            if (_inCropMode) RefreshRccMatrix();
+                        }
                     };
 
                     foreach (var row in _vm.TargetDoseRows)
-                        row.PropertyChanged += new PropertyChangedEventHandler(rowPropertyChanged);
+                        row.PropertyChanged += new PropertyChangedEventHandler(_rowPropertyChanged);
                     foreach (var row in _vm.OrganRows)
-                        row.PropertyChanged += new PropertyChangedEventHandler(rowPropertyChanged);
+                        row.PropertyChanged += new PropertyChangedEventHandler(_rowPropertyChanged);
 
                     RootElement = Build();
 
@@ -4151,9 +4218,12 @@ namespace VMS.TPS
                     {
                         _cbMode.Items.Add("Eval PTV (standard)");
                         _cbMode.Items.Add("Crop PTV from OARs");
+                        // Nested is Generic-only for now - Breast Opto keeps its
+                        // existing 2-mode combo unchanged.
+                        if (IsGenericKind) _cbMode.Items.Add("Nested");
                     }
                     _cbMode.SelectedIndex = 0;
-                    _cbMode.SelectionChanged += (s, e) => SwitchMode(_cbMode.SelectedIndex == 1);
+                    _cbMode.SelectionChanged += (s, e) => SwitchMode(_cbMode.SelectedIndex);
                     topBar.Children.Add(_cbMode);
 
                     topBar.Children.Add(new TextBlock { Text = "    Show: ", VerticalAlignment = VerticalAlignment.Center, FontWeight = FontWeights.Bold, Margin = new Thickness(0, 0, 4, 0) });
@@ -4320,6 +4390,76 @@ namespace VMS.TPS
                     return col;
                 }
 
+                // RCC's own Organs grid columns (Max Dose/Small/Large/Nested §7/
+                // Nested Thickness) - also used by the Generic tab's "Crop PTV
+                // from OARs" mode (see SwitchMode, which swaps the Organs grid
+                // between this and AddOrganGenerationColumns), so the two tabs
+                // configure/crop OARs identically. RCC refreshes the Advanced
+                // Plan Preview on any change; Generic (which has no such
+                // preview) refreshes the crop-distance matrix instead.
+                private void AddOrganCropColumns()
+                {
+                    Action onChanged = IsRcc ? (Action)RefreshRccPlan : RefreshRccMatrix;
+
+                    // No separate "Crop" tick - an OAR is included the moment a
+                    // valid Max Dose is entered (confirmed by the number itself).
+                    _dgOrgans.Columns.Add(new DataGridTextColumn
+                    {
+                        Header = "Max Dose (Gy)",
+                        Binding = new Binding(nameof(OrganRow.MaxDoseGy)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.LostFocus },
+                        Width = 110,
+                        ElementStyle = _inputTextBlockStyle,
+                        EditingElementStyle = _inputTextBoxStyle
+                    });
+
+                    // Small/Large pick which Zone A rate applies to this OAR
+                    // (mutually exclusive - enforced on OrganRow itself).
+                    AddBoolColumn(_dgOrgans, _vm.OrganRows, "Small",
+                        (r, v) => r.IsSmallOrgan = v, nameof(OrganRow.IsSmallOrgan), 65, onChanged);
+
+                    AddBoolColumn(_dgOrgans, _vm.OrganRows, "Large",
+                        (r, v) => r.IsLargeOrgan = v, nameof(OrganRow.IsLargeOrgan), 65, onChanged);
+
+                    AddBoolColumn(_dgOrgans, _vm.OrganRows, "Nested §7",
+                        (r, v) => r.NestedSparing = v, nameof(OrganRow.NestedSparing), 90, onChanged);
+
+                    // Shell thickness driving how many z_oar_in_ptv_hr# rings
+                    // BuildRccNestedShells steps outward (see that method).
+                    _dgOrgans.Columns.Add(new DataGridTextColumn
+                    {
+                        Header = "Nested Thickness (mm)",
+                        Binding = new Binding(nameof(OrganRow.NestedThicknessMm)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.LostFocus },
+                        Width = 150,
+                        ElementStyle = _inputTextBlockStyle,
+                        EditingElementStyle = _inputTextBoxStyle
+                    });
+                }
+
+                // The default Organs grid columns (Ovl/Opt/PRV/PRV Margin), used
+                // by Breast Opto always, and by Generic outside of "Crop PTV
+                // from OARs" mode. RCC never uses this - it's always
+                // AddOrganCropColumns above.
+                private void AddOrganGenerationColumns()
+                {
+                    AddBoolColumn(_dgOrgans, _vm.OrganRows, "Ovl",
+                        (r, v) => r.CreateOvl = v, nameof(OrganRow.CreateOvl), 75, UpdateStructureCount);
+
+                    AddBoolColumn(_dgOrgans, _vm.OrganRows, "Opt",
+                        (r, v) => r.CreateOpt = v, nameof(OrganRow.CreateOpt), 75, UpdateStructureCount);
+
+                    AddBoolColumn(_dgOrgans, _vm.OrganRows, "PRV",
+                        (r, v) => r.CreatePrv = v, nameof(OrganRow.CreatePrv), 75, UpdateStructureCount);
+
+                    _dgOrgans.Columns.Add(new DataGridTextColumn
+                    {
+                        Header = "PRV Margin (mm)",
+                        Binding = new Binding(nameof(OrganRow.PrvMarginMm)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.LostFocus },
+                        Width = 150,
+                        ElementStyle = _inputTextBlockStyle,
+                        EditingElementStyle = _inputTextBoxStyle
+                    });
+                }
+
                 // --- LEFT: TARGETS ---
                 private UIElement BuildTargetsPanel()
                 {
@@ -4429,6 +4569,11 @@ namespace VMS.TPS
 
                     if (IsGenericKind)
                     {
+                        _genericCropExtrasPanel = BuildGenericCropExtrasPanel();
+                        _genericCropExtrasPanel.Visibility = Visibility.Collapsed;
+                        DockPanel.SetDock(_genericCropExtrasPanel, Dock.Bottom);
+                        leftPanel.Children.Add(_genericCropExtrasPanel);
+
                         var autoPanel = BuildAutoStructuresPanel();
                         DockPanel.SetDock(autoPanel, Dock.Bottom);
                         leftPanel.Children.Add(autoPanel);
@@ -4736,61 +4881,10 @@ namespace VMS.TPS
                         ElementStyle = (Style)_owner.FindResource(typeof(TextBlock))
                     });
 
-                    if (IsRcc)
-                    {
-                        // No separate "Crop" tick - an OAR is included the moment a
-                        // valid Max Dose is entered (confirmed by the number itself).
-                        _dgOrgans.Columns.Add(new DataGridTextColumn
-                        {
-                            Header = "Max Dose (Gy)",
-                            Binding = new Binding(nameof(OrganRow.MaxDoseGy)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.LostFocus },
-                            Width = 110,
-                            ElementStyle = _inputTextBlockStyle,
-                            EditingElementStyle = _inputTextBoxStyle
-                        });
+                    if (IsRcc) AddOrganCropColumns();
+                    else AddOrganGenerationColumns();
 
-                        // Small/Large pick which Zone A rate applies to this OAR
-                        // (mutually exclusive - enforced on OrganRow itself).
-                        AddBoolColumn(_dgOrgans, _vm.OrganRows, "Small",
-                            (r, v) => r.IsSmallOrgan = v, nameof(OrganRow.IsSmallOrgan), 65, RefreshRccPlan);
-
-                        AddBoolColumn(_dgOrgans, _vm.OrganRows, "Large",
-                            (r, v) => r.IsLargeOrgan = v, nameof(OrganRow.IsLargeOrgan), 65, RefreshRccPlan);
-
-                        AddBoolColumn(_dgOrgans, _vm.OrganRows, "Nested §7",
-                            (r, v) => r.NestedSparing = v, nameof(OrganRow.NestedSparing), 90, RefreshRccPlan);
-
-                        // Shell thickness driving how many z_oar_in_ptv_hr# rings
-                        // BuildRccNestedShells steps outward (see that method).
-                        _dgOrgans.Columns.Add(new DataGridTextColumn
-                        {
-                            Header = "Nested Thickness (mm)",
-                            Binding = new Binding(nameof(OrganRow.NestedThicknessMm)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.LostFocus },
-                            Width = 150,
-                            ElementStyle = _inputTextBlockStyle,
-                            EditingElementStyle = _inputTextBoxStyle
-                        });
-                    }
-                    else
-                    {
-                        AddBoolColumn(_dgOrgans, _vm.OrganRows, "Ovl",
-                            (r, v) => r.CreateOvl = v, nameof(OrganRow.CreateOvl), 75, UpdateStructureCount);
-
-                        AddBoolColumn(_dgOrgans, _vm.OrganRows, "Opt",
-                            (r, v) => r.CreateOpt = v, nameof(OrganRow.CreateOpt), 75, UpdateStructureCount);
-
-                        AddBoolColumn(_dgOrgans, _vm.OrganRows, "PRV",
-                            (r, v) => r.CreatePrv = v, nameof(OrganRow.CreatePrv), 75, UpdateStructureCount);
-
-                        _dgOrgans.Columns.Add(new DataGridTextColumn
-                        {
-                            Header = "PRV Margin (mm)",
-                            Binding = new Binding(nameof(OrganRow.PrvMarginMm)) { Mode = BindingMode.TwoWay, UpdateSourceTrigger = UpdateSourceTrigger.LostFocus },
-                            Width = 150,
-                            ElementStyle = _inputTextBlockStyle,
-                            EditingElementStyle = _inputTextBoxStyle
-                        });
-                    }
+                    _txtOrgansHeader = rightHeader;
 
                     if (IsRcc)
                     {
@@ -4833,9 +4927,109 @@ namespace VMS.TPS
                             CellStyle = _singleClickCellStyle
                         };
                         rightPanel.Children.Add(_dgCrop);
+
+                        if (IsGenericKind)
+                        {
+                            _nestedPanel = BuildNestedPanel();
+                            _nestedPanel.Visibility = Visibility.Collapsed;
+                            rightPanel.Children.Add(_nestedPanel);
+                        }
                     }
 
                     return rightPanel;
+                }
+
+                // Generic-only: the "Crop PTV from OARs" mode's Organs grid uses
+                // the exact same Max Dose/Small/Large/Nested §7/Nested Thickness
+                // columns as the RCC tab (see AddOrganCropColumns), and the
+                // Crop PTVs button (DoRccStyleCrop) uses RCC's own §2 Max-Dose
+                // crop formula instead of hand-typed per-organ-per-target mm -
+                // so this panel (Zone A rates + a live crop-distance preview,
+                // both reused verbatim from the RCC tab) needs to be visible
+                // alongside it. Hidden outside Crop PTV mode; see SwitchMode.
+                private UIElement BuildGenericCropExtrasPanel()
+                {
+                    var section = new StackPanel { Orientation = Orientation.Vertical };
+
+                    var matrixPanel = BuildRccCropDistanceMatrixPanel();
+                    section.Children.Add(matrixPanel);
+
+                    var zoneSection = new StackPanel { Orientation = Orientation.Vertical, Margin = new Thickness(0, 10, 0, 0) };
+                    zoneSection.Children.Add(new TextBlock
+                    {
+                        Text = "FALLOFF ZONE (OAR max-dose crop)",
+                        FontWeight = FontWeights.Bold,
+                        Foreground = (Brush)_owner.FindResource("TextSecondary"),
+                        Margin = new Thickness(0, 0, 0, 8)
+                    });
+                    var row = new UniformGrid { Rows = 1, Columns = 2 };
+                    _txtRccZoneASmall = AddRateColumn(row, "Zone A - small organ (%/mm)", RCC_ZONE_A_SMALL_DEFAULT_PCT_PER_MM, RefreshRccMatrix);
+                    _txtRccZoneALarge = AddRateColumn(row, "Zone A - large organ (%/mm)", RCC_ZONE_A_LARGE_DEFAULT_PCT_PER_MM, RefreshRccMatrix);
+                    zoneSection.Children.Add(row);
+                    section.Children.Add(_owner.CreateCard(zoneSection));
+
+                    return section;
+                }
+
+                // Generic-only: "Nested" mode - pick one PTV (from the same
+                // Targets list used everywhere else in this tab) and one organ
+                // (from the Organs list), then step 2mm-thick shells outward
+                // from that PTV's z_PTV_opt surface, keeping only the part of
+                // each shell that's inside the organ, until the organ runs out.
+                // See DoNestedCreate. z_PTV_opt is (re)built on demand from the
+                // same Eval->Opt formula Step1/Step2 use if it doesn't already
+                // exist for the picked PTV's dose/suffix.
+                private UIElement BuildNestedPanel()
+                {
+                    var section = new StackPanel { Orientation = Orientation.Vertical };
+                    section.Children.Add(new TextBlock
+                    {
+                        Text = "NESTED  (organ material inside one PTV, sliced into 2mm shells outward from the PTV surface)",
+                        FontWeight = FontWeights.Bold,
+                        TextWrapping = TextWrapping.Wrap,
+                        Foreground = (Brush)_owner.FindResource("AccentBlue"),
+                        Margin = new Thickness(0, 0, 0, 10)
+                    });
+
+                    UIElement MakeRow(string label, FrameworkElement input)
+                    {
+                        var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 10) };
+                        row.Children.Add(new TextBlock
+                        {
+                            Text = label,
+                            Width = 150,
+                            VerticalAlignment = VerticalAlignment.Center,
+                            Foreground = (Brush)_owner.FindResource("TextSecondary")
+                        });
+                        row.Children.Add(input);
+                        return row;
+                    }
+
+                    _cbNestedPtv = new ComboBox { MinWidth = 220, DisplayMemberPath = nameof(TargetDoseRow.TargetId) };
+                    section.Children.Add(MakeRow("PTV:", _cbNestedPtv));
+
+                    _cbNestedOar = new ComboBox { MinWidth = 220, DisplayMemberPath = nameof(OrganRow.OarId) };
+                    section.Children.Add(MakeRow("Organ:", _cbNestedOar));
+
+                    _txtNestedThickness = new TextBox
+                    {
+                        Width = 70,
+                        Text = RCC_NESTED_RING_STEP_MM.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)
+                    };
+                    section.Children.Add(MakeRow("Shell thickness (mm):", _txtNestedThickness));
+
+                    _btnNestedCreate = new Button
+                    {
+                        Content = "Create Nested Structures",
+                        Padding = new Thickness(15, 6, 15, 6),
+                        HorizontalAlignment = HorizontalAlignment.Left,
+                        Margin = new Thickness(0, 10, 0, 0)
+                    };
+                    _btnNestedCreate.SetResourceReference(FrameworkElement.StyleProperty, "PrimaryButton");
+                    _btnNestedCreate.Click += (s, e) => DoNestedCreate();
+                    section.Children.Add(_btnNestedCreate);
+
+                    return _owner.CreateCard(section);
                 }
 
                 // --- BOTTOM BAR ---
@@ -4889,7 +5083,7 @@ namespace VMS.TPS
                     {
                         _btnCrop = new Button { Content = "Crop PTVs", Padding = new Thickness(20, 6, 20, 6), Margin = new Thickness(0, 0, 6, 0), Visibility = Visibility.Collapsed };
                         _btnCrop.SetResourceReference(FrameworkElement.StyleProperty, "WarningButton");
-                        _btnCrop.Click += (s, e) => DoCrop();
+                        _btnCrop.Click += (s, e) => { if (IsGenericKind) DoRccStyleCrop(); else DoCrop(); };
                         buttonPanel.Children.Add(_btnCrop);
 
                         _btnDone = new Button { Content = "Done", Padding = new Thickness(15, 6, 15, 6), Margin = new Thickness(0, 0, 6, 0), Visibility = Visibility.Collapsed };
@@ -4915,7 +5109,19 @@ namespace VMS.TPS
                 // ----------------------------------------------------------------
                 // GENERIC / BREAST OPTO: crop-from-OAR sub-mode + commit/validate
                 // ----------------------------------------------------------------
-                private void SwitchMode(bool secondMode)
+                private DataGridTextColumn MakeOrganNameColumn() => new DataGridTextColumn
+                {
+                    Header = "Organ",
+                    Binding = new Binding(nameof(OrganRow.OarId)),
+                    IsReadOnly = true,
+                    Width = new DataGridLength(140),
+                    ElementStyle = (Style)_owner.FindResource(typeof(TextBlock))
+                };
+
+                // modeIndex: 0 = standard, 1 = Crop PTV from OARs, 2 = Nested
+                // (Generic only - Breast Opto's combo has no 3rd item, so it can
+                // never reach nestedMode here).
+                private void SwitchMode(int modeIndex)
                 {
                     if (IsRcc)
                     {
@@ -4925,40 +5131,89 @@ namespace VMS.TPS
                         // it. Generate Structure is the one action button and stays
                         // visible either way; the Crop Distance Matrix lives under
                         // the Targets section now and is visible in both views.
-                        _dgOrgans.Visibility = secondMode ? Visibility.Collapsed : Visibility.Visible;
-                        _dgRccPlan.Visibility = secondMode ? Visibility.Visible : Visibility.Collapsed;
+                        bool advancedView = modeIndex == 1;
+                        _dgOrgans.Visibility = advancedView ? Visibility.Collapsed : Visibility.Visible;
+                        _dgRccPlan.Visibility = advancedView ? Visibility.Visible : Visibility.Collapsed;
                         RefreshRccPlan();
                         return;
                     }
 
-                    if (secondMode)
+                    bool cropMode = modeIndex == 1;
+                    bool nestedMode = IsGenericKind && modeIndex == 2;
+
+                    if (cropMode)
                     {
-                        BuildCropGrid(_vm.TargetDoseRows.Where(r => r.IsSelected).ToList());
-                        _dgOrgans.Visibility = Visibility.Collapsed;
-                        _dgCrop.Visibility = Visibility.Visible;
-                    }
-                    else
-                    {
-                        if (_inCropMode)
+                        if (IsGenericKind)
                         {
+                            // Same Organs grid, but the RCC-style Max Dose/Small/
+                            // Large columns (and the RCC §2 Max-Dose crop formula
+                            // in DoRccStyleCrop) replace the default Ovl/Opt/PRV
+                            // columns/manual crop matrix while in this mode.
+                            if (!_inCropMode)
+                            {
+                                _dgOrgans.Columns.Clear();
+                                _dgOrgans.Columns.Add(MakeOrganNameColumn());
+                                AddOrganCropColumns();
+                            }
+                            _dgOrgans.Visibility = Visibility.Visible;
+                            _dgCrop.Visibility = Visibility.Collapsed;
+                            if (_genericCropExtrasPanel != null) _genericCropExtrasPanel.Visibility = Visibility.Visible;
+                            if (_txtOrgansHeader != null) _txtOrgansHeader.Text = "ORGANS  (enter Max Dose to auto-crop; tick Small/Large for falloff zone)";
+                            RefreshRccMatrix();
+                        }
+                        else
+                        {
+                            BuildCropGrid(_vm.TargetDoseRows.Where(r => r.IsSelected).ToList());
+                            _dgOrgans.Visibility = Visibility.Collapsed;
+                            _dgCrop.Visibility = Visibility.Visible;
+                        }
+                    }
+                    else if (nestedMode)
+                    {
+                        _dgOrgans.Visibility = Visibility.Collapsed;
+                        _dgCrop.Visibility = Visibility.Collapsed;
+                        if (_genericCropExtrasPanel != null) _genericCropExtrasPanel.Visibility = Visibility.Collapsed;
+                        if (_nestedPanel != null) _nestedPanel.Visibility = Visibility.Visible;
+                        RefreshNestedPickers();
+                    }
+                    else // standard
+                    {
+                        if (IsGenericKind)
+                        {
+                            if (_inCropMode)
+                            {
+                                _dgOrgans.Columns.Clear();
+                                _dgOrgans.Columns.Add(MakeOrganNameColumn());
+                                AddOrganGenerationColumns();
+                                if (_txtOrgansHeader != null) _txtOrgansHeader.Text = "ORGANS  (tick what to create per organ)";
+                            }
+                        }
+                        else if (_inCropMode)
+                        {
+                            // Breast Opto: unchanged from before - reset the Ovl/
+                            // Opt ticks the Organs grid still shows on the way out.
                             foreach (var r in _vm.OrganRows) { r.CreateOvl = false; r.CreateOpt = false; }
                             _dgOrgans.Items.Refresh();
                             UpdateStructureCount();
                         }
                         _dgOrgans.Visibility = Visibility.Visible;
                         _dgCrop.Visibility = Visibility.Collapsed;
+                        if (_genericCropExtrasPanel != null) _genericCropExtrasPanel.Visibility = Visibility.Collapsed;
+                        if (_nestedPanel != null) _nestedPanel.Visibility = Visibility.Collapsed;
                     }
 
-                    _inCropMode = secondMode;
+                    _inCropMode = cropMode;
+                    _inNestedMode = nestedMode;
 
-                    if (_colDose != null) _colDose.Visibility = secondMode ? Visibility.Collapsed : Visibility.Visible;
-                    if (_colSuffix != null) _colSuffix.Visibility = secondMode ? Visibility.Collapsed : Visibility.Visible;
-                    if (_colBolus != null) _colBolus.Visibility = secondMode ? Visibility.Collapsed : Visibility.Visible;
-                    if (_colAvoid != null) _colAvoid.Visibility = secondMode ? Visibility.Collapsed : Visibility.Visible;
+                    bool hideTargetCols = cropMode || nestedMode;
+                    if (_colDose != null) _colDose.Visibility = hideTargetCols ? Visibility.Collapsed : Visibility.Visible;
+                    if (_colSuffix != null) _colSuffix.Visibility = hideTargetCols ? Visibility.Collapsed : Visibility.Visible;
+                    if (_colBolus != null) _colBolus.Visibility = hideTargetCols ? Visibility.Collapsed : Visibility.Visible;
+                    if (_colAvoid != null) _colAvoid.Visibility = hideTargetCols ? Visibility.Collapsed : Visibility.Visible;
 
-                    _btnCrop.Visibility = secondMode ? Visibility.Visible : Visibility.Collapsed;
-                    _btnDone.Visibility = secondMode ? Visibility.Visible : Visibility.Collapsed;
-                    _btnCreate.Visibility = secondMode ? Visibility.Collapsed : Visibility.Visible;
+                    _btnCrop.Visibility = cropMode ? Visibility.Visible : Visibility.Collapsed;
+                    _btnDone.Visibility = (cropMode || nestedMode) ? Visibility.Visible : Visibility.Collapsed;
+                    _btnCreate.Visibility = (cropMode || nestedMode) ? Visibility.Collapsed : Visibility.Visible;
                 }
 
                 private void BuildCropGrid(List<TargetDoseRow> selectedTargets)
@@ -5185,6 +5440,423 @@ namespace VMS.TPS
 
                     _dgTargets.Items.Refresh();
                     ApplyTargetFilter();
+                }
+
+                // Generic-only: "Crop PTV from OARs" mode's Crop PTVs button.
+                // Same output contract as DoCrop() (creates/updates a z_{target}_Crp
+                // target row per ticked PTV) but the per-organ crop distance comes
+                // from RCC's own §2 Max-Dose formula (Rx, OAR Max Dose, Small/Large
+                // Zone A rate - see ComputeRccPlan/ApplyRccMaxDoseCropToOpt) instead
+                // of a hand-typed mm matrix, driven by the same Max Dose/Small/Large
+                // columns AddOrganCropColumns puts on the Organs grid in this mode.
+                private void DoRccStyleCrop()
+                {
+                    _dgTargets.CommitEdit(DataGridEditingUnit.Cell, true);
+                    _dgTargets.CommitEdit(DataGridEditingUnit.Row, true);
+                    _dgOrgans.CommitEdit(DataGridEditingUnit.Cell, true);
+                    _dgOrgans.CommitEdit(DataGridEditingUnit.Row, true);
+
+                    var ext = _vm.SelectedExternal;
+                    if (ext == null || ext.IsEmpty)
+                    {
+                        MessageBox.Show(_owner, "No External/Body structure selected.",
+                            "Missing External", MessageBoxButton.OK, MessageBoxImage.Warning);
+                        return;
+                    }
+
+                    var selectedTargets = _vm.TargetDoseRows
+                        .Where(r => r.IsSelected && r.ParsedDoseGy.HasValue && r.ParsedDoseGy.Value > 0)
+                        .ToList();
+                    if (selectedTargets.Count == 0)
+                    {
+                        MessageBox.Show(_owner, "Tick at least one PTV with a valid dose in the Targets table.",
+                            "No targets selected", MessageBoxButton.OK, MessageBoxImage.Warning);
+                        return;
+                    }
+
+                    var oarsWithMaxDose = _vm.OrganRows.Where(o => o.ParsedMaxDoseGy.HasValue).ToList();
+                    if (oarsWithMaxDose.Count == 0)
+                    {
+                        MessageBox.Show(_owner, "Enter a Max Dose (Gy) for at least one organ.",
+                            "No organs configured", MessageBoxButton.OK, MessageBoxImage.Warning);
+                        return;
+                    }
+
+                    double zoneASmall = ParseRateOrDefault(_txtRccZoneASmall, RCC_ZONE_A_SMALL_DEFAULT_PCT_PER_MM);
+                    double zoneALarge = ParseRateOrDefault(_txtRccZoneALarge, RCC_ZONE_A_LARGE_DEFAULT_PCT_PER_MM);
+
+                    var fb = new SliceRecontourFallback();
+                    var created = new List<string>();
+                    var errors = new List<string>();
+
+                    foreach (var tdr in selectedTargets)
+                    {
+                        var target = _ss.Structures.FirstOrDefault(s =>
+                            !s.IsEmpty && string.Equals(s.Id, tdr.TargetId, StringComparison.OrdinalIgnoreCase));
+                        if (target == null) continue;
+
+                        double rx = tdr.ParsedDoseGy.Value;
+                        var cropPairs = new List<KeyValuePair<OrganRow, double>>();
+                        foreach (var oar in oarsWithMaxDose)
+                        {
+                            double oarMax = oar.ParsedMaxDoseGy.Value;
+                            if (oarMax >= rx) continue;
+                            double zoneA = oar.IsLargeOrgan ? zoneALarge : zoneASmall;
+                            double cropMm = RccCropMm(RccPctDiff(rx, oarMax), zoneA);
+                            if (cropMm <= 0) continue;
+                            cropPairs.Add(new KeyValuePair<OrganRow, double>(oar, cropMm));
+                        }
+                        if (cropPairs.Count == 0) continue;
+
+                        using (var tgUnion = new TempGuard(_ss))
+                        {
+                            SegmentVolume expandedOarsUnion = null;
+                            Structure expandedOarsUnionSt = null;
+                            var pairLabels = new List<string>();
+
+                            foreach (var pair in cropPairs)
+                            {
+                                var oarSt = _ss.Structures.FirstOrDefault(s =>
+                                    !s.IsEmpty && string.Equals(s.Id, pair.Key.OarId, StringComparison.OrdinalIgnoreCase));
+                                if (oarSt == null) continue;
+
+                                try
+                                {
+                                    var expanded = SafeMargin(oarSt.SegmentVolume, pair.Value);
+                                    var tmpSt = tgUnion.Add(CreateTempFromSegment(_ss, expanded, "zGC_ExpOar"));
+
+                                    if (expandedOarsUnion == null)
+                                    {
+                                        expandedOarsUnion = expanded;
+                                        expandedOarsUnionSt = tmpSt;
+                                    }
+                                    else
+                                    {
+                                        expandedOarsUnion = SafeBoolean(_ss,
+                                            expandedOarsUnion, expanded, BoolOp.Or,
+                                            expandedOarsUnionSt, tmpSt, null, fb, "GenericCropOarsUnion", tgUnion);
+                                    }
+                                    pairLabels.Add($"{pair.Key.OarId}({pair.Value:0.0}mm)");
+                                }
+                                catch (Exception ex)
+                                {
+                                    errors.Add($"Organ {pair.Key.OarId} union failed: {ex.Message}");
+                                }
+                            }
+                            if (expandedOarsUnion == null) continue;
+
+                            try
+                            {
+                                using (var tgCrop = new TempGuard(_ss))
+                                {
+                                    var croppedSeg = SafeBoolean(_ss,
+                                        target.SegmentVolume, expandedOarsUnion, BoolOp.Sub,
+                                        target, expandedOarsUnionSt, null, fb,
+                                        $"GenericCrop_{tdr.TargetId}_Sub", tgCrop);
+                                    croppedSeg = SafeBoolean(_ss, croppedSeg, ext.SegmentVolume, BoolOp.And,
+                                        null, ext, null, fb, $"GenericCrop_{tdr.TargetId}_CapExt", tgCrop);
+
+                                    bool isReCrop = tdr.TargetId.EndsWith("_Crp", StringComparison.OrdinalIgnoreCase);
+                                    string cropId = isReCrop ? tdr.TargetId : BuildId("z_", tdr.TargetId, "_Crp");
+
+                                    var cropSt = GetOrCreate(_ss, "PTV", cropId);
+                                    if (AssignSegmentSafely(cropSt, croppedSeg))
+                                    {
+                                        cropSt.Color = Color.FromRgb(255, 165, 0);
+                                        var info = $"Cropped (RCC Max-Dose formula) from: {string.Join(", ", pairLabels)}";
+                                        if (isReCrop && !string.IsNullOrEmpty(tdr.CropInfo))
+                                            info = tdr.CropInfo + "\n---\n" + info;
+
+                                        created.Add(cropId);
+
+                                        if (isReCrop)
+                                        {
+                                            tdr.CropInfo = info;
+                                        }
+                                        else
+                                        {
+                                            var newRow = new TargetDoseRow
+                                            {
+                                                IsSelected = false,
+                                                TargetId = cropId,
+                                                DoseGy = tdr.DoseGy,
+                                                Suffix = tdr.Suffix,
+                                                BolusMm = tdr.BolusMm,
+                                                CreateAvoidance = tdr.CreateAvoidance,
+                                                CropInfo = info
+                                            };
+                                            newRow.PropertyChanged += new PropertyChangedEventHandler(_rowPropertyChanged);
+                                            _vm.TargetDoseRows.Add(newRow);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        _ss.RemoveStructure(cropSt);
+                                        errors.Add($"{tdr.TargetId}: Crop resulted in an empty structure.");
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                errors.Add($"{tdr.TargetId}: {ex.Message}");
+                            }
+                        }
+                    }
+
+                    var msg = new StringBuilder();
+                    msg.AppendLine($"Cropped {created.Count} PTV(s):");
+                    foreach (var id in created) msg.AppendLine($"  {id}");
+                    if (errors.Count > 0)
+                    {
+                        msg.AppendLine();
+                        msg.AppendLine($"Errors ({errors.Count}):");
+                        foreach (var err in errors) msg.AppendLine($"  {err}");
+                    }
+                    msg.AppendLine();
+                    msg.AppendLine("You can crop again, or click Done to proceed.");
+                    MessageBox.Show(_owner, msg.ToString(), "Crop Complete", MessageBoxButton.OK, MessageBoxImage.Information);
+
+                    _dgTargets.Items.Refresh();
+                    ApplyTargetFilter();
+                    RefreshRccMatrix();
+                }
+
+                // Generic-only: repopulates the Nested mode PTV/Organ pickers
+                // from the same Targets/Organs lists used everywhere else in
+                // this tab, preserving the current picks where they still exist.
+                private void RefreshNestedPickers()
+                {
+                    if (_cbNestedPtv == null || _cbNestedOar == null) return;
+
+                    var prevPtv = _cbNestedPtv.SelectedItem as TargetDoseRow;
+                    var prevOar = _cbNestedOar.SelectedItem as OrganRow;
+
+                    _cbNestedPtv.ItemsSource = null;
+                    _cbNestedPtv.ItemsSource = _vm.TargetDoseRows;
+                    _cbNestedPtv.SelectedItem = (prevPtv != null && _vm.TargetDoseRows.Contains(prevPtv))
+                        ? prevPtv : _vm.TargetDoseRows.FirstOrDefault();
+
+                    _cbNestedOar.ItemsSource = null;
+                    _cbNestedOar.ItemsSource = _vm.OrganRows;
+                    _cbNestedOar.SelectedItem = (prevOar != null && _vm.OrganRows.Contains(prevOar))
+                        ? prevOar : _vm.OrganRows.FirstOrDefault();
+                }
+
+                // Generic-only: "Nested" mode. Ensures the picked PTV's z_PTV_opt
+                // exists (building it from the same Eval->Opt formula Step1/
+                // Step2 use if it doesn't - see EnsurePtvOpt), then steps
+                // <thickness>mm-thick shells outward from that PTV_Opt surface,
+                // keeping only the part of each shell that's inside the picked
+                // organ, until a shell no longer overlaps the organ at all:
+                //   1) croppedPtv = PTV_Opt minus Organ (the part of the PTV
+                //      that isn't already inside the organ) - working geometry
+                //      only, never itself kept as a structure.
+                //   2) level 1: ring = (croppedPtv +thickness) minus croppedPtv,
+                //      piece = ring ∩ Organ -> z_[Organ]_[dose]_1
+                //   3) level 2: ring = (croppedPtv +2*thickness) minus
+                //      (croppedPtv +thickness), piece = ring ∩ Organ -> ..._2
+                //   4) repeat outward until piece ∩ Organ is empty (the organ
+                //      has run out at that depth), or RCC_NESTED_MAX_LEVELS is
+                //      hit as a safety cap.
+                private void DoNestedCreate()
+                {
+                    var tdr = _cbNestedPtv?.SelectedItem as TargetDoseRow;
+                    var oar = _cbNestedOar?.SelectedItem as OrganRow;
+                    if (tdr == null || oar == null)
+                    {
+                        MessageBox.Show(_owner, "Pick both a PTV and an organ.",
+                            "Missing selection", MessageBoxButton.OK, MessageBoxImage.Warning);
+                        return;
+                    }
+
+                    var ext = _vm.SelectedExternal;
+                    if (ext == null || ext.IsEmpty)
+                    {
+                        MessageBox.Show(_owner, "No External/Body structure selected.",
+                            "Missing External", MessageBoxButton.OK, MessageBoxImage.Warning);
+                        return;
+                    }
+
+                    var oarSt = _ss.Structures.FirstOrDefault(s =>
+                        !s.IsEmpty && string.Equals(s.Id, oar.OarId, StringComparison.OrdinalIgnoreCase));
+                    if (oarSt == null)
+                    {
+                        MessageBox.Show(_owner, $"Organ structure '{oar.OarId}' is missing or empty.",
+                            "Missing organ", MessageBoxButton.OK, MessageBoxImage.Warning);
+                        return;
+                    }
+
+                    double thickness = double.TryParse(_txtNestedThickness?.Text,
+                        System.Globalization.NumberStyles.Any, System.Globalization.CultureInfo.InvariantCulture, out var t) && t > 0
+                        ? t : RCC_NESTED_RING_STEP_MM;
+
+                    var fb = new SliceRecontourFallback();
+                    string error;
+                    var ptvOptSt = EnsurePtvOpt(tdr, ext, fb, out error);
+                    if (ptvOptSt == null)
+                    {
+                        MessageBox.Show(_owner, error ?? "Could not build or find z_PTV_opt for the picked PTV.",
+                            "PTV_Opt unavailable", MessageBoxButton.OK, MessageBoxImage.Warning);
+                        return;
+                    }
+
+                    double? doseGy = tdr.ParsedDoseGy ?? GuessDoseFromName(tdr.TargetId);
+                    var created = new List<string>();
+                    string stopReason = "ran out of organ material";
+
+                    try
+                    {
+                        using (var tg = new TempGuard(_ss))
+                        {
+                            var croppedSeg = SafeBoolean(_ss, ptvOptSt.SegmentVolume, oarSt.SegmentVolume, BoolOp.Sub,
+                                ptvOptSt, oarSt, null, fb, "Nested_CroppedPtv", tg);
+                            if (croppedSeg == null)
+                            {
+                                stopReason = "the PTV_Opt is entirely inside the organ - nothing outside it to build shells from";
+                            }
+                            else
+                            {
+                                var croppedSt = tg.Add(CreateTempFromSegment(_ss, croppedSeg, "zNestCropPtv"));
+
+                                for (int level = 1; level <= RCC_NESTED_MAX_LEVELS; level++)
+                                {
+                                    var outerSeg = SafeMargin(croppedSt.SegmentVolume, thickness * level);
+                                    var innerSeg = SafeMargin(croppedSt.SegmentVolume, thickness * (level - 1));
+                                    var outerSt = tg.Add(CreateTempFromSegment(_ss, outerSeg, "zNestOuter"));
+                                    var innerSt = tg.Add(CreateTempFromSegment(_ss, innerSeg, "zNestInner"));
+
+                                    var ringSeg = SafeBoolean(_ss, outerSeg, innerSeg, BoolOp.Sub,
+                                        outerSt, innerSt, null, fb, $"Nested_Ring{level}", tg);
+                                    if (ringSeg == null) { stopReason = $"level {level}: shell is empty"; break; }
+
+                                    var ringSt = tg.Add(CreateTempFromSegment(_ss, ringSeg, "zNestRing"));
+                                    var pieceSeg = SafeBoolean(_ss, ringSeg, oarSt.SegmentVolume, BoolOp.And,
+                                        ringSt, oarSt, null, fb, $"Nested_Piece{level}", tg);
+                                    if (pieceSeg == null) { stopReason = $"level {level}: shell no longer overlaps the organ"; break; }
+
+                                    string pieceId = doseGy.HasValue
+                                        ? BuildId("z_", oar.OarId, $"_{doseGy.Value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)}_{level}")
+                                        : BuildId("z_", oar.OarId, $"_{level}");
+
+                                    var st = GetOrCreate(_ss, "CONTROL", pieceId);
+                                    EnsureRccHighRes(st);
+                                    if (AssignSegmentSafely(st, pieceSeg))
+                                    {
+                                        st.Color = level % 2 == 1 ? Colors.Gold : Colors.DarkGoldenrod;
+                                        created.Add(pieceId);
+                                    }
+                                    else
+                                    {
+                                        _ss.RemoveStructure(st);
+                                        stopReason = $"level {level}: empty after assignment";
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        MessageBox.Show(_owner, $"Nested build failed: {ex.Message}",
+                            "Nested failed", MessageBoxButton.OK, MessageBoxImage.Error);
+                        return;
+                    }
+
+                    var msg = created.Count > 0
+                        ? $"Created {created.Count} nested structure(s):\n{string.Join("\n", created)}\n\nStopped: {stopReason}."
+                        : $"No structures were created.\n\nReason: {stopReason}.";
+                    MessageBox.Show(_owner, msg, "Nested", MessageBoxButton.OK,
+                        created.Count > 0 ? MessageBoxImage.Information : MessageBoxImage.Warning);
+                    UpdateStructureCount();
+                }
+
+                // Finds the picked PTV's z_PTV_opt if it already exists, or
+                // builds it fresh using the same Eval->Opt formula as
+                // StructureProcessor's Step1_EvalPtv/Step2_OptPtv (dose-union
+                // capped to Body-3mm for Eval, +2mm expand capped to External
+                // for Opt) - simplified to a single target/no dose-ladder,
+                // since Nested mode only ever works one PTV at a time. Returns
+                // null and sets `error` if the raw target structure is missing
+                // or the geometry collapses to nothing.
+                private Structure EnsurePtvOpt(TargetDoseRow tdr, Structure ext, SliceRecontourFallback fb, out string error)
+                {
+                    error = null;
+                    double? doseGy = tdr.ParsedDoseGy ?? GuessDoseFromName(tdr.TargetId);
+                    if (!doseGy.HasValue)
+                    {
+                        error = $"'{tdr.TargetId}' has no dose set in the Targets table, and none could be guessed from its name.";
+                        return null;
+                    }
+                    string doseStr = doseGy.Value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+                    string sfxStr = string.IsNullOrWhiteSpace(tdr.Suffix) ? "" : "_" + tdr.Suffix.Trim();
+                    string evalId = TruncId($"z_PTV_eval_{doseStr}{sfxStr}");
+                    string optId = TruncId($"z_PTV_opt_{doseStr}{sfxStr}");
+
+                    var existingOpt = _ss.Structures.FirstOrDefault(s =>
+                        !s.IsEmpty && string.Equals(s.Id, optId, StringComparison.OrdinalIgnoreCase));
+                    if (existingOpt != null) return existingOpt;
+
+                    var target = _ss.Structures.FirstOrDefault(s =>
+                        !s.IsEmpty && string.Equals(s.Id, tdr.TargetId, StringComparison.OrdinalIgnoreCase));
+                    if (target == null)
+                    {
+                        error = $"'{tdr.TargetId}' structure is missing or empty.";
+                        return null;
+                    }
+
+                    Structure evalSt = _ss.Structures.FirstOrDefault(s =>
+                        !s.IsEmpty && string.Equals(s.Id, evalId, StringComparison.OrdinalIgnoreCase));
+
+                    using (var tg = new TempGuard(_ss))
+                    {
+                        if (evalSt == null)
+                        {
+                            var extMinus3 = SafeMargin(ext.SegmentVolume, -BODY_CONTRACT_MM);
+                            var bodyMinus3 = SafeBoolean(_ss, extMinus3, ext.SegmentVolume, BoolOp.And,
+                                ext, ext, null, fb, "Nested_BodyMinus3", tg);
+
+                            var evalSeg = SafeBoolean(_ss, target.SegmentVolume, bodyMinus3, BoolOp.And,
+                                target, ext, evalId, fb, "Nested_Eval_AndBodyMinus3", tg);
+                            evalSeg = SafeBoolean(_ss, evalSeg, ext.SegmentVolume, BoolOp.And,
+                                null, ext, evalId, fb, "Nested_Eval_AndExt", tg);
+                            if (evalSeg == null)
+                            {
+                                error = $"z_PTV_eval could not be built for '{tdr.TargetId}' (empty after Body-3mm/External cap).";
+                                return null;
+                            }
+
+                            var evalStNew = GetOrCreate(_ss, "PTV", evalId);
+                            if (!AssignSegmentSafely(evalStNew, evalSeg))
+                            {
+                                _ss.RemoveStructure(evalStNew);
+                                error = $"z_PTV_eval could not be built for '{tdr.TargetId}' (empty result).";
+                                return null;
+                            }
+                            evalStNew.Color = Colors.Blue;
+                            evalSt = evalStNew;
+                        }
+
+                        var evalClone = CloneSegViaTempTracked(_ss, evalSt.SegmentVolume, "zTmpNestEval", tg);
+                        var optSeg = SafeMargin(evalClone, EVAL_TO_OPT_EXPAND_MM);
+                        optSeg = SafeBoolean(_ss, optSeg, ext.SegmentVolume, BoolOp.And,
+                            null, ext, optId, fb, "Nested_Opt_CapExt", tg);
+                        if (optSeg == null)
+                        {
+                            error = $"z_PTV_opt could not be built for '{tdr.TargetId}' (empty after +2mm/External cap).";
+                            return null;
+                        }
+
+                        var optSt = GetOrCreate(_ss, "PTV", optId);
+                        if (!AssignSegmentSafely(optSt, optSeg))
+                        {
+                            _ss.RemoveStructure(optSt);
+                            error = $"z_PTV_opt could not be built for '{tdr.TargetId}' (empty result).";
+                            return null;
+                        }
+                        optSt.Color = Colors.Red;
+                        if (SMOOTH_OPT_TARGET) SmoothStructureByExpandContract(optSt, SMOOTH_MM);
+                        return optSt;
+                    }
                 }
 
                 private void ApplyTargetFilter()
@@ -5453,7 +6125,7 @@ namespace VMS.TPS
 
                 // One "label above, rate below" column, used to lay the FALLOFF
                 // ZONE section out as a single row with one column per zone.
-                private TextBox AddRateColumn(UniformGrid parent, string label, double defaultValue)
+                private TextBox AddRateColumn(UniformGrid parent, string label, double defaultValue, Action onChanged = null)
                 {
                     var col = new StackPanel { Orientation = Orientation.Vertical, Margin = new Thickness(0, 0, 12, 0) };
                     col.Children.Add(new TextBlock
@@ -5470,7 +6142,7 @@ namespace VMS.TPS
                         Width = 70,
                         HorizontalAlignment = HorizontalAlignment.Left
                     };
-                    tb.LostFocus += (s, e) => RefreshRccPlan();
+                    tb.LostFocus += (s, e) => (onChanged ?? RefreshRccPlan)();
                     col.Children.Add(tb);
                     parent.Children.Add(col);
                     return tb;
@@ -5642,6 +6314,7 @@ namespace VMS.TPS
                 // "-" if that OAR's Max Dose does not require sparing this target's Rx).
                 private void RefreshRccMatrix()
                 {
+                    if (_dgRccMatrix == null) return;
                     double zoneASmall = ParseRateOrDefault(_txtRccZoneASmall, RCC_ZONE_A_SMALL_DEFAULT_PCT_PER_MM);
                     double zoneALarge = ParseRateOrDefault(_txtRccZoneALarge, RCC_ZONE_A_LARGE_DEFAULT_PCT_PER_MM);
                     var tickedTargets = _vm.TargetDoseRows
