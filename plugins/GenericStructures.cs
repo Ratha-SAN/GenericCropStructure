@@ -649,6 +649,20 @@
 //               Still visible in standard/Eval mode and in Nested mode
 //               (which actively uses it - ticking "Nested" for an organ
 //               auto-selects that PTV's row in it).
+//   v5.16.0.0 – Generic Nested mode: each level's kept piece is now bounded
+//               by the PTV/organ overlap, not the whole organ. Added a new
+//               in-memory `overlap = PTV_Opt ∩ Organ` structure alongside
+//               the existing `croppedPtv = PTV_Opt - Organ`; every shell's
+//               piece is computed as `ring ∩ overlap` instead of the old
+//               `ring ∩ Organ`, so a shell can never pick up organ tissue
+//               that was never part of the PTV to begin with just because
+//               it expanded far enough to geometrically reach it - the
+//               union of every kept level exactly exhausts `overlap` and
+//               nothing more. Added a new early-exit ("the PTV_Opt and
+//               organ don't overlap at all - nothing to slice") for the
+//               case where croppedPtv builds fine but overlap is empty.
+//               The per-level stop reason now reads "ring no longer
+//               overlaps the PTV/organ overlap region" to match.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -674,8 +688,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.15.1.0")]
-[assembly: AssemblyFileVersion("5.15.1.0")]
+[assembly: AssemblyVersion("5.16.0.0")]
+[assembly: AssemblyFileVersion("5.16.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -3930,7 +3944,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.15.1.0";
+                Title = "Generic Crop Structure Generator - v5.16.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
@@ -5816,19 +5830,28 @@ namespace VMS.TPS
                 // "Nested" with a PTV picked: ensures that PTV's z_PTV_opt
                 // exists (building it from the same Eval->Opt formula Step1/
                 // Step2 use if it doesn't - see EnsurePtvOpt), then steps
-                // <thickness>mm-thick shells outward from that PTV_Opt surface,
-                // keeping only the part of each shell that's inside the organ,
-                // until a shell no longer overlaps it at all:
+                // <thickness>mm-thick shells outward from that PTV_Opt's
+                // organ-cropped surface, keeping only the part of each shell
+                // that's inside the ORIGINAL PTV/organ overlap (not the whole
+                // organ), until a shell no longer overlaps it at all:
                 //   1) croppedPtv = PTV_Opt minus Organ (the part of the PTV
-                //      that isn't already inside the organ) - working geometry
+                //      that ISN'T already inside the organ) - working geometry
                 //      only, never itself kept as a structure.
-                //   2) level 1: ring = (croppedPtv +thickness) minus croppedPtv,
-                //      piece = ring ∩ Organ -> z_[Organ]_[dose]_1
-                //   3) level 2: ring = (croppedPtv +2*thickness) minus
-                //      (croppedPtv +thickness), piece = ring ∩ Organ -> ..._2
-                //   4) repeat outward until piece ∩ Organ is empty (the organ
-                //      has run out at that depth), or RCC_NESTED_MAX_LEVELS is
-                //      hit as a safety cap.
+                //   2) overlap = PTV_Opt ∩ Organ (the part of the PTV that
+                //      already IS inside the organ) - also working geometry
+                //      only. Every level below is capped to this, not to the
+                //      whole organ, so a shell can never pick up organ tissue
+                //      that was never part of the PTV to begin with, just
+                //      because it expanded far enough to geometrically reach
+                //      it - the union of every kept level exactly exhausts
+                //      `overlap`, nothing more.
+                //   3) level 1: ring = (croppedPtv +thickness) minus croppedPtv,
+                //      piece = ring ∩ overlap -> z_[Organ]_[dose]_1
+                //   4) level 2: ring = (croppedPtv +2*thickness) minus
+                //      (croppedPtv +thickness), piece = ring ∩ overlap -> ..._2
+                //   5) repeat outward until piece (ring ∩ overlap) is empty -
+                //      the overlap has been fully sliced up to that depth - or
+                //      RCC_NESTED_MAX_LEVELS is hit as a safety cap.
                 private void DoNestedCreate()
                 {
                     _dgTargets.CommitEdit(DataGridEditingUnit.Cell, true);
@@ -5886,13 +5909,21 @@ namespace VMS.TPS
                             {
                                 var croppedSeg = SafeBoolean(_ss, ptvOptSt.SegmentVolume, oarSt.SegmentVolume, BoolOp.Sub,
                                     ptvOptSt, oarSt, null, fb, "Nested_CroppedPtv", tg);
+                                var overlapSeg = SafeBoolean(_ss, ptvOptSt.SegmentVolume, oarSt.SegmentVolume, BoolOp.And,
+                                    ptvOptSt, oarSt, null, fb, "Nested_Overlap", tg);
+
                                 if (croppedSeg == null)
                                 {
                                     stopReason = "the PTV_Opt is entirely inside the organ - nothing outside it to build shells from";
                                 }
+                                else if (overlapSeg == null)
+                                {
+                                    stopReason = "the PTV_Opt and organ don't overlap at all - nothing to slice";
+                                }
                                 else
                                 {
                                     var croppedSt = tg.Add(CreateTempFromSegment(_ss, croppedSeg, "zNestCropPtv"));
+                                    var overlapSt = tg.Add(CreateTempFromSegment(_ss, overlapSeg, "zNestOverlap"));
 
                                     // Each level's scratch (outerSt/innerSt/ringSt) uses
                                     // its OWN TempGuard, disposed at the end of that
@@ -5920,18 +5951,27 @@ namespace VMS.TPS
                                                 outerSt, innerSt, null, fb, $"Nested_Ring{level}", levelTg);
                                             if (ringSeg != null)
                                             {
+                                                // Ring∩(PTV_Opt∩Organ overlap) - NOT ring∩Organ
+                                                // directly - so a level only ever picks up
+                                                // material that was already inside the PTV to
+                                                // begin with, never organ tissue the ring
+                                                // happens to reach beyond the original PTV
+                                                // boundary. The union of every level's piece
+                                                // is therefore bounded by (and eventually
+                                                // exhausts) the overlap region exactly.
                                                 var ringSt = levelTg.Add(CreateTempFromSegment(_ss, ringSeg, "zNestRing"));
-                                                pieceSeg = SafeBoolean(_ss, ringSeg, oarSt.SegmentVolume, BoolOp.And,
-                                                    ringSt, oarSt, null, fb, $"Nested_Piece{level}", levelTg);
+                                                pieceSeg = SafeBoolean(_ss, ringSeg, overlapSt.SegmentVolume, BoolOp.And,
+                                                    ringSt, overlapSt, null, fb, $"Nested_Piece{level}", levelTg);
                                             }
                                             // Single stopping rule: the ring no longer
-                                            // overlaps the organ - covers both an empty
-                                            // ring∩organ intersection and the (normally
-                                            // unreachable, since thickness>0 always makes
-                                            // outer strictly larger than inner) degenerate
-                                            // case where the raw ring itself came back empty.
+                                            // overlaps the PTV/organ overlap region -
+                                            // covers both an empty ring∩overlap intersection
+                                            // and the (normally unreachable, since thickness>0
+                                            // always makes outer strictly larger than inner)
+                                            // degenerate case where the raw ring itself came
+                                            // back empty.
                                             levelOk = pieceSeg != null;
-                                            if (!levelOk) stopReason = $"level {level}: ring no longer overlaps the organ";
+                                            if (!levelOk) stopReason = $"level {level}: ring no longer overlaps the PTV/organ overlap region";
                                         }
                                         if (!levelOk) break;
 
