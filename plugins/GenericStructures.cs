@@ -663,6 +663,25 @@
 //               case where croppedPtv builds fine but overlap is empty.
 //               The per-level stop reason now reads "ring no longer
 //               overlaps the PTV/organ overlap region" to match.
+//   v5.17.0.0 – Window height increased 800->960 (+20%). Generic Eval mode:
+//               added a "quick category" bulk-tick control directly under
+//               "Generate selected structures only", above the existing
+//               granular per-id Auto Structures table - a compact row of
+//               Eval/Opt/Ring/Rind/Avoidance checkboxes (unticked by
+//               default) that writes through to the matching real
+//               structure-id rows below instead of requiring the user to
+//               scroll/hunt for each one individually. With 2 or fewer
+//               selected PTV dose groups it's a single bulk row that
+//               applies to every selected PTV at once; with more than 2
+//               it becomes a table (CategoryPickRow/_dgCategoryPick) with
+//               one row per PTV so Eval/Opt/Rind can be set independently
+//               per PTV. Ring and Avoidance are plan-wide structures (not
+//               built per PTV), so their checkbox is really one shared
+//               toggle mirrored across every visible row - ticking it on
+//               any row/PTV ticks z_Ring_1/z_Ring_2 (+z_Ring_{dose} on the
+//               highest-dose PTV) or z_Avoidance for all of them at once.
+//               Only enabled while "Generate selected structures only" is
+//               ticked, same as the table it drives.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -688,8 +707,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.16.0.0")]
-[assembly: AssemblyFileVersion("5.16.0.0")]
+[assembly: AssemblyVersion("5.17.0.0")]
+[assembly: AssemblyFileVersion("5.17.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -3606,6 +3625,31 @@ namespace VMS.TPS
                 PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
         }
 
+        // Generic tab only: one row of the "quick category" bulk-tick control
+        // shown directly under "Generate selected structures only", above the
+        // granular per-id Auto Structures table (see SiteTabController.
+        // BuildCategoryPickSection/RefreshCategoryPickRows). Holds no state of
+        // its own beyond a UI reflection - toggling a property here writes
+        // through to the matching real AutoStructureRow entry/entries (see
+        // _categoryRowPropertyChanged), it never drives generation directly.
+        private sealed class CategoryPickRow : INotifyPropertyChanged
+        {
+            public string PtvLabel { get; set; }
+            public double DoseGy { get; set; }
+            public string Suffix { get; set; }
+
+            private bool _eval, _opt, _ring, _rind, _avoidance;
+            public bool Eval { get => _eval; set { if (_eval != value) { _eval = value; OnPC(nameof(Eval)); } } }
+            public bool Opt { get => _opt; set { if (_opt != value) { _opt = value; OnPC(nameof(Opt)); } } }
+            public bool Ring { get => _ring; set { if (_ring != value) { _ring = value; OnPC(nameof(Ring)); } } }
+            public bool Rind { get => _rind; set { if (_rind != value) { _rind = value; OnPC(nameof(Rind)); } } }
+            public bool Avoidance { get => _avoidance; set { if (_avoidance != value) { _avoidance = value; OnPC(nameof(Avoidance)); } } }
+
+            public event PropertyChangedEventHandler PropertyChanged;
+            private void OnPC(string name) =>
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name));
+        }
+
         // ==================================================================
         // RCC PLAN / RESULT ROWS
         // These are pure result/DTO types produced by the RCC formula engine
@@ -3944,9 +3988,9 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.16.0.0";
+                Title = "Generic Crop Structure Generator - v5.17.0.0";
                 Width = 1250;
-                Height = 800;
+                Height = 960;
                 MinWidth = 1000;
                 MinHeight = 600;
                 ResizeMode = ResizeMode.CanResize;
@@ -4181,6 +4225,24 @@ namespace VMS.TPS
                 private DataGrid _dgAutoStructuresLeft, _dgAutoStructuresRight;   // Generic-only: selective per-structure generation, 2-column list
                 private TextBlock _txtAutoStructuresWarning;
                 private CheckBox _cbUseSelective;
+
+                // Generic-only: quick per-category (Eval/Opt/Ring/Rind/
+                // Avoidance) bulk-tick control shown above the granular per-id
+                // Auto Structures table - see BuildCategoryPickSection/
+                // RefreshCategoryPickRows/_categoryRowPropertyChanged. A table
+                // (_dgCategoryPick, one row per PTV) once more than 2 PTV
+                // groups are selected; otherwise a single bulk row
+                // (_categoryPickRowPanel/_cbCat*) that applies to every
+                // selected PTV group at once. Ring/Avoidance are plan-wide,
+                // not per-PTV, so their checkbox is really one shared toggle
+                // mirrored across every visible row - see
+                // _categoryRowPropertyChanged.
+                private ObservableCollection<CategoryPickRow> _categoryPickRows = new ObservableCollection<CategoryPickRow>();
+                private DataGrid _dgCategoryPick;
+                private StackPanel _categoryPickRowPanel;
+                private CheckBox _cbCatEval, _cbCatOpt, _cbCatRing, _cbCatRind, _cbCatAvoid;
+                private bool _syncingCategoryPick;
+                private string _categoryHighestDoseStr;
                 private ComboBox _cbExternal, _cbTargetFilter, _cbMode, _cbPhysicalThickness;
 
                 // Only the Targets columns that SwitchMode toggles Visibility on
@@ -4224,6 +4286,15 @@ namespace VMS.TPS
                 // so DoRccStyleCrop can subscribe newly-added _Crp target rows
                 // to the exact same handler instead of duplicating it.
                 private Action<object, PropertyChangedEventArgs> _rowPropertyChanged;
+
+                // Shared PropertyChanged handler subscribed to every
+                // CategoryPickRow created in RefreshCategoryPickRows - writes
+                // any Eval/Opt/Ring/Rind/Avoidance toggle through to the
+                // matching real AutoStructureRow(s), and for the plan-wide
+                // Ring/Avoidance columns, mirrors the new value across every
+                // other visible CategoryPickRow so they all show one shared
+                // state (guarded by _syncingCategoryPick against re-entrancy).
+                private Action<object, PropertyChangedEventArgs> _categoryRowPropertyChanged;
 
                 // ---- RCC-only state ----
                 private RccPlan _rccPlan;
@@ -4269,6 +4340,65 @@ namespace VMS.TPS
                                     SyncNestedAutoStructureSelection(orgRow);
                             }
                         }
+                    };
+
+                    _categoryRowPropertyChanged = (s, e) =>
+                    {
+                        var row = s as CategoryPickRow;
+                        if (row == null) return;
+                        string doseStr = row.DoseGy.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                        string sfxStr = string.IsNullOrWhiteSpace(row.Suffix) ? "" : "_" + row.Suffix;
+
+                        void SetAuto(string id, bool val)
+                        {
+                            var ar = _vm.AutoStructureRows.FirstOrDefault(r => string.Equals(r.Name, id, StringComparison.OrdinalIgnoreCase));
+                            if (ar != null) ar.IsSelected = val;
+                        }
+
+                        switch (e.PropertyName)
+                        {
+                            case nameof(CategoryPickRow.Eval):
+                                SetAuto(TruncId($"z_PTV_eval_{doseStr}{sfxStr}"), row.Eval);
+                                break;
+                            case nameof(CategoryPickRow.Opt):
+                                SetAuto(TruncId($"z_PTV_opt_{doseStr}{sfxStr}"), row.Opt);
+                                break;
+                            case nameof(CategoryPickRow.Rind):
+                                SetAuto(TruncId($"z_Rind_{doseStr}{sfxStr}"), row.Rind);
+                                break;
+                            case nameof(CategoryPickRow.Ring):
+                                // Ring is plan-wide (z_Ring_1/z_Ring_2, plus
+                                // z_Ring_{dose} on the highest-dose group only)
+                                // - every row's Ring checkbox is really one
+                                // shared toggle, so mirror it across all rows.
+                                SetAuto("z_Ring_1", row.Ring);
+                                SetAuto("z_Ring_2", row.Ring);
+                                if (!string.IsNullOrEmpty(_categoryHighestDoseStr))
+                                    SetAuto(TruncId($"z_Ring_{_categoryHighestDoseStr}"), row.Ring);
+                                if (!_syncingCategoryPick)
+                                {
+                                    _syncingCategoryPick = true;
+                                    foreach (var r in _categoryPickRows) if (r != row) r.Ring = row.Ring;
+                                    if (_cbCatRing != null) _cbCatRing.IsChecked = row.Ring;
+                                    _syncingCategoryPick = false;
+                                }
+                                break;
+                            case nameof(CategoryPickRow.Avoidance):
+                                // z_Avoidance is a single plan-wide structure -
+                                // same shared-toggle treatment as Ring above.
+                                SetAuto("z_Avoidance", row.Avoidance);
+                                if (!_syncingCategoryPick)
+                                {
+                                    _syncingCategoryPick = true;
+                                    foreach (var r in _categoryPickRows) if (r != row) r.Avoidance = row.Avoidance;
+                                    if (_cbCatAvoid != null) _cbCatAvoid.IsChecked = row.Avoidance;
+                                    _syncingCategoryPick = false;
+                                }
+                                break;
+                        }
+
+                        _dgAutoStructuresLeft?.Items.Refresh();
+                        _dgAutoStructuresRight?.Items.Refresh();
                     };
 
                     foreach (var row in _vm.TargetDoseRows)
@@ -4758,6 +4888,8 @@ namespace VMS.TPS
                     };
                     section.Children.Add(_txtAutoStructuresWarning);
 
+                    section.Children.Add(BuildCategoryPickSection());
+
                     // Two side-by-side grids instead of one tall single-column
                     // list, so roughly twice as many structure ids are visible
                     // without scrolling. Both halves share one "Gen" header
@@ -4815,16 +4947,179 @@ namespace VMS.TPS
                         _vm.UseSelectiveGeneration = true;
                         _dgAutoStructuresLeft.IsEnabled = true;
                         _dgAutoStructuresRight.IsEnabled = true;
+                        if (_dgCategoryPick != null) _dgCategoryPick.IsEnabled = true;
+                        if (_categoryPickRowPanel != null) _categoryPickRowPanel.IsEnabled = true;
                     };
                     _cbUseSelective.Unchecked += (s, e) =>
                     {
                         _vm.UseSelectiveGeneration = false;
                         _dgAutoStructuresLeft.IsEnabled = false;
                         _dgAutoStructuresRight.IsEnabled = false;
+                        if (_dgCategoryPick != null) _dgCategoryPick.IsEnabled = false;
+                        if (_categoryPickRowPanel != null) _categoryPickRowPanel.IsEnabled = false;
                     };
 
                     section.Children.Add(columns);
                     return _owner.CreateCard(section);
+                }
+
+                // Generic-only: quick bulk-tick control sitting directly under
+                // "Generate selected structures only", above the granular
+                // per-id Auto Structures table. Ticking Eval/Opt/Ring/Rind/
+                // Avoidance here just writes through to the matching real
+                // structure-id row(s) below (see CategoryPickRow/
+                // _categoryRowPropertyChanged) - it never generates anything
+                // by itself. Only enabled while UseSelectiveGeneration is
+                // ticked (wired above in BuildAutoStructuresPanel). Built
+                // once here; populated per refresh by RefreshCategoryPickRows.
+                private UIElement BuildCategoryPickSection()
+                {
+                    var host = new Grid();
+
+                    // More than 2 selected PTV groups: full table, one row per
+                    // PTV so Eval/Opt/Rind can be set independently per PTV.
+                    _dgCategoryPick = new DataGrid
+                    {
+                        AutoGenerateColumns = false,
+                        CanUserAddRows = false,
+                        CanUserDeleteRows = false,
+                        HeadersVisibility = DataGridHeadersVisibility.Column,
+                        CellStyle = _singleClickCellStyle,
+                        MaxHeight = 160,
+                        Margin = new Thickness(0, 0, 0, 8),
+                        IsEnabled = _vm.UseSelectiveGeneration,
+                        Visibility = Visibility.Collapsed
+                    };
+                    _dgCategoryPick.Columns.Add(new DataGridTextColumn
+                    {
+                        Header = "PTV",
+                        Binding = new Binding(nameof(CategoryPickRow.PtvLabel)),
+                        IsReadOnly = true,
+                        Width = new DataGridLength(1, DataGridLengthUnitType.Star),
+                        ElementStyle = (Style)_owner.FindResource(typeof(TextBlock))
+                    });
+                    _dgCategoryPick.Columns.Add(_owner.MakeSingleClickCheckColumn("Eval", nameof(CategoryPickRow.Eval), 50));
+                    _dgCategoryPick.Columns.Add(_owner.MakeSingleClickCheckColumn("Opt", nameof(CategoryPickRow.Opt), 50));
+                    _dgCategoryPick.Columns.Add(_owner.MakeSingleClickCheckColumn("Ring", nameof(CategoryPickRow.Ring), 50));
+                    _dgCategoryPick.Columns.Add(_owner.MakeSingleClickCheckColumn("Rind", nameof(CategoryPickRow.Rind), 50));
+                    _dgCategoryPick.Columns.Add(_owner.MakeSingleClickCheckColumn("Avoid", nameof(CategoryPickRow.Avoidance), 50));
+                    host.Children.Add(_dgCategoryPick);
+
+                    // 2 or fewer selected PTV groups: one compact bulk row -
+                    // ticking a box applies to every selected PTV group at once.
+                    _categoryPickRowPanel = new StackPanel
+                    {
+                        Orientation = Orientation.Horizontal,
+                        Margin = new Thickness(0, 0, 0, 8),
+                        IsEnabled = _vm.UseSelectiveGeneration,
+                        Visibility = Visibility.Collapsed
+                    };
+
+                    StackPanel MakeCatCheck(string label, out CheckBox cb)
+                    {
+                        var p = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 14, 0) };
+                        var box = new CheckBox { VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(0, 0, 4, 0) };
+                        p.Children.Add(box);
+                        p.Children.Add(new TextBlock
+                        {
+                            Text = label,
+                            VerticalAlignment = VerticalAlignment.Center,
+                            Foreground = (Brush)_owner.FindResource("TextSecondary")
+                        });
+                        cb = box;
+                        return p;
+                    }
+
+                    _categoryPickRowPanel.Children.Add(MakeCatCheck("Eval", out _cbCatEval));
+                    _categoryPickRowPanel.Children.Add(MakeCatCheck("Opt", out _cbCatOpt));
+                    _categoryPickRowPanel.Children.Add(MakeCatCheck("Ring", out _cbCatRing));
+                    _categoryPickRowPanel.Children.Add(MakeCatCheck("Rind", out _cbCatRind));
+                    _categoryPickRowPanel.Children.Add(MakeCatCheck("Avoidance", out _cbCatAvoid));
+                    host.Children.Add(_categoryPickRowPanel);
+
+                    // Eval/Opt/Rind are genuinely per-PTV: bulk-apply to every
+                    // row currently in _categoryPickRows (at most 2 here).
+                    _cbCatEval.Checked += (s, e) => { foreach (var r in _categoryPickRows) r.Eval = true; };
+                    _cbCatEval.Unchecked += (s, e) => { foreach (var r in _categoryPickRows) r.Eval = false; };
+                    _cbCatOpt.Checked += (s, e) => { foreach (var r in _categoryPickRows) r.Opt = true; };
+                    _cbCatOpt.Unchecked += (s, e) => { foreach (var r in _categoryPickRows) r.Opt = false; };
+                    _cbCatRind.Checked += (s, e) => { foreach (var r in _categoryPickRows) r.Rind = true; };
+                    _cbCatRind.Unchecked += (s, e) => { foreach (var r in _categoryPickRows) r.Rind = false; };
+
+                    // Ring/Avoidance are plan-wide, not per-PTV; the guard
+                    // avoids re-entering while _categoryRowPropertyChanged is
+                    // itself mirroring a change it just made back onto this
+                    // same checkbox.
+                    _cbCatRing.Checked += (s, e) => { if (!_syncingCategoryPick) foreach (var r in _categoryPickRows) r.Ring = true; };
+                    _cbCatRing.Unchecked += (s, e) => { if (!_syncingCategoryPick) foreach (var r in _categoryPickRows) r.Ring = false; };
+                    _cbCatAvoid.Checked += (s, e) => { if (!_syncingCategoryPick) foreach (var r in _categoryPickRows) r.Avoidance = true; };
+                    _cbCatAvoid.Unchecked += (s, e) => { if (!_syncingCategoryPick) foreach (var r in _categoryPickRows) r.Avoidance = false; };
+
+                    return host;
+                }
+
+                // Rebuilds _categoryPickRows (the "quick category" bulk-tick
+                // control) from the current groupKeys/_vm.AutoStructureRows
+                // state - called by RefreshAutoStructurePreview right after it
+                // rebuilds AutoStructureRows, so this always reflects the same
+                // real per-id selection state, just grouped by PTV/category.
+                // Switches to the per-PTV table once more than 2 PTV groups
+                // are selected; otherwise shows the single bulk row.
+                private void RefreshCategoryPickRows(List<OptKey> groupKeys, string highestDoseStr)
+                {
+                    if (_dgCategoryPick == null || _categoryPickRowPanel == null) return;
+
+                    _categoryHighestDoseStr = highestDoseStr;
+                    _categoryPickRows.Clear();
+
+                    bool AutoIsSelected(string id)
+                    {
+                        var ar = _vm.AutoStructureRows.FirstOrDefault(r => string.Equals(r.Name, id, StringComparison.OrdinalIgnoreCase));
+                        return ar != null && ar.IsSelected;
+                    }
+
+                    bool ringOn = AutoIsSelected("z_Ring_1") && AutoIsSelected("z_Ring_2") &&
+                        (string.IsNullOrEmpty(highestDoseStr) || AutoIsSelected(TruncId($"z_Ring_{highestDoseStr}")));
+                    bool avoidOn = AutoIsSelected("z_Avoidance");
+
+                    foreach (var k in groupKeys)
+                    {
+                        string doseStr = k.DoseGy.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                        string sfxStr = string.IsNullOrWhiteSpace(k.Suffix) ? "" : "_" + k.Suffix;
+                        var row = new CategoryPickRow
+                        {
+                            PtvLabel = doseStr + " Gy" + (string.IsNullOrWhiteSpace(k.Suffix) ? "" : " " + k.Suffix),
+                            DoseGy = k.DoseGy,
+                            Suffix = k.Suffix,
+                            Eval = AutoIsSelected(TruncId($"z_PTV_eval_{doseStr}{sfxStr}")),
+                            Opt = AutoIsSelected(TruncId($"z_PTV_opt_{doseStr}{sfxStr}")),
+                            Rind = AutoIsSelected(TruncId($"z_Rind_{doseStr}{sfxStr}")),
+                            Ring = ringOn,
+                            Avoidance = avoidOn
+                        };
+                        row.PropertyChanged += new PropertyChangedEventHandler(_categoryRowPropertyChanged);
+                        _categoryPickRows.Add(row);
+                    }
+
+                    bool tableMode = groupKeys.Count > 2;
+                    _dgCategoryPick.Visibility = tableMode ? Visibility.Visible : Visibility.Collapsed;
+                    _categoryPickRowPanel.Visibility = tableMode ? Visibility.Collapsed : Visibility.Visible;
+
+                    if (tableMode)
+                    {
+                        _dgCategoryPick.ItemsSource = null;
+                        _dgCategoryPick.ItemsSource = _categoryPickRows;
+                    }
+                    else
+                    {
+                        _syncingCategoryPick = true;
+                        _cbCatEval.IsChecked = groupKeys.Count > 0 && _categoryPickRows.All(r => r.Eval);
+                        _cbCatOpt.IsChecked = groupKeys.Count > 0 && _categoryPickRows.All(r => r.Opt);
+                        _cbCatRind.IsChecked = groupKeys.Count > 0 && _categoryPickRows.All(r => r.Rind);
+                        _cbCatRing.IsChecked = ringOn;
+                        _cbCatAvoid.IsChecked = avoidOn;
+                        _syncingCategoryPick = false;
+                    }
                 }
 
                 // Rebuilds _vm.AutoStructureRows with the real structure ids
@@ -4873,6 +5168,7 @@ namespace VMS.TPS
                         if (_txtAutoStructuresWarning != null) _txtAutoStructuresWarning.Visibility = Visibility.Visible;
                         _dgAutoStructuresLeft.ItemsSource = null;
                         _dgAutoStructuresRight.ItemsSource = null;
+                        RefreshCategoryPickRows(new List<OptKey>(), null);
                         return;
                     }
                     if (_txtAutoStructuresWarning != null) _txtAutoStructuresWarning.Visibility = Visibility.Collapsed;
@@ -4926,6 +5222,8 @@ namespace VMS.TPS
                     _dgAutoStructuresLeft.ItemsSource = _vm.AutoStructureRows.Take(half).ToList();
                     _dgAutoStructuresRight.ItemsSource = null;
                     _dgAutoStructuresRight.ItemsSource = _vm.AutoStructureRows.Skip(half).ToList();
+
+                    RefreshCategoryPickRows(groupKeys, highestDoseStr);
                 }
 
                 // RCC-only: the read-only "Crop Distance Matrix" (one row per OAR
