@@ -509,6 +509,23 @@
 //                   since Step7 could only use whatever it found in _zEval.
 //                   With Eval always computed now, this crop is applied
 //                   correctly regardless of which structures are ticked.
+//   v5.12.0.0 – Two usability fixes:
+//                 - Targets table: ticking a PTV no longer auto-fills its
+//                   Suffix from the structure name (GuessSuffixFromName and
+//                   both call sites - the per-row tick and the "Use" header
+//                   bulk-tick - removed). Suffix is left exactly as typed;
+//                   dose is still auto-guessed from the structure name at
+//                   row creation as before, that's unrelated and unchanged.
+//                 - Auto Structures table: per-OAR Ovl/Opt/PRV rows now
+//                   default to TICKED the first time they appear, instead of
+//                   unticked like the PTV-derived rows - ticking Ovl/Opt/PRV
+//                   for an organ in the Organs grid is already the
+//                   deliberate opt-in, so the matching row shouldn't need a
+//                   second tick in the Auto Structures table. AddRow() takes
+//                   a new defaultSelected argument for this; it only applies
+//                   the first time an id appears - once a row exists, its
+//                   own tick state (including a manual untick) always wins
+//                   on later refreshes.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -533,8 +550,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.11.0.0")]
-[assembly: AssemblyFileVersion("5.11.0.0")]
+[assembly: AssemblyVersion("5.12.0.0")]
+[assembly: AssemblyFileVersion("5.12.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -3762,7 +3779,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.11.0.0";
+                Title = "Generic Crop Structure Generator - v5.12.0.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
@@ -3954,15 +3971,6 @@ namespace VMS.TPS
                 return null;
             }
 
-            public static string GuessSuffixFromName(string id)
-            {
-                if (string.IsNullOrEmpty(id)) return "";
-                string s = Regex.Replace(id, @"^(PTV|CTV|GTV|LN|ITV)", "", RegexOptions.IgnoreCase);
-                s = Regex.Replace(s, @"(?<!\d)(\d{2,4}(\.\d{1,3})?)(?!\d)", "");
-                s = Regex.Replace(s, @"[\s\-_]+", "_");
-                return s.Trim('_');
-            }
-
             private static bool IsSafeIdFragment(string s)
             {
                 if (string.IsNullOrWhiteSpace(s)) return false;
@@ -4052,13 +4060,6 @@ namespace VMS.TPS
 
                         if (e.PropertyName == nameof(TargetDoseRow.IsSelected))
                         {
-                            var targetRow = s as TargetDoseRow;
-                            if (targetRow != null && targetRow.IsSelected &&
-                                string.IsNullOrWhiteSpace(targetRow.Suffix))
-                            {
-                                targetRow.Suffix = GuessSuffixFromName(targetRow.TargetId);
-                            }
-
                             if (_inCropMode)
                                 BuildCropGrid(_vm.TargetDoseRows.Where(r => r.IsSelected).ToList());
                         }
@@ -4351,12 +4352,7 @@ namespace VMS.TPS
                     _dgTargets.Columns.Add(_owner.MakeSingleClickCheckColumn(
                         _owner.MakeHeaderCheckbox("Use", isChecked =>
                         {
-                            foreach (var r in _vm.TargetDoseRows)
-                            {
-                                r.IsSelected = isChecked;
-                                if (isChecked && string.IsNullOrWhiteSpace(r.Suffix))
-                                    r.Suffix = GuessSuffixFromName(r.TargetId);
-                            }
+                            foreach (var r in _vm.TargetDoseRows) r.IsSelected = isChecked;
                             _dgTargets.Items.Refresh();
                             if (IsRcc) RefreshRccPlan(); else UpdateStructureCount();
                         }),
@@ -4554,9 +4550,12 @@ namespace VMS.TPS
                 // ticked targets/organs - PTV_Eval/Opt/Rind per dose group,
                 // the global Opt_Sum, all 3 rings, Avoidance, and per-OAR
                 // Ovl/Opt/PRV for whichever organs are ticked. Each id's prior
-                // IsSelected state is preserved across refreshes; new ids
-                // (never seen before) default to unticked, so opting in is
-                // always a deliberate action rather than something to undo.
+                // IsSelected state is preserved across refreshes. New PTV-
+                // derived rows default to unticked (opting in is deliberate);
+                // new per-OAR Ovl/Opt/PRV rows default to TICKED instead,
+                // since ticking Ovl/Opt/PRV for that organ in the Organs grid
+                // is already the deliberate opt-in - see AddRow's
+                // defaultSelected argument below.
                 private void RefreshAutoStructurePreview()
                 {
                     if (_dgAutoStructuresLeft == null || _dgAutoStructuresRight == null) return;
@@ -4570,12 +4569,16 @@ namespace VMS.TPS
                         .ToDictionary(r => r.Name, r => r.IsSelected, StringComparer.OrdinalIgnoreCase);
                     _vm.AutoStructureRows.Clear();
 
-                    void AddRow(string id)
+                    // defaultSelected only applies the first time an id ever
+                    // shows up (nothing to preserve from prevSelection yet);
+                    // once a row exists its own tick state always wins, so a
+                    // user un-ticking one manually is never overridden here.
+                    void AddRow(string id, bool defaultSelected = false)
                     {
                         if (string.IsNullOrEmpty(id)) return;
                         if (_vm.AutoStructureRows.Any(r => string.Equals(r.Name, id, StringComparison.OrdinalIgnoreCase)))
                             return;
-                        bool selected = prevSelection.TryGetValue(id, out var prev) && prev;
+                        bool selected = prevSelection.TryGetValue(id, out var prev) ? prev : defaultSelected;
                         _vm.AutoStructureRows.Add(new AutoStructureRow { Name = id, IsSelected = selected });
                     }
 
@@ -4623,14 +4626,18 @@ namespace VMS.TPS
 
                     AddRow("z_Avoidance");
 
+                    // Organ rows default to selected (unlike PTV-derived rows
+                    // above): ticking Ovl/Opt/PRV for an organ in the Organs
+                    // grid is already a deliberate opt-in, so the matching
+                    // Auto Structures row shouldn't require a second tick here.
                     var doseLevels = groupKeys.Select(k => k.DoseGy).Distinct().ToList();
                     foreach (var oar in _vm.OrganRows.Where(o => o.CreateOvl))
                         foreach (var d in doseLevels)
-                            AddRow(BuildId("z_", oar.OarId, $"_Ovl_{d.ToString(System.Globalization.CultureInfo.InvariantCulture)}"));
+                            AddRow(BuildId("z_", oar.OarId, $"_Ovl_{d.ToString(System.Globalization.CultureInfo.InvariantCulture)}"), true);
                     foreach (var oar in _vm.OrganRows.Where(o => o.CreateOpt))
-                        AddRow(BuildId("z_", oar.OarId, "_Opt"));
+                        AddRow(BuildId("z_", oar.OarId, "_Opt"), true);
                     foreach (var oar in _vm.OrganRows.Where(o => o.CreatePrv && o.ParsedPrvMarginMm.GetValueOrDefault() > 0))
-                        AddRow(BuildId("PRV_", oar.OarId));
+                        AddRow(BuildId("PRV_", oar.OarId), true);
 
                     int half = (_vm.AutoStructureRows.Count + 1) / 2;
                     _dgAutoStructuresLeft.ItemsSource = null;
