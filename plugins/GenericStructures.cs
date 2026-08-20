@@ -604,6 +604,22 @@
 //                   The "Create Nested Structures" action now reuses the same
 //                   bottom-bar button as Crop mode (content/handler swap by
 //                   mode) instead of a separate button.
+//   v5.14.1.0 – Fixed a crash ("Accessing disposed TPS.NET DataObject of
+//               type 'Structure'", terminating Eclipse entirely) when
+//               clicking Create Nested Structures. DoNestedCreate's shell
+//               loop was piling outerSt/innerSt/ringSt into the SAME
+//               TempGuard for the whole loop (up to RCC_NESTED_MAX_LEVELS =
+//               30 levels), so up to ~90 CONTROL scratch structures could be
+//               alive at once before any got cleaned up - on a plan whose
+//               structure set is already sizeable, that can push the total
+//               past Eclipse's 255-structure cap mid-loop, which is the most
+//               likely trigger for this native crash (a C# try/catch can't
+//               catch it - it terminates the whole app, not just the
+//               script). Each level's 3 scratch structures now live in
+//               their own per-level TempGuard, disposed at the end of that
+//               level, so at most ~4-5 temp structures (plus whichever
+//               kept z_[organ]_[dose]_[level] pieces have already been
+//               committed) exist simultaneously instead of ~90.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -629,8 +645,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.14.0.0")]
-[assembly: AssemblyFileVersion("5.14.0.0")]
+[assembly: AssemblyVersion("5.14.1.0")]
+[assembly: AssemblyFileVersion("5.14.1.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -3885,7 +3901,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.14.0.0";
+                Title = "Generic Crop Structure Generator - v5.14.1.0";
                 Width = 1250;
                 Height = 800;
                 MinWidth = 1000;
@@ -5817,21 +5833,45 @@ namespace VMS.TPS
                                 {
                                     var croppedSt = tg.Add(CreateTempFromSegment(_ss, croppedSeg, "zNestCropPtv"));
 
+                                    // Each level's scratch (outerSt/innerSt/ringSt) uses
+                                    // its OWN TempGuard, disposed at the end of that
+                                    // level, instead of piling all of them into the
+                                    // outer `tg` for the whole loop - up to 30 levels x
+                                    // 3 temps each would otherwise leave up to ~90 CONTROL
+                                    // structures alive simultaneously, which on a plan
+                                    // that already has a sizeable structure count can
+                                    // push the whole set over Eclipse's 255-structure
+                                    // cap mid-loop. That appears to be what was crashing
+                                    // Eclipse outright (disposed-object native error)
+                                    // instead of failing safely.
                                     for (int level = 1; level <= RCC_NESTED_MAX_LEVELS; level++)
                                     {
-                                        var outerSeg = SafeMargin(croppedSt.SegmentVolume, thickness * level);
-                                        var innerSeg = SafeMargin(croppedSt.SegmentVolume, thickness * (level - 1));
-                                        var outerSt = tg.Add(CreateTempFromSegment(_ss, outerSeg, "zNestOuter"));
-                                        var innerSt = tg.Add(CreateTempFromSegment(_ss, innerSeg, "zNestInner"));
+                                        bool levelOk;
+                                        SegmentVolume pieceSeg = null;
+                                        using (var levelTg = new TempGuard(_ss))
+                                        {
+                                            var outerSeg = SafeMargin(croppedSt.SegmentVolume, thickness * level);
+                                            var innerSeg = SafeMargin(croppedSt.SegmentVolume, thickness * (level - 1));
+                                            var outerSt = levelTg.Add(CreateTempFromSegment(_ss, outerSeg, "zNestOuter"));
+                                            var innerSt = levelTg.Add(CreateTempFromSegment(_ss, innerSeg, "zNestInner"));
 
-                                        var ringSeg = SafeBoolean(_ss, outerSeg, innerSeg, BoolOp.Sub,
-                                            outerSt, innerSt, null, fb, $"Nested_Ring{level}", tg);
-                                        if (ringSeg == null) { stopReason = $"level {level}: shell is empty"; break; }
-
-                                        var ringSt = tg.Add(CreateTempFromSegment(_ss, ringSeg, "zNestRing"));
-                                        var pieceSeg = SafeBoolean(_ss, ringSeg, oarSt.SegmentVolume, BoolOp.And,
-                                            ringSt, oarSt, null, fb, $"Nested_Piece{level}", tg);
-                                        if (pieceSeg == null) { stopReason = $"level {level}: shell no longer overlaps the organ"; break; }
+                                            var ringSeg = SafeBoolean(_ss, outerSeg, innerSeg, BoolOp.Sub,
+                                                outerSt, innerSt, null, fb, $"Nested_Ring{level}", levelTg);
+                                            if (ringSeg == null)
+                                            {
+                                                stopReason = $"level {level}: shell is empty";
+                                                levelOk = false;
+                                            }
+                                            else
+                                            {
+                                                var ringSt = levelTg.Add(CreateTempFromSegment(_ss, ringSeg, "zNestRing"));
+                                                pieceSeg = SafeBoolean(_ss, ringSeg, oarSt.SegmentVolume, BoolOp.And,
+                                                    ringSt, oarSt, null, fb, $"Nested_Piece{level}", levelTg);
+                                                levelOk = pieceSeg != null;
+                                                if (!levelOk) stopReason = $"level {level}: shell no longer overlaps the organ";
+                                            }
+                                        }
+                                        if (!levelOk) break;
 
                                         string pieceId = BuildId("z_", oar.OarId,
                                             $"_{oar.NestedPtvOption.DoseGy.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)}_{level}");
