@@ -767,6 +767,23 @@
 //               ShowDialog). Falls back to plain white/black/gray if the
 //               XAML parse ever fails. Only the content area is themed -
 //               the native tool-window title bar chrome is unchanged.
+//   v5.20.0.0 – Breast Opto, Physical Bolus mode only: added z_Ring_1 /
+//               z_Ring_2 falloff rings around z_Virtual_PTV (new Step 6 in
+//               Step5_VirtualBolus's physical-bolus branch). z_Ring_1 =
+//               (z_Virtual_PTV +14mm) Sub (z_Virtual_PTV +4mm) - a 4mm gap,
+//               VB_RING_THICKNESS_MM (1cm) thick; z_Ring_2 = (z_Virtual_PTV
+//               +24mm) Sub (z_Virtual_PTV +14mm) - starts exactly where
+//               Ring 1 ends (14mm gap), same 1cm thickness. Both cropped
+//               to remove whatever part extends outside Body_new, capped
+//               2mm inward via SafeMargin(Body_new, -VB_SKIN_CROP_MM),
+//               reusing the same skin-trim constant already used for
+//               z_Virtual_Bolus. New VB_RING_GAP_MM (4.0) and
+//               VB_RING_THICKNESS_MM (10.0) constants. Uses the SAME
+//               z_Ring_1/z_Ring_2 ids Generic and RCC already use (a
+//               deliberate choice, not a naming bug) - running more than
+//               one of Generic/RCC/Breast-Opto-physical-bolus on the same
+//               structure set will overwrite whichever ring pair ran
+//               first. Skipped entirely if Body_new couldn't be built.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -792,8 +809,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.19.2.0")]
-[assembly: AssemblyFileVersion("5.19.2.0")]
+[assembly: AssemblyVersion("5.20.0.0")]
+[assembly: AssemblyFileVersion("5.20.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -824,6 +841,8 @@ namespace VMS.TPS
         private const double VB_OPT_INWARD_MM = 5.0;  // expansion magnitude for Virtual_PTV_Opt (no physical bolus)
         private const double VB_PHYS_OPT_EXPAND_MM = 4.0;  // ant+lat expansion of z_PTV_opt for z_Virtual_PTV_Opt (physical bolus mode)
         private const double VB_PHYS_BOLUS_OPT_MARGIN_MM = 4.0;  // isotropic (all-direction) margin around Bolus_phys_Opt used as an in-memory crop boundary for z_Virtual_PTV_Opt (physical bolus mode)
+        private const double VB_RING_GAP_MM = 4.0;  // gap from z_Virtual_PTV to z_Ring_1's inner boundary (physical bolus mode); z_Ring_2's inner boundary is this + VB_RING_THICKNESS_MM
+        private const double VB_RING_THICKNESS_MM = 10.0;  // thickness (1cm) of both z_Ring_1 and z_Ring_2 (physical bolus mode)
 
         private static readonly double[] PhysicalBolusThicknessOptionsMm = { 5.0, 10.0, 15.0, 20.0 };
 
@@ -2241,6 +2260,81 @@ namespace VMS.TPS
                         {
                             _ss.RemoveStructure(zVPtvOptPhys);
                             _progress.AppendLine("  SKIP: z_Virtual_PTV_Opt (empty)");
+                        }
+
+                        // ========================================================
+                        // STEP 6 (physical bolus mode only): z_Ring_1 / z_Ring_2
+                        // falloff rings around z_Virtual_PTV (the "extended"
+                        // virtual PTV, not the plain z_PTV_opt_sum).
+                        //   z_Ring_1 = (z_Virtual_PTV +14mm) Sub (z_Virtual_PTV +4mm)
+                        //              -> 4mm gap, VB_RING_THICKNESS_MM (1cm) thick.
+                        //   z_Ring_2 = (z_Virtual_PTV +24mm) Sub (z_Virtual_PTV +14mm)
+                        //              -> starts exactly where Ring 1 ends (14mm
+                        //              gap), same 1cm thickness.
+                        // Both cropped to remove whatever part extends outside
+                        // Body_new, capped 2mm inward (SafeMargin(Body_new,
+                        // -VB_SKIN_CROP_MM)) - the same skin-trim convention
+                        // already used for z_Virtual_Bolus above.
+                        // ========================================================
+                        if (bodyNew == null)
+                        {
+                            _progress.AppendLine("  SKIP: z_Ring_1/z_Ring_2 (Body_new not available)");
+                        }
+                        else
+                        {
+                            double ring1InnerMm = VB_RING_GAP_MM;
+                            double ring1OuterMm = VB_RING_GAP_MM + VB_RING_THICKNESS_MM;
+                            double ring2InnerMm = ring1OuterMm;
+                            double ring2OuterMm = ring1OuterMm + VB_RING_THICKNESS_MM;
+
+                            var bodyCapSeg = SafeMargin(bodyNew.SegmentVolume, -VB_SKIN_CROP_MM);
+                            var bodyCapSt = tg.Add(_ss.AddStructure("CONTROL", MakeUniqueId(_ss, "zVB_RingCapBody")));
+                            if (bodyNew.IsHighResolution && !bodyCapSt.IsHighResolution)
+                                bodyCapSt.ConvertToHighResolution();
+                            AssignSegmentSafely(bodyCapSt, bodyCapSeg);
+
+                            void BuildVirtualBolusRing(double innerMm, double outerMm, string ringId)
+                            {
+                                var innerSeg = SafeMargin(zVirtualPtv.SegmentVolume, innerMm);
+                                var outerSeg = SafeMargin(zVirtualPtv.SegmentVolume, outerMm);
+                                var innerSt = tg.Add(_ss.AddStructure("CONTROL", MakeUniqueId(_ss, "zVB_RingInner")));
+                                var outerSt = tg.Add(_ss.AddStructure("CONTROL", MakeUniqueId(_ss, "zVB_RingOuter")));
+                                if (zVirtualPtv.IsHighResolution && !innerSt.IsHighResolution) innerSt.ConvertToHighResolution();
+                                if (zVirtualPtv.IsHighResolution && !outerSt.IsHighResolution) outerSt.ConvertToHighResolution();
+                                AssignSegmentSafely(innerSt, innerSeg);
+                                AssignSegmentSafely(outerSt, outerSeg);
+
+                                var ringSeg = SafeBoolean(_ss, outerSeg, innerSeg, BoolOp.Sub,
+                                    outerSt, innerSt, ringId, _fb, $"VBRing_{ringId}_OuterMinusInner", tg);
+                                if (ringSeg == null)
+                                {
+                                    _progress.AppendLine($"  SKIP: {ringId} (empty before Body_new crop)");
+                                    return;
+                                }
+
+                                ringSeg = SafeBoolean(_ss, ringSeg, bodyCapSeg, BoolOp.And,
+                                    null, bodyCapSt, ringId, _fb, $"VBRing_{ringId}_CapBodyNewMinus2", tg);
+                                if (ringSeg == null)
+                                {
+                                    _progress.AppendLine($"  SKIP: {ringId} (empty after Body_new crop)");
+                                    return;
+                                }
+
+                                var ringSt = GetOrCreate(_ss, "CONTROL", ringId);
+                                if (AssignSegmentSafely(ringSt, ringSeg))
+                                {
+                                    ringSt.Color = Colors.Magenta;
+                                    LogCreated(ringId);
+                                }
+                                else
+                                {
+                                    _ss.RemoveStructure(ringSt);
+                                    _progress.AppendLine($"  SKIP: {ringId} (empty)");
+                                }
+                            }
+
+                            BuildVirtualBolusRing(ring1InnerMm, ring1OuterMm, "z_Ring_1");
+                            BuildVirtualBolusRing(ring2InnerMm, ring2OuterMm, "z_Ring_2");
                         }
 
                         return bodyNew;
@@ -4136,7 +4230,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.19.2.0";
+                Title = "Generic Crop Structure Generator - v5.20.0.0";
                 Width = 1250;
                 Height = 960;
                 MinWidth = 1000;
