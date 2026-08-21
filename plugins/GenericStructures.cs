@@ -955,6 +955,22 @@
 //               both tabs (previously 11 for Generic/10 for Breast Opto -
 //               Generic replaces Step5 in the count with Step10's Rind,
 //               so the RunStep() call count still matches on both paths).
+//   v5.29.0.0 – Fixed the Targets grid's "Use" header checkbox ("select
+//               all") silently ticking rows hidden by the "PTV only"
+//               filter (the default - GTV/CTV/LN rows are hidden until
+//               the filter dropdown is switched to "All"). Its click
+//               handler looped over _vm.TargetDoseRows, the full
+//               underlying list, instead of the DataGrid's own (filtered)
+//               Items - so clicking "select all" while GTV/CTV/LN rows
+//               were hidden still set IsSelected=true on them, and they'd
+//               later fail CommitSelections()'s Dose (Gy) validation on
+//               Generate without ever having been visibly ticked, which
+//               is what the "Missing dose for CTV_HR/GTVn/..." report
+//               turned out to be - not a validation regression, a
+//               select-all-ignores-the-filter bug. Now loops over
+//               _dgTargets.Items.Cast<TargetDoseRow>() instead, which
+//               respects ApplyTargetFilter()'s active Filter, so "select
+//               all" only affects what's actually visible.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -980,8 +996,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.28.0.0")]
-[assembly: AssemblyFileVersion("5.28.0.0")]
+[assembly: AssemblyVersion("5.29.0.0")]
+[assembly: AssemblyFileVersion("5.29.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -4666,7 +4682,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.28.0.0";
+                Title = "Generic Crop Structure Generator - v5.29.0.0";
                 Width = 1250;
                 Height = 960;
                 MinWidth = 1000;
@@ -5344,7 +5360,18 @@ namespace VMS.TPS
                     _dgTargets.Columns.Add(_owner.MakeSingleClickCheckColumn(
                         _owner.MakeHeaderCheckbox("Use", isChecked =>
                         {
-                            foreach (var r in _vm.TargetDoseRows) r.IsSelected = isChecked;
+                            // Only toggle rows the "PTV only"/"All" filter
+                            // (ApplyTargetFilter) is currently showing -
+                            // _dgTargets.Items respects that active Filter,
+                            // unlike _vm.TargetDoseRows (the full underlying
+                            // list). Previously this used _vm.TargetDoseRows
+                            // directly, so clicking "select all" while
+                            // GTV/CTV/LN rows were hidden under the "PTV
+                            // only" default silently ticked them too - they
+                            // then failed the Dose (Gy) validation on
+                            // Generate without ever being visibly selected.
+                            foreach (var r in _dgTargets.Items.Cast<TargetDoseRow>().ToList())
+                                r.IsSelected = isChecked;
                             _dgTargets.Items.Refresh();
                             if (IsRcc) RefreshRccPlan(); else UpdateStructureCount();
                         }),
