@@ -869,6 +869,23 @@
 //               Close()) so the caller's own pre-existing finally-block
 //               Close() can't throw on an already-self-closed window; all
 //               5 call sites updated from Close() to SafeClose().
+//   v5.25.0.0 – ProgressWindow pulse: (1) confirmed/kept the heartbeat +
+//               ECG Storyboards' own timing (0.9s heartbeat, 2.2s ECG
+//               sweep, both RepeatBehavior="Forever") completely
+//               independent of percent - Report() never touches the
+//               Storyboards, only text/color, so the loop plays at a
+//               constant natural rate regardless of generation progress;
+//               (2) ECG Stroke + glow color is now live-updated on every
+//               Report() call via new LerpEcgColor()/LerpColor(), sweeping
+//               yellow (0%) -> blue (50%, the theme's own AccentCyan) ->
+//               green (100%, matching DoneXaml's #2ECC71 exactly so the
+//               swap to the static done state at completion is seamless).
+//               Heart glyph stays red throughout, unaffected by percent.
+//               New x:Name="EcgGlow" on the ECG Path's DropShadowEffect
+//               plus FindName lookups for both EcgPath/EcgGlow after
+//               parsing PulseXaml (WPF's XamlReader.Parse registers a
+//               NameScope on the root automatically, same mechanism
+//               ThemeXaml's FindResource already relies on).
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -894,8 +911,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.24.0.0")]
-[assembly: AssemblyFileVersion("5.24.0.0")]
+[assembly: AssemblyVersion("5.25.0.0")]
+[assembly: AssemblyFileVersion("5.25.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -1081,16 +1098,22 @@ namespace VMS.TPS
             // the @keyframes heartbeat timings/values exactly (0%/12%/24%/
             // 36%/48%/100% of a 0.9s cycle -> 1.0/1.28/1.0/1.16/1.0/1.0), and
             // the ECG Path's StrokeDashOffset animates from its dash length
-            // down to 0 over 2.2s linear, both looping forever until
-            // ShowCompleted() swaps this out for the static DoneXaml below.
-            // The path/heart are sized down ~30% from the original design
-            // (FontSize 40->28, path scaled from an original 380x50 area to
-            // 266x25 - the ECG's own height, 25, works out ~10% shorter than
-            // the heart's new 28), and StrokeDashArray/Offset (188, in
+            // down to 0 over 2.2s linear, both looping forever at a fixed
+            // rate - Report() only ever touches color/text, never the
+            // Storyboards, so the loop's own timing is completely
+            // independent of percent - until ShowCompleted() swaps this out
+            // for the static DoneXaml below at 100%. The path/heart are
+            // sized down ~30% from the original design (FontSize 40->28,
+            // path scaled from an original 380x50 area to 266x25 - the
+            // ECG's own height, 25, works out ~10% shorter than the heart's
+            // new 28), and StrokeDashArray/Offset (188, in
             // StrokeThickness(2.5)-relative units) is re-derived for this
             // smaller path's shorter length. Both glow via DropShadowEffect,
-            // matching the CSS drop-shadow filters - now in red (heart fill)
-            // to match the requested heart color.
+            // matching the CSS drop-shadow filters - the heart stays red
+            // throughout, while the ECG's Stroke/glow Color is repainted on
+            // every Report() call by LerpEcgColor(), sweeping from yellow
+            // (0%) through blue (50%) to green (100%), landing exactly on
+            // the DoneXaml green so the swap at completion is seamless.
             private const string PulseXaml = @"
 <Grid xmlns=""http://schemas.microsoft.com/winfx/2006/xaml/presentation""
       xmlns:x=""http://schemas.microsoft.com/winfx/2006/xaml""
@@ -1128,12 +1151,12 @@ namespace VMS.TPS
         </EventTrigger>
     </Grid.Triggers>
 
-    <Path x:Name=""EcgPath"" Stroke=""#00E5FF"" StrokeThickness=""2.5""
+    <Path x:Name=""EcgPath"" Stroke=""#FFD400"" StrokeThickness=""2.5""
           StrokeStartLineCap=""Round"" StrokeEndLineCap=""Round"" StrokeLineJoin=""Round""
           StrokeDashArray=""188 188"" VerticalAlignment=""Center"" Margin=""40,0,0,0""
           Data=""M0,15 L14,15 L20,8 L25,15 L29,25 L34,0 L38,20 L42,15 L77,15 L91,15 L97,8 L102,15 L106,25 L111,0 L115,20 L119,15 L154,15 L168,15 L174,8 L179,15 L183,25 L188,0 L192,20 L196,15 L266,15"">
         <Path.Effect>
-            <DropShadowEffect Color=""#00E5FF"" BlurRadius=""10"" ShadowDepth=""0"" Opacity=""0.9"" />
+            <DropShadowEffect x:Name=""EcgGlow"" Color=""#FFD400"" BlurRadius=""10"" ShadowDepth=""0"" Opacity=""0.9"" />
         </Path.Effect>
     </Path>
 
@@ -1173,9 +1196,19 @@ namespace VMS.TPS
     </TextBlock>
 </Grid>";
 
+            // ECG color sweep stops: yellow (0%) -> blue (50%, matches the
+            // theme's own AccentCyan) -> green (100%, matches DoneXaml's
+            // #2ECC71 exactly so the swap to the static done state is
+            // seamless).
+            private static readonly Color EcgColorStart = (Color)ColorConverter.ConvertFromString("#FFD400");
+            private static readonly Color EcgColorMid = (Color)ColorConverter.ConvertFromString("#00E5FF");
+            private static readonly Color EcgColorEnd = (Color)ColorConverter.ConvertFromString("#2ECC71");
+
             private readonly TextBlock _status;
             private UIElement _pulseHost;
             private UIElement _doneHost;
+            private System.Windows.Shapes.Path _ecgPath;
+            private System.Windows.Media.Effects.DropShadowEffect _ecgGlow;
             private bool _completed;
 
             public ProgressWindow(Window owner, string title)
@@ -1230,6 +1263,9 @@ namespace VMS.TPS
                 {
                     _pulseHost = (UIElement)XamlReader.Parse(PulseXaml);
                     panel.Children.Add(_pulseHost);
+                    var fe = _pulseHost as FrameworkElement;
+                    _ecgPath = fe?.FindName("EcgPath") as System.Windows.Shapes.Path;
+                    _ecgGlow = fe?.FindName("EcgGlow") as System.Windows.Media.Effects.DropShadowEffect;
                 }
                 catch { /* no animation if the XAML parse ever fails - status text alone still works */ }
 
@@ -1248,6 +1284,11 @@ namespace VMS.TPS
             {
                 int pct = Math.Max(0, Math.Min(100, percent));
                 if (!string.IsNullOrEmpty(status)) _status.Text = $"{status}  ({pct}%)";
+
+                var ecgColor = LerpEcgColor(pct);
+                if (_ecgPath != null) _ecgPath.Stroke = new SolidColorBrush(ecgColor);
+                if (_ecgGlow != null) _ecgGlow.Color = ecgColor;
+
                 Dispatcher.Invoke(() => { }, System.Windows.Threading.DispatcherPriority.Background);
 
                 if (pct >= 100 && !_completed)
@@ -1255,6 +1296,28 @@ namespace VMS.TPS
                     _completed = true;
                     ShowCompleted();
                 }
+            }
+
+            // Two-segment gradient driven purely by percent - the loop's own
+            // timing (Storyboards above) never changes: 0-50% sweeps yellow
+            // -> blue, 50-100% sweeps blue -> green, landing on the exact
+            // DoneXaml green at 100%.
+            private static Color LerpEcgColor(int pct)
+            {
+                double frac = pct / 100.0;
+                return frac <= 0.5
+                    ? LerpColor(EcgColorStart, EcgColorMid, frac / 0.5)
+                    : LerpColor(EcgColorMid, EcgColorEnd, (frac - 0.5) / 0.5);
+            }
+
+            private static Color LerpColor(Color a, Color b, double t)
+            {
+                t = Math.Max(0.0, Math.Min(1.0, t));
+                return Color.FromArgb(
+                    (byte)(a.A + (b.A - a.A) * t),
+                    (byte)(a.R + (b.R - a.R) * t),
+                    (byte)(a.G + (b.G - a.G) * t),
+                    (byte)(a.B + (b.B - a.B) * t));
             }
 
             // Swaps the looping cyan/red pulse for the static green "done"
@@ -4585,7 +4648,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.24.0.0";
+                Title = "Generic Crop Structure Generator - v5.25.0.0";
                 Width = 1250;
                 Height = 960;
                 MinWidth = 1000;
