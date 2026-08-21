@@ -813,6 +813,29 @@
 //               is no longer capped back to ext afterward -
 //               zAvoidance_{dose} = Body_new Sub (union +32mm), kept as-is.
 //               Rings are unaffected by this change.
+//   v5.22.0.0 – ProgressWindow: replaced the flat percent bar with an
+//               animated "vitals monitor" pulse (heartbeat icon + ECG
+//               trace), translating a CSS/SVG @keyframes reference the
+//               user supplied into WPF (this is a desktop window, not a
+//               browser - no extra library needed either, since
+//               Storyboard/DoubleAnimationUsingKeyFrames/DropShadowEffect
+//               are all built into WPF). New PulseXaml constant (inline
+//               XAML parsed via XamlReader.Parse, same technique as
+//               ThemeXaml): a heart glyph's ScaleTransform animates
+//               through the same keyframe timings/values as the CSS
+//               (0%/12%/24%/36%/48%/100% of 0.9s -> 1.0/1.28/1.0/1.16/
+//               1.0/1.0), and an ECG-shaped Path's StrokeDashOffset
+//               animates its dash length down to 0 over 2.2s linear -
+//               both looping forever via an EventTrigger on
+//               FrameworkElement.Loaded, so no C#-side timer/wiring is
+//               needed. Both glow via DropShadowEffect in AccentCyan,
+//               matching the CSS's drop-shadow filters. Removed the old
+//               ProgressBar Style from ThemeXaml (no longer used). Percent
+//               is now folded into Report()'s status text (e.g. "Building
+//               PTV_Eval...  (42%)") instead of a separate bar - the pulse
+//               itself runs continuously and independently of percent,
+//               like a real vitals monitor signalling "still working"
+//               rather than literal progress.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -838,8 +861,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.21.1.0")]
-[assembly: AssemblyFileVersion("5.21.1.0")]
+[assembly: AssemblyVersion("5.22.0.0")]
+[assembly: AssemblyFileVersion("5.22.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -972,7 +995,7 @@ namespace VMS.TPS
         // Report() instead pumps the dispatcher at Background priority
         // after each update, forcing the pending layout/render pass to
         // actually happen before the caller resumes its synchronous work,
-        // so the bar/text visibly move instead of only flashing once at
+        // so the text visibly moves instead of only flashing once at
         // the very end.
         //
         // Styled to match OptimisationStructureWindow's dark theme
@@ -983,6 +1006,24 @@ namespace VMS.TPS
         // StructureProcessor.Run(), which runs post-ShowDialog). Only the
         // content area is themed; the native tool-window title bar chrome
         // is left as-is.
+        //
+        // The flat percent bar was replaced with an animated "vitals
+        // monitor" pulse (heartbeat icon + ECG trace), matching a CSS/SVG
+        // reference the user supplied - this is a WPF desktop window, not
+        // a browser, so CSS @keyframes/SVG stroke-dashoffset don't apply
+        // directly; no extra library is needed for the WPF equivalent
+        // either, since Storyboard/DoubleAnimationUsingKeyFrames/
+        // DropShadowEffect are all built into WPF (PresentationCore/
+        // PresentationFramework, already referenced by this whole window).
+        // The animation is defined as inline XAML (PulseXaml below) parsed
+        // via XamlReader.Parse, same technique already used for ThemeXaml -
+        // its own EventTrigger on FrameworkElement.Loaded starts both
+        // Storyboards (RepeatBehavior="Forever") the moment it's added to
+        // the visual tree, so it needs no C#-side wiring at all. Like a
+        // real vitals monitor, it animates continuously and independently
+        // of Report()'s percent value - it signals "still working", not
+        // literal progress; percent is now folded into the status text
+        // instead of a separate bar.
         private sealed class ProgressWindow : Window
         {
             private const string ThemeXaml = @"
@@ -994,34 +1035,79 @@ namespace VMS.TPS
     <SolidColorBrush x:Key=""TextSecondary"" Color=""#8B94A5"" />
     <SolidColorBrush x:Key=""AccentCyan""    Color=""#00E5FF"" />
     <SolidColorBrush x:Key=""BorderBrush""   Color=""#2E3440"" />
-
-    <Style TargetType=""ProgressBar"">
-        <Setter Property=""Background"" Value=""{StaticResource PanelBrush}"" />
-        <Setter Property=""Foreground"" Value=""{StaticResource AccentCyan}"" />
-        <Setter Property=""BorderBrush"" Value=""{StaticResource BorderBrush}"" />
-        <Setter Property=""BorderThickness"" Value=""1"" />
-        <Setter Property=""Template"">
-            <Setter.Value>
-                <ControlTemplate TargetType=""ProgressBar"">
-                    <Border Background=""{TemplateBinding Background}""
-                            BorderBrush=""{TemplateBinding BorderBrush}""
-                            BorderThickness=""{TemplateBinding BorderThickness}""
-                            CornerRadius=""4"">
-                        <Grid ClipToBounds=""True"" Margin=""1"">
-                            <Rectangle x:Name=""PART_Track"" Fill=""Transparent"" />
-                            <Rectangle x:Name=""PART_Indicator""
-                                       Fill=""{TemplateBinding Foreground}""
-                                       HorizontalAlignment=""Left""
-                                       RadiusX=""3"" RadiusY=""3"" />
-                        </Grid>
-                    </Border>
-                </ControlTemplate>
-            </Setter.Value>
-        </Setter>
-    </Style>
 </ResourceDictionary>";
 
-            private readonly ProgressBar _bar;
+            // Heartbeat + ECG "vitals monitor" pulse - WPF translation of the
+            // user-supplied CSS: the heart's ScaleTransform keyframes match
+            // the @keyframes heartbeat timings/values exactly (0%/12%/24%/
+            // 36%/48%/100% of a 0.9s cycle -> 1.0/1.28/1.0/1.16/1.0/1.0), and
+            // the ECG Path's StrokeDashOffset animates from its dash length
+            // down to 0 over 2.2s linear, both looping forever - the same
+            // shape as @keyframes pulse-line's stroke-dashoffset 480->0 (CSS
+            // dasharray units are absolute; WPF's are multiples of
+            // StrokeThickness, so 480/StrokeThickness(2.5) = 192 here for an
+            // equivalent visual scale against this path's own ~732-unit
+            // length). Both glow via DropShadowEffect, matching the CSS
+            // drop-shadow filters using the same AccentCyan the window's own
+            // theme already uses in place of --accent-color.
+            private const string PulseXaml = @"
+<Grid xmlns=""http://schemas.microsoft.com/winfx/2006/xaml/presentation""
+      xmlns:x=""http://schemas.microsoft.com/winfx/2006/xaml""
+      Height=""64"">
+    <Grid.Resources>
+        <Storyboard x:Key=""HeartbeatAnim"">
+            <DoubleAnimationUsingKeyFrames Storyboard.TargetName=""HeartScale"" Storyboard.TargetProperty=""ScaleX""
+                                            Duration=""0:0:0.9"" RepeatBehavior=""Forever"">
+                <LinearDoubleKeyFrame KeyTime=""0:0:0.000"" Value=""1.0"" />
+                <LinearDoubleKeyFrame KeyTime=""0:0:0.108"" Value=""1.28"" />
+                <LinearDoubleKeyFrame KeyTime=""0:0:0.216"" Value=""1.0"" />
+                <LinearDoubleKeyFrame KeyTime=""0:0:0.324"" Value=""1.16"" />
+                <LinearDoubleKeyFrame KeyTime=""0:0:0.432"" Value=""1.0"" />
+                <LinearDoubleKeyFrame KeyTime=""0:0:0.900"" Value=""1.0"" />
+            </DoubleAnimationUsingKeyFrames>
+            <DoubleAnimationUsingKeyFrames Storyboard.TargetName=""HeartScale"" Storyboard.TargetProperty=""ScaleY""
+                                            Duration=""0:0:0.9"" RepeatBehavior=""Forever"">
+                <LinearDoubleKeyFrame KeyTime=""0:0:0.000"" Value=""1.0"" />
+                <LinearDoubleKeyFrame KeyTime=""0:0:0.108"" Value=""1.28"" />
+                <LinearDoubleKeyFrame KeyTime=""0:0:0.216"" Value=""1.0"" />
+                <LinearDoubleKeyFrame KeyTime=""0:0:0.324"" Value=""1.16"" />
+                <LinearDoubleKeyFrame KeyTime=""0:0:0.432"" Value=""1.0"" />
+                <LinearDoubleKeyFrame KeyTime=""0:0:0.900"" Value=""1.0"" />
+            </DoubleAnimationUsingKeyFrames>
+        </Storyboard>
+        <Storyboard x:Key=""PulseLineAnim"">
+            <DoubleAnimation Storyboard.TargetName=""EcgPath"" Storyboard.TargetProperty=""StrokeDashOffset""
+                              From=""293"" To=""0"" Duration=""0:0:2.2"" RepeatBehavior=""Forever"" />
+        </Storyboard>
+    </Grid.Resources>
+    <Grid.Triggers>
+        <EventTrigger RoutedEvent=""FrameworkElement.Loaded"">
+            <BeginStoryboard Storyboard=""{StaticResource HeartbeatAnim}"" />
+            <BeginStoryboard Storyboard=""{StaticResource PulseLineAnim}"" />
+        </EventTrigger>
+    </Grid.Triggers>
+
+    <Path x:Name=""EcgPath"" Stroke=""#00E5FF"" StrokeThickness=""2.5""
+          StrokeStartLineCap=""Round"" StrokeEndLineCap=""Round"" StrokeLineJoin=""Round""
+          StrokeDashArray=""293 293"" VerticalAlignment=""Center"" Margin=""54,0,0,0""
+          Data=""M0,35 L20,35 L28,20 L36,35 L42,55 L48,5 L54,45 L60,35 L110,35 L130,35 L138,20 L146,35 L152,55 L158,5 L164,45 L170,35 L220,35 L240,35 L248,20 L256,35 L262,55 L268,5 L274,45 L280,35 L380,35"">
+        <Path.Effect>
+            <DropShadowEffect Color=""#00E5FF"" BlurRadius=""10"" ShadowDepth=""0"" Opacity=""0.9"" />
+        </Path.Effect>
+    </Path>
+
+    <TextBlock Text=""&#10084;&#65039;"" FontSize=""40"" Foreground=""#00E5FF""
+               VerticalAlignment=""Center"" HorizontalAlignment=""Left""
+               RenderTransformOrigin=""0.5,0.5"">
+        <TextBlock.RenderTransform>
+            <ScaleTransform x:Name=""HeartScale"" ScaleX=""1"" ScaleY=""1"" />
+        </TextBlock.RenderTransform>
+        <TextBlock.Effect>
+            <DropShadowEffect Color=""#00E5FF"" BlurRadius=""10"" ShadowDepth=""0"" Opacity=""0.9"" />
+        </TextBlock.Effect>
+    </TextBlock>
+</Grid>";
+
             private readonly TextBlock _status;
 
             public ProgressWindow(Window owner, string title)
@@ -1067,13 +1153,17 @@ namespace VMS.TPS
                 {
                     Text = "Starting...",
                     Foreground = textFg,
-                    Margin = new Thickness(0, 0, 0, 12),
+                    Margin = new Thickness(0, 0, 0, 10),
                     TextWrapping = TextWrapping.Wrap
                 };
                 panel.Children.Add(_status);
 
-                _bar = new ProgressBar { Minimum = 0, Maximum = 100, Value = 0, Height = 18 };
-                panel.Children.Add(_bar);
+                try
+                {
+                    var pulse = (UIElement)XamlReader.Parse(PulseXaml);
+                    panel.Children.Add(pulse);
+                }
+                catch { /* no animation if the XAML parse ever fails - status text alone still works */ }
 
                 outerBorder.Child = panel;
                 Content = outerBorder;
@@ -1081,8 +1171,8 @@ namespace VMS.TPS
 
             public void Report(string status, int percent)
             {
-                if (!string.IsNullOrEmpty(status)) _status.Text = status;
-                _bar.Value = Math.Max(0, Math.Min(100, percent));
+                int pct = Math.Max(0, Math.Min(100, percent));
+                if (!string.IsNullOrEmpty(status)) _status.Text = $"{status}  ({pct}%)";
                 Dispatcher.Invoke(() => { }, System.Windows.Threading.DispatcherPriority.Background);
             }
         }
@@ -4343,7 +4433,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.21.1.0";
+                Title = "Generic Crop Structure Generator - v5.22.0.0";
                 Width = 1250;
                 Height = 960;
                 MinWidth = 1000;
