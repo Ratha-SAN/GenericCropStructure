@@ -886,6 +886,34 @@
 //               parsing PulseXaml (WPF's XamlReader.Parse registers a
 //               NameScope on the root automatically, same mechanism
 //               ThemeXaml's FindResource already relies on).
+//   v5.26.0.0 – ProgressWindow: root-caused and fixed the heartbeat/ECG
+//               loop actually looking tied to generation progress despite
+//               v5.25.0.0's RepeatBehavior="Forever" Storyboards - the
+//               whole generation pipeline runs synchronously on the UI
+//               thread (see the class-level comment above), so WPF's
+//               animation/render timing can only advance while Report()
+//               pumps the Dispatcher; between ticks (i.e. during each
+//               step's actual ESAPI work) the Storyboards were frozen,
+//               so the "loop" only ever visibly jumped forward once per
+//               Report() call - exactly what looked progress-driven.
+//               Replaced the whole animated pulse with a static heart +
+//               ECG glyph pair (no Storyboard/Timeline at all): a dim
+//               heart outline and a full cyan ECG trace are always shown,
+//               each with a colored twin (red heart / green ECG with
+//               glow) clipped via a RectangleGeometry whose Width Report()
+//               sets directly from percent - heart fills over 0-20%, ECG
+//               fills (green, over the static cyan baseline) over
+//               20-100%, both revealing strictly left-to-right. Since
+//               nothing changes between Report() calls now, there's
+//               nothing to look "stuck" - a background-thread worker
+//               (the only way to get a truly continuous loop under a
+//               busy UI thread) was considered and rejected, since Varian
+//               doesn't document ESAPI as safe to call off the script's
+//               own thread. Removed PulseXaml/DoneXaml/EcgColor*/
+//               LerpEcgColor/LerpColor entirely; ShowCompleted() no
+//               longer swaps in a separate "done" fragment (the fill is
+//               already fully red+green at 100%) - still holds 3 seconds
+//               then auto-closes via SafeClose(), unchanged.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -911,8 +939,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.25.0.0")]
-[assembly: AssemblyFileVersion("5.25.0.0")]
+[assembly: AssemblyVersion("5.26.0.0")]
+[assembly: AssemblyFileVersion("5.26.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -1063,23 +1091,22 @@ namespace VMS.TPS
         // content area is themed; the native tool-window title bar chrome
         // is left as-is.
         //
-        // The flat percent bar was replaced with an animated "vitals
-        // monitor" pulse (heartbeat icon + ECG trace), matching a CSS/SVG
-        // reference the user supplied - this is a WPF desktop window, not
-        // a browser, so CSS @keyframes/SVG stroke-dashoffset don't apply
-        // directly; no extra library is needed for the WPF equivalent
-        // either, since Storyboard/DoubleAnimationUsingKeyFrames/
-        // DropShadowEffect are all built into WPF (PresentationCore/
-        // PresentationFramework, already referenced by this whole window).
-        // The animation is defined as inline XAML (PulseXaml below) parsed
-        // via XamlReader.Parse, same technique already used for ThemeXaml -
-        // its own EventTrigger on FrameworkElement.Loaded starts both
-        // Storyboards (RepeatBehavior="Forever") the moment it's added to
-        // the visual tree, so it needs no C#-side wiring at all. Like a
-        // real vitals monitor, it animates continuously and independently
-        // of Report()'s percent value - it signals "still working", not
-        // literal progress; percent is now folded into the status text
-        // instead of a separate bar.
+        // The percent bar is a static heart + ECG glyph pair, filled
+        // left-to-right as percent advances - not an animated loop, since
+        // this whole pipeline runs synchronously on the UI thread (see
+        // above) and a truly continuous loop can't be driven while that
+        // thread is busy with ESAPI calls between Report() ticks; a
+        // background-thread worker was considered but rejected since
+        // Varian doesn't document ESAPI as safe to call off the script's
+        // own thread. A static, percent-driven fill sidesteps the problem
+        // entirely - it only ever changes exactly when Report() is called,
+        // so there's nothing to look "stuck" between ticks. Heart glyph
+        // fills red over percent 0-20%, then the ECG trace fills green
+        // (over its own static cyan baseline) over percent 20-100%, both
+        // via a Clip geometry whose width grows with percent - no
+        // Storyboard/animation timeline at all. Built as inline XAML
+        // (ProgressXaml below) parsed via XamlReader.Parse, same technique
+        // already used for ThemeXaml.
         private sealed class ProgressWindow : Window
         {
             private const string ThemeXaml = @"
@@ -1093,122 +1120,61 @@ namespace VMS.TPS
     <SolidColorBrush x:Key=""BorderBrush""   Color=""#2E3440"" />
 </ResourceDictionary>";
 
-            // Heartbeat + ECG "vitals monitor" pulse - WPF translation of the
-            // user-supplied CSS: the heart's ScaleTransform keyframes match
-            // the @keyframes heartbeat timings/values exactly (0%/12%/24%/
-            // 36%/48%/100% of a 0.9s cycle -> 1.0/1.28/1.0/1.16/1.0/1.0), and
-            // the ECG Path's StrokeDashOffset animates from its dash length
-            // down to 0 over 2.2s linear, both looping forever at a fixed
-            // rate - Report() only ever touches color/text, never the
-            // Storyboards, so the loop's own timing is completely
-            // independent of percent - until ShowCompleted() swaps this out
-            // for the static DoneXaml below at 100%. The path/heart are
-            // sized down ~30% from the original design (FontSize 40->28,
-            // path scaled from an original 380x50 area to 266x25 - the
-            // ECG's own height, 25, works out ~10% shorter than the heart's
-            // new 28), and StrokeDashArray/Offset (188, in
-            // StrokeThickness(2.5)-relative units) is re-derived for this
-            // smaller path's shorter length. Both glow via DropShadowEffect,
-            // matching the CSS drop-shadow filters - the heart stays red
-            // throughout, while the ECG's Stroke/glow Color is repainted on
-            // every Report() call by LerpEcgColor(), sweeping from yellow
-            // (0%) through blue (50%) to green (100%), landing exactly on
-            // the DoneXaml green so the swap at completion is seamless.
-            private const string PulseXaml = @"
+            // Heart + ECG "vitals monitor" glyph, entirely static (no
+            // Storyboard/animation): a dim heart outline and a full cyan
+            // ECG trace are always shown, each with a colored twin
+            // (red heart / green ECG) laid exactly on top, clipped via a
+            // RectangleGeometry whose Width is set directly from Report()
+            // - HeartClip grows over percent 0-20%, EcgClip grows over
+            // percent 20-100%, so the two colored twins "reveal"
+            // left-to-right as generation actually progresses, and nothing
+            // moves between Report() calls. Sized to the same ~30%-smaller
+            // dimensions as before (heart FontSize 28; ECG path 266x25).
+            private const string ProgressXaml = @"
 <Grid xmlns=""http://schemas.microsoft.com/winfx/2006/xaml/presentation""
       xmlns:x=""http://schemas.microsoft.com/winfx/2006/xaml""
       Height=""36"">
-    <Grid.Resources>
-        <Storyboard x:Key=""HeartbeatAnim"">
-            <DoubleAnimationUsingKeyFrames Storyboard.TargetName=""HeartScale"" Storyboard.TargetProperty=""ScaleX""
-                                            Duration=""0:0:0.9"" RepeatBehavior=""Forever"">
-                <LinearDoubleKeyFrame KeyTime=""0:0:0.000"" Value=""1.0"" />
-                <LinearDoubleKeyFrame KeyTime=""0:0:0.108"" Value=""1.28"" />
-                <LinearDoubleKeyFrame KeyTime=""0:0:0.216"" Value=""1.0"" />
-                <LinearDoubleKeyFrame KeyTime=""0:0:0.324"" Value=""1.16"" />
-                <LinearDoubleKeyFrame KeyTime=""0:0:0.432"" Value=""1.0"" />
-                <LinearDoubleKeyFrame KeyTime=""0:0:0.900"" Value=""1.0"" />
-            </DoubleAnimationUsingKeyFrames>
-            <DoubleAnimationUsingKeyFrames Storyboard.TargetName=""HeartScale"" Storyboard.TargetProperty=""ScaleY""
-                                            Duration=""0:0:0.9"" RepeatBehavior=""Forever"">
-                <LinearDoubleKeyFrame KeyTime=""0:0:0.000"" Value=""1.0"" />
-                <LinearDoubleKeyFrame KeyTime=""0:0:0.108"" Value=""1.28"" />
-                <LinearDoubleKeyFrame KeyTime=""0:0:0.216"" Value=""1.0"" />
-                <LinearDoubleKeyFrame KeyTime=""0:0:0.324"" Value=""1.16"" />
-                <LinearDoubleKeyFrame KeyTime=""0:0:0.432"" Value=""1.0"" />
-                <LinearDoubleKeyFrame KeyTime=""0:0:0.900"" Value=""1.0"" />
-            </DoubleAnimationUsingKeyFrames>
-        </Storyboard>
-        <Storyboard x:Key=""PulseLineAnim"">
-            <DoubleAnimation Storyboard.TargetName=""EcgPath"" Storyboard.TargetProperty=""StrokeDashOffset""
-                              From=""188"" To=""0"" Duration=""0:0:2.2"" RepeatBehavior=""Forever"" />
-        </Storyboard>
-    </Grid.Resources>
-    <Grid.Triggers>
-        <EventTrigger RoutedEvent=""FrameworkElement.Loaded"">
-            <BeginStoryboard Storyboard=""{StaticResource HeartbeatAnim}"" />
-            <BeginStoryboard Storyboard=""{StaticResource PulseLineAnim}"" />
-        </EventTrigger>
-    </Grid.Triggers>
-
-    <Path x:Name=""EcgPath"" Stroke=""#FFD400"" StrokeThickness=""2.5""
-          StrokeStartLineCap=""Round"" StrokeEndLineCap=""Round"" StrokeLineJoin=""Round""
-          StrokeDashArray=""188 188"" VerticalAlignment=""Center"" Margin=""40,0,0,0""
-          Data=""M0,15 L14,15 L20,8 L25,15 L29,25 L34,0 L38,20 L42,15 L77,15 L91,15 L97,8 L102,15 L106,25 L111,0 L115,20 L119,15 L154,15 L168,15 L174,8 L179,15 L183,25 L188,0 L192,20 L196,15 L266,15"">
-        <Path.Effect>
-            <DropShadowEffect x:Name=""EcgGlow"" Color=""#FFD400"" BlurRadius=""10"" ShadowDepth=""0"" Opacity=""0.9"" />
-        </Path.Effect>
-    </Path>
-
-    <TextBlock Text=""&#10084;&#65039;"" FontSize=""28"" Foreground=""Red""
-               VerticalAlignment=""Center"" HorizontalAlignment=""Left""
-               RenderTransformOrigin=""0.5,0.5"">
-        <TextBlock.RenderTransform>
-            <ScaleTransform x:Name=""HeartScale"" ScaleX=""1"" ScaleY=""1"" />
-        </TextBlock.RenderTransform>
+    <TextBlock Text=""&#10084;&#65039;"" FontSize=""28"" Foreground=""#3A3F4A""
+               VerticalAlignment=""Center"" HorizontalAlignment=""Left"" />
+    <TextBlock x:Name=""HeartFill"" Text=""&#10084;&#65039;"" FontSize=""28"" Foreground=""Red""
+               VerticalAlignment=""Center"" HorizontalAlignment=""Left"">
         <TextBlock.Effect>
             <DropShadowEffect Color=""Red"" BlurRadius=""10"" ShadowDepth=""0"" Opacity=""0.9"" />
         </TextBlock.Effect>
+        <TextBlock.Clip>
+            <RectangleGeometry x:Name=""HeartClip"" Rect=""0,0,0,40"" />
+        </TextBlock.Clip>
     </TextBlock>
-</Grid>";
 
-            // Static "done" state shown once Report() reaches 100%: same
-            // heart + ECG shapes as PulseXaml but motionless and green,
-            // swapped in for the looping cyan/red pulse via ShowCompleted().
-            // Starts Collapsed - nothing shows until completion.
-            private const string DoneXaml = @"
-<Grid xmlns=""http://schemas.microsoft.com/winfx/2006/xaml/presentation""
-      xmlns:x=""http://schemas.microsoft.com/winfx/2006/xaml""
-      Height=""36"" Visibility=""Collapsed"">
-    <Path Stroke=""#2ECC71"" StrokeThickness=""2.5""
+    <Path Stroke=""#00E5FF"" StrokeThickness=""2.5""
+          StrokeStartLineCap=""Round"" StrokeEndLineCap=""Round"" StrokeLineJoin=""Round""
+          VerticalAlignment=""Center"" Margin=""40,0,0,0""
+          Data=""M0,15 L14,15 L20,8 L25,15 L29,25 L34,0 L38,20 L42,15 L77,15 L91,15 L97,8 L102,15 L106,25 L111,0 L115,20 L119,15 L154,15 L168,15 L174,8 L179,15 L183,25 L188,0 L192,20 L196,15 L266,15"" />
+    <Path x:Name=""EcgFill"" Stroke=""#2ECC71"" StrokeThickness=""2.5""
           StrokeStartLineCap=""Round"" StrokeEndLineCap=""Round"" StrokeLineJoin=""Round""
           VerticalAlignment=""Center"" Margin=""40,0,0,0""
           Data=""M0,15 L14,15 L20,8 L25,15 L29,25 L34,0 L38,20 L42,15 L77,15 L91,15 L97,8 L102,15 L106,25 L111,0 L115,20 L119,15 L154,15 L168,15 L174,8 L179,15 L183,25 L188,0 L192,20 L196,15 L266,15"">
         <Path.Effect>
             <DropShadowEffect Color=""#2ECC71"" BlurRadius=""10"" ShadowDepth=""0"" Opacity=""0.9"" />
         </Path.Effect>
+        <Path.Clip>
+            <RectangleGeometry x:Name=""EcgClip"" Rect=""0,0,0,40"" />
+        </Path.Clip>
     </Path>
-    <TextBlock Text=""&#10084;&#65039;"" FontSize=""28"" Foreground=""#2ECC71""
-               VerticalAlignment=""Center"" HorizontalAlignment=""Left"">
-        <TextBlock.Effect>
-            <DropShadowEffect Color=""#2ECC71"" BlurRadius=""10"" ShadowDepth=""0"" Opacity=""0.9"" />
-        </TextBlock.Effect>
-    </TextBlock>
 </Grid>";
 
-            // ECG color sweep stops: yellow (0%) -> blue (50%, matches the
-            // theme's own AccentCyan) -> green (100%, matches DoneXaml's
-            // #2ECC71 exactly so the swap to the static done state is
-            // seamless).
-            private static readonly Color EcgColorStart = (Color)ColorConverter.ConvertFromString("#FFD400");
-            private static readonly Color EcgColorMid = (Color)ColorConverter.ConvertFromString("#00E5FF");
-            private static readonly Color EcgColorEnd = (Color)ColorConverter.ConvertFromString("#2ECC71");
+            // Fill spans: heart clip only needs to be wide enough to fully
+            // reveal the FontSize=28 glyph (40 matches the ECG's own left
+            // Margin, so both regions line up); ECG clip matches the
+            // path's own max X (266).
+            private const double HeartClipMaxWidth = 40.0;
+            private const double EcgClipMaxWidth = 266.0;
+            private const double ClipHeight = 40.0;
 
             private readonly TextBlock _status;
-            private UIElement _pulseHost;
-            private UIElement _doneHost;
-            private System.Windows.Shapes.Path _ecgPath;
-            private System.Windows.Media.Effects.DropShadowEffect _ecgGlow;
+            private UIElement _progressHost;
+            private RectangleGeometry _heartClip;
+            private RectangleGeometry _ecgClip;
             private bool _completed;
 
             public ProgressWindow(Window owner, string title)
@@ -1261,20 +1227,13 @@ namespace VMS.TPS
 
                 try
                 {
-                    _pulseHost = (UIElement)XamlReader.Parse(PulseXaml);
-                    panel.Children.Add(_pulseHost);
-                    var fe = _pulseHost as FrameworkElement;
-                    _ecgPath = fe?.FindName("EcgPath") as System.Windows.Shapes.Path;
-                    _ecgGlow = fe?.FindName("EcgGlow") as System.Windows.Media.Effects.DropShadowEffect;
+                    _progressHost = (UIElement)XamlReader.Parse(ProgressXaml);
+                    panel.Children.Add(_progressHost);
+                    var fe = _progressHost as FrameworkElement;
+                    _heartClip = fe?.FindName("HeartClip") as RectangleGeometry;
+                    _ecgClip = fe?.FindName("EcgClip") as RectangleGeometry;
                 }
-                catch { /* no animation if the XAML parse ever fails - status text alone still works */ }
-
-                try
-                {
-                    _doneHost = (UIElement)XamlReader.Parse(DoneXaml);
-                    panel.Children.Add(_doneHost);
-                }
-                catch { /* if this fails, ShowCompleted() just leaves the pulse as-is */ }
+                catch { /* no fill glyph if the XAML parse ever fails - status text alone still works */ }
 
                 outerBorder.Child = panel;
                 Content = outerBorder;
@@ -1285,9 +1244,10 @@ namespace VMS.TPS
                 int pct = Math.Max(0, Math.Min(100, percent));
                 if (!string.IsNullOrEmpty(status)) _status.Text = $"{status}  ({pct}%)";
 
-                var ecgColor = LerpEcgColor(pct);
-                if (_ecgPath != null) _ecgPath.Stroke = new SolidColorBrush(ecgColor);
-                if (_ecgGlow != null) _ecgGlow.Color = ecgColor;
+                double heartFrac = Math.Max(0.0, Math.Min(1.0, pct / 20.0));
+                double ecgFrac = Math.Max(0.0, Math.Min(1.0, (pct - 20) / 80.0));
+                if (_heartClip != null) _heartClip.Rect = new Rect(0, 0, HeartClipMaxWidth * heartFrac, ClipHeight);
+                if (_ecgClip != null) _ecgClip.Rect = new Rect(0, 0, EcgClipMaxWidth * ecgFrac, ClipHeight);
 
                 Dispatcher.Invoke(() => { }, System.Windows.Threading.DispatcherPriority.Background);
 
@@ -1298,39 +1258,15 @@ namespace VMS.TPS
                 }
             }
 
-            // Two-segment gradient driven purely by percent - the loop's own
-            // timing (Storyboards above) never changes: 0-50% sweeps yellow
-            // -> blue, 50-100% sweeps blue -> green, landing on the exact
-            // DoneXaml green at 100%.
-            private static Color LerpEcgColor(int pct)
-            {
-                double frac = pct / 100.0;
-                return frac <= 0.5
-                    ? LerpColor(EcgColorStart, EcgColorMid, frac / 0.5)
-                    : LerpColor(EcgColorMid, EcgColorEnd, (frac - 0.5) / 0.5);
-            }
-
-            private static Color LerpColor(Color a, Color b, double t)
-            {
-                t = Math.Max(0.0, Math.Min(1.0, t));
-                return Color.FromArgb(
-                    (byte)(a.A + (b.A - a.A) * t),
-                    (byte)(a.R + (b.R - a.R) * t),
-                    (byte)(a.G + (b.G - a.G) * t),
-                    (byte)(a.B + (b.B - a.B) * t));
-            }
-
-            // Swaps the looping cyan/red pulse for the static green "done"
-            // state, holds for 3 seconds so it's actually visible, then
-            // closes the window itself - independent of whatever the caller
-            // does afterward (e.g. a completion MessageBox), so this window
-            // doesn't linger on-screen once the work is actually done. The
-            // 3-second hold blocks synchronously, same as every other Report()
-            // call already does implicitly on this single-threaded pipeline.
+            // Holds the fully-filled state for 3 seconds so it's actually
+            // visible, then closes the window itself - independent of
+            // whatever the caller does afterward (e.g. a completion
+            // MessageBox), so this window doesn't linger on-screen once the
+            // work is actually done. The 3-second hold blocks synchronously,
+            // same as every other Report() call already does implicitly on
+            // this single-threaded pipeline.
             private void ShowCompleted()
             {
-                if (_pulseHost != null) _pulseHost.Visibility = Visibility.Collapsed;
-                if (_doneHost != null) _doneHost.Visibility = Visibility.Visible;
                 Dispatcher.Invoke(() => { }, System.Windows.Threading.DispatcherPriority.Render);
 
                 System.Threading.Thread.Sleep(3000);
@@ -4648,7 +4584,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.25.0.0";
+                Title = "Generic Crop Structure Generator - v5.26.0.0";
                 Width = 1250;
                 Height = 960;
                 MinWidth = 1000;
