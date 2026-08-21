@@ -914,6 +914,28 @@
 //               longer swaps in a separate "done" fragment (the fill is
 //               already fully red+green at 100%) - still holds 3 seconds
 //               then auto-closes via SafeClose(), unchanged.
+//   v5.27.0.0 – Performance: Step6_Overlaps (z_[OAR]_Ovl_[dose], both tabs)
+//               was redoing an expensive clone+margin of each higher-dose
+//               z_PTV_opt_{dose}_sum geometry once per (dose level, OAR
+//               request) pair, even though that geometry only depends on
+//               the dose pair - with R Ovl-ticked OARs it repeated the
+//               identical work R times per dose pair, so generation time
+//               scaled with the number of ticked OARs on top of the
+//               number of dose levels (O(D^2 x R) instead of O(D^2)).
+//               Hoisted the per-(d, hd) clone+margin out of the OAR
+//               request loop into a per-dose-level precompute
+//               (higherExpandedByDose), now computed once and reused
+//               across every OAR request at that dose - geometry and
+//               structure IDs are unchanged, this only removes redundant
+//               work. This was the clearest algorithmic hot spot found
+//               while investigating reports that Generic-tab generation
+//               with many ticked structures (particularly many OARs) was
+//               slow; the remaining per-boolean-operation cost is
+//               inherent to Eclipse/ESAPI (each SegmentVolume clone,
+//               margin, and boolean op is a real computation whose cost
+//               scales with contour complexity/resolution) and wasn't
+//               something this pass could remove further without
+//               changing the resulting geometry.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -939,8 +961,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.26.0.0")]
-[assembly: AssemblyFileVersion("5.26.0.0")]
+[assembly: AssemblyVersion("5.27.0.0")]
+[assembly: AssemblyFileVersion("5.27.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -2782,72 +2804,91 @@ namespace VMS.TPS
 
                     string doseStr = d.ToString(System.Globalization.CultureInfo.InvariantCulture);
 
-                    foreach (var req in ovlRequests)
+                    // Precompute each higher-dose "expanded" subtract geometry
+                    // ONCE per dose level, not once per OAR request. Previously
+                    // this clone+margin ran again from scratch inside the
+                    // req loop below for every ticked Ovl request, even though
+                    // the result only depends on (d, hd) - with R Ovl requests
+                    // it redid identical, expensive geometry work R times per
+                    // dose pair, which is exactly what made this step slow to
+                    // scale with "many structures" (many ticked OARs).
+                    var higherExpandedByDose = new Dictionary<double, SegmentVolume>();
+                    using (var doseTg = new TempGuard(_ss))
                     {
-                        var ovlId = BuildId("z_", req.OarId, $"_Ovl_{doseStr}");
-                        if (!IsAutoStructureSelected(ovlId))
+                        foreach (var hd in doseLevels.Where(x => x > d))
                         {
-                            _progress.AppendLine($"  SKIP: {ovlId} (not selected)");
-                            continue;
+                            if (!_zOptDoseSum.TryGetValue(hd, out var higherOptSum)) continue;
+                            var higherClone = CloneSegViaTempTracked(_ss, higherOptSum.SegmentVolume, "zTmpOptH", doseTg);
+                            higherExpandedByDose[hd] = SafeMargin(higherClone, +LOWER_SUBTRACT_EXTRA_MM);
                         }
-                        try
+
+                        foreach (var req in ovlRequests)
                         {
-                            var oar = _ss.Structures.FirstOrDefault(s =>
-                                !s.IsEmpty && string.Equals(s.Id, req.OarId, StringComparison.OrdinalIgnoreCase));
-                            if (oar == null || oar.IsEmpty)
+                            var ovlId = BuildId("z_", req.OarId, $"_Ovl_{doseStr}");
+                            if (!IsAutoStructureSelected(ovlId))
                             {
-                                _progress.AppendLine($"  SKIP: {ovlId} (OAR not found or empty)");
+                                _progress.AppendLine($"  SKIP: {ovlId} (not selected)");
                                 continue;
                             }
-
-                            using (var tg = new TempGuard(_ss))
+                            try
                             {
-                                var optSeg = CloneSegViaTempTracked(_ss, optSumSt.SegmentVolume, "zTmpOptOvlp", tg);
-                                var oarSeg = CloneSegViaTempTracked(_ss, oar.SegmentVolume, "zTmpOarOvlp", tg);
-                                var opToUse = OVERLAP_IS_INTERSECTION ? BoolOp.And : BoolOp.Or;
-                                var actionName = OVERLAP_IS_INTERSECTION ? "And" : "Or";
-
-                                var ov = SafeBoolean(_ss, optSeg, oarSeg, opToUse,
-                                            optSumSt, oar, ovlId, _fb,
-                                            $"Ovlp_{doseStr}_{req.OarId}_{actionName}", tg);
-
-                                // Crop lower-dose overlap from higher-dose opt targets + 1 mm
-                                foreach (var hd in doseLevels.Where(x => x > d))
+                                var oar = _ss.Structures.FirstOrDefault(s =>
+                                    !s.IsEmpty && string.Equals(s.Id, req.OarId, StringComparison.OrdinalIgnoreCase));
+                                if (oar == null || oar.IsEmpty)
                                 {
-                                    if (!_zOptDoseSum.TryGetValue(hd, out var higherOptSum)) continue;
-
-                                    var higherClone = CloneSegViaTempTracked(_ss, higherOptSum.SegmentVolume, "zTmpOptH", tg);
-                                    var higherExpanded = SafeMargin(higherClone, +LOWER_SUBTRACT_EXTRA_MM);
-                                    string hDoseStr = hd.ToString(System.Globalization.CultureInfo.InvariantCulture);
-
-                                    ov = SafeBoolean(_ss, ov, higherExpanded, BoolOp.Sub,
-                                            null, higherOptSum, ovlId, _fb,
-                                            $"Ovlp_{doseStr}_SubHigher_{hDoseStr}", tg);
+                                    _progress.AppendLine($"  SKIP: {ovlId} (OAR not found or empty)");
+                                    continue;
                                 }
 
-                                ov = SafeBoolean(_ss, ov, ext.SegmentVolume, BoolOp.And,
-                                        null, ext, ovlId, _fb,
-                                        $"Ovlp_{doseStr}_{req.OarId}_CapExt", tg);
-
-                                if (ov != null)
+                                using (var tg = new TempGuard(_ss))
                                 {
-                                    var st = GetOrCreate(_ss, "PTV", ovlId);
-                                    if (AssignSegmentSafely(st, ov))
+                                    var optSeg = CloneSegViaTempTracked(_ss, optSumSt.SegmentVolume, "zTmpOptOvlp", tg);
+                                    var oarSeg = CloneSegViaTempTracked(_ss, oar.SegmentVolume, "zTmpOarOvlp", tg);
+                                    var opToUse = OVERLAP_IS_INTERSECTION ? BoolOp.And : BoolOp.Or;
+                                    var actionName = OVERLAP_IS_INTERSECTION ? "And" : "Or";
+
+                                    var ov = SafeBoolean(_ss, optSeg, oarSeg, opToUse,
+                                                optSumSt, oar, ovlId, _fb,
+                                                $"Ovlp_{doseStr}_{req.OarId}_{actionName}", tg);
+
+                                    // Crop lower-dose overlap from each higher-dose opt sum
+                                    // + 1mm, reusing the geometry precomputed once above.
+                                    foreach (var hd in doseLevels.Where(x => x > d))
                                     {
-                                        st.Color = Color.FromRgb(191, 255, 0);
-                                        LogCreated(ovlId);
+                                        if (!higherExpandedByDose.TryGetValue(hd, out var higherExpanded)) continue;
+                                        if (!_zOptDoseSum.TryGetValue(hd, out var higherOptSum)) continue;
+
+                                        string hDoseStr = hd.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+                                        ov = SafeBoolean(_ss, ov, higherExpanded, BoolOp.Sub,
+                                                null, higherOptSum, ovlId, _fb,
+                                                $"Ovlp_{doseStr}_SubHigher_{hDoseStr}", tg);
                                     }
-                                    else
+
+                                    ov = SafeBoolean(_ss, ov, ext.SegmentVolume, BoolOp.And,
+                                            null, ext, ovlId, _fb,
+                                            $"Ovlp_{doseStr}_{req.OarId}_CapExt", tg);
+
+                                    if (ov != null)
                                     {
-                                        _ss.RemoveStructure(st);
-                                        _progress.AppendLine($"  SKIP: {ovlId} (No overlap intersection)");
+                                        var st = GetOrCreate(_ss, "PTV", ovlId);
+                                        if (AssignSegmentSafely(st, ov))
+                                        {
+                                            st.Color = Color.FromRgb(191, 255, 0);
+                                            LogCreated(ovlId);
+                                        }
+                                        else
+                                        {
+                                            _ss.RemoveStructure(st);
+                                            _progress.AppendLine($"  SKIP: {ovlId} (No overlap intersection)");
+                                        }
                                     }
                                 }
                             }
-                        }
-                        catch (Exception exOvl)
-                        {
-                            _progress.AppendLine($"  FAIL: {ovlId} -> {exOvl.Message}");
+                            catch (Exception exOvl)
+                            {
+                                _progress.AppendLine($"  FAIL: {ovlId} -> {exOvl.Message}");
+                            }
                         }
                     }
                 }
@@ -4584,7 +4625,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.26.0.0";
+                Title = "Generic Crop Structure Generator - v5.27.0.0";
                 Width = 1250;
                 Height = 960;
                 MinWidth = 1000;
