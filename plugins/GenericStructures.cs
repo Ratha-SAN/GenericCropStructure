@@ -734,6 +734,24 @@
 //               cap-to-Body_new-only result). Bolus_phys_Opt is now hoisted
 //               to method scope (was previously a block-local variable) so
 //               Step 4-5 can read it.
+//   v5.19.1.0 – Breast Opto Virtual Bolus: replaced the skin-normal-based
+//               asymmetric expansion (SafePerpendicularMargin/
+//               TryComputeSkinNormalAtTip) with a simple flat one
+//               (SafeFlatAsymmetricMargin) for z_Virtual_PTV's Step 1
+//               expansion and the physical-bolus-mode z_Virtual_PTV_Opt
+//               expansion. The old approach decomposed a single
+//               perpendicular-to-skin offset of magnitude mm into
+//               anterior/lateral components that individually summed to
+//               LESS than mm (only their vector magnitude, in quadrature,
+//               equalled mm) - so e.g. a 22mm input didn't actually reach
+//               22mm anteriorly or laterally, just some fraction of it
+//               depending on the local skin-surface normal direction at
+//               the target's tip. The new SafeFlatAsymmetricMargin applies
+//               the FULL mm value independently in both the anterior and
+//               the (ipsilateral) lateral direction, matching what's
+//               actually expected. SafePerpendicularMargin and
+//               TryComputeSkinNormalAtTip are removed entirely - nothing
+//               else used them.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -759,8 +777,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.19.0.0")]
-[assembly: AssemblyFileVersion("5.19.0.0")]
+[assembly: AssemblyVersion("5.19.1.0")]
+[assembly: AssemblyFileVersion("5.19.1.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -1852,8 +1870,8 @@ namespace VMS.TPS
                             if (subSeg != null) AssignSegmentSafely(baseSt, subSeg);
                         }
 
-                        var expSeg = SafePerpendicularMargin(_ss, baseSt, ext, totalMm,
-                                        isLeft, _fb, tg, $"zVB_AsymExp_{req.TargetId}");
+                        var expSeg = SafeFlatAsymmetricMargin(baseSt, totalMm,
+                                        isLeft, _fb, $"zVB_AsymExp_{req.TargetId}");
                         if (expSeg == null) continue;
 
                         // Subtract lung from expanded result too (catches margin bleed-in)
@@ -2066,8 +2084,8 @@ namespace VMS.TPS
                             var k = new OptKey(req.DoseGy, req.Suffix);
                             if (!_zOpt.ContainsKey(k)) continue;
 
-                            var expSeg2 = SafePerpendicularMargin(_ss, _zOpt[k], ext,
-                                            VB_PHYS_OPT_EXPAND_MM, isLeft, _fb, tg,
+                            var expSeg2 = SafeFlatAsymmetricMargin(_zOpt[k],
+                                            VB_PHYS_OPT_EXPAND_MM, isLeft, _fb,
                                             $"zVB_PhysOptExp_{req.TargetId}");
                             if (expSeg2 == null) continue;
 
@@ -3024,49 +3042,25 @@ namespace VMS.TPS
             }
         }
 
-        // ------------------------------------------------------------------
-        // v3.0.0.34: Expansion whose direction is the body/skin surface's own
-        // outward normal at the point nearest the target's tip, rather than a
-        // fixed global anterior/lateral axis split.
-        //
-        // Method: find the point on `target` closest to any point on `body`
-        // (the "tip"), take that nearest body-surface point, and estimate the
-        // 2D outward normal there from its neighbouring contour points on the
-        // same image slice (tangent from prev/next point, rotated 90 degrees,
-        // sign corrected to point away from that slice's contour centroid).
-        // That single unit direction is then decomposed into the codebase's
-        // existing lateral (x1/x2) and anterior (y1) AsymmetricMargin slots,
-        // scaled so their combined magnitude is exactly `mm` along the
-        // computed direction - reusing the same isLeft-driven x1-vs-x2 sign
-        // convention already relied on elsewhere in this file, just with a
-        // direction-weighted ratio instead of an even mm/mm split.
-        //
-        // Falls back to SafeAsymmetricMargin's even split if a tip/normal
-        // can't be determined (e.g. missing contour data).
-        // ------------------------------------------------------------------
-        private static SegmentVolume SafePerpendicularMargin(
-            StructureSet ss, Structure target, Structure body, double mm,
-            bool isLeft, SliceRecontourFallback fb, TempGuard tg, string ctx)
+        // Simple asymmetric outer margin: the FULL `mm` anteriorly AND the
+        // FULL `mm` laterally (on the ipsilateral side per isLeft) - used
+        // for z_Virtual_PTV's Step 1 expansion and the physical-bolus-mode
+        // z_Virtual_PTV_Opt expansion, where both the anterior and lateral
+        // extent are each meant to be the full mm value passed in, not a
+        // direction-weighted split (a previous skin-surface-normal-based
+        // version, SafePerpendicularMargin/TryComputeSkinNormalAtTip, split
+        // mm between the two axes based on the local skin normal direction,
+        // so neither individually reached the full mm value - that approach
+        // didn't work reliably and was removed).
+        private static SegmentVolume SafeFlatAsymmetricMargin(
+            Structure target, double mm, bool isLeft, SliceRecontourFallback fb, string ctx)
         {
             if (target == null || target.IsEmpty) return null;
             if (Math.Abs(mm) < 1e-6) return target.SegmentVolume;
 
-            double lateralMag = mm;
-            double anteriorMag = mm;
-
-            if (TryComputeSkinNormalAtTip(ss, target, body, out double dirX, out double dirY))
-            {
-                lateralMag = Math.Abs(dirX) * mm;
-                anteriorMag = Math.Abs(dirY) * mm;
-            }
-            else
-            {
-                fb?.MarkCreated(ctx + "_NormalFallback");
-            }
-
-            double x1 = isLeft ? 0 : lateralMag;
-            double y1 = anteriorMag;
-            double x2 = isLeft ? lateralMag : 0;
+            double x1 = isLeft ? 0 : mm;
+            double y1 = mm;
+            double x2 = isLeft ? mm : 0;
 
             var margins = new AxisAlignedMargins(StructureMarginGeometry.Outer, x1, y1, 0, x2, 0, 0);
             try
@@ -3078,98 +3072,6 @@ namespace VMS.TPS
                 fb?.MarkCreated(ctx + "_IsoFallback");
                 return target.SegmentVolume.Margin(mm);
             }
-        }
-
-        // Finds the point on `target` nearest to `body`'s surface, then
-        // estimates the outward 2D (in-plane) normal of `body` at that
-        // nearest point. Returns false if either structure has no contour
-        // data to work with. All distances/directions are computed directly
-        // from raw contour coordinates - only the RATIO between dirX and
-        // dirY is used by the caller, so no assumption about which raw axis
-        // sign means "right" vs "left" is required.
-        private static bool TryComputeSkinNormalAtTip(
-            StructureSet ss, Structure target, Structure body,
-            out double dirX, out double dirY)
-        {
-            dirX = 0; dirY = 0;
-            if (ss?.Image == null || target == null || target.IsEmpty ||
-                body == null || body.IsEmpty)
-                return false;
-
-            int nz = ss.Image.ZSize;
-            double bestDist2 = double.MaxValue;
-            VVector bestSkinPoint = default(VVector);
-            VVector[] bestLoop = null;
-            int bestIdx = -1;
-
-            for (int z = 0; z < nz; z++)
-            {
-                VVector[][] targetLoops, bodyLoops;
-                try { targetLoops = target.GetContoursOnImagePlane(z); }
-                catch { continue; }
-                if (targetLoops == null || targetLoops.Length == 0) continue;
-
-                try { bodyLoops = body.GetContoursOnImagePlane(z); }
-                catch { continue; }
-                if (bodyLoops == null || bodyLoops.Length == 0) continue;
-
-                foreach (var tLoop in targetLoops)
-                {
-                    if (tLoop == null) continue;
-                    foreach (var tp in tLoop)
-                    {
-                        foreach (var bLoop in bodyLoops)
-                        {
-                            if (bLoop == null || bLoop.Length < 3) continue;
-                            for (int i = 0; i < bLoop.Length; i++)
-                            {
-                                double dx = bLoop[i].x - tp.x;
-                                double dy = bLoop[i].y - tp.y;
-                                double d2 = dx * dx + dy * dy;
-                                if (d2 < bestDist2)
-                                {
-                                    bestDist2 = d2;
-                                    bestSkinPoint = bLoop[i];
-                                    bestLoop = bLoop;
-                                    bestIdx = i;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (bestLoop == null || bestIdx < 0) return false;
-
-            int n = bestLoop.Length;
-            var prev = bestLoop[(bestIdx - 1 + n) % n];
-            var next = bestLoop[(bestIdx + 1) % n];
-            double tangentX = next.x - prev.x;
-            double tangentY = next.y - prev.y;
-
-            double normX = tangentY;
-            double normY = -tangentX;
-            double len = Math.Sqrt(normX * normX + normY * normY);
-            if (len < 1e-6) return false;
-            normX /= len;
-            normY /= len;
-
-            double cx = 0, cy = 0;
-            foreach (var p in bestLoop) { cx += p.x; cy += p.y; }
-            cx /= n;
-            cy /= n;
-
-            double toPointX = bestSkinPoint.x - cx;
-            double toPointY = bestSkinPoint.y - cy;
-            if (normX * toPointX + normY * toPointY < 0)
-            {
-                normX = -normX;
-                normY = -normY;
-            }
-
-            dirX = normX;
-            dirY = normY;
-            return true;
         }
 
         private static bool AssignSegmentSafely(Structure target, SegmentVolume seg)
@@ -4154,7 +4056,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.19.0.0";
+                Title = "Generic Crop Structure Generator - v5.19.1.0";
                 Width = 1250;
                 Height = 960;
                 MinWidth = 1000;
