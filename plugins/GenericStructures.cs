@@ -854,6 +854,21 @@
 //               ticked (or the BOLUS structure is removed/renamed) -
 //               previously this case proceeded silently, ignoring the
 //               existing physical bolus.
+//   v5.24.0.0 – ProgressWindow "vitals monitor" visual tweaks: (1) status
+//               text now Orange + Bold; (2) heart glyph fill/glow changed
+//               to Red (was the theme's cyan accent); (3) heart + ECG
+//               shrunk ~30% (heart FontSize 40->28; ECG path geometry
+//               recomputed from its original 380x50 area down to 266x25 -
+//               25 being ~10% shorter than the new 28-unit heart size, as
+//               requested - StrokeDashArray/Offset re-derived to 188 for
+//               the shorter path); (4) new static "done" state (DoneXaml,
+//               green #2ECC71 heart+ECG, motionless) swapped in via new
+//               ShowCompleted() once Report() first sees percent>=100 -
+//               holds for 3 seconds so it's actually visible, then closes
+//               the window itself. Added SafeClose() (try/catch around
+//               Close()) so the caller's own pre-existing finally-block
+//               Close() can't throw on an already-self-closed window; all
+//               5 call sites updated from Close() to SafeClose().
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -879,8 +894,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.23.0.0")]
-[assembly: AssemblyFileVersion("5.23.0.0")]
+[assembly: AssemblyVersion("5.24.0.0")]
+[assembly: AssemblyFileVersion("5.24.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -1066,18 +1081,20 @@ namespace VMS.TPS
             // the @keyframes heartbeat timings/values exactly (0%/12%/24%/
             // 36%/48%/100% of a 0.9s cycle -> 1.0/1.28/1.0/1.16/1.0/1.0), and
             // the ECG Path's StrokeDashOffset animates from its dash length
-            // down to 0 over 2.2s linear, both looping forever - the same
-            // shape as @keyframes pulse-line's stroke-dashoffset 480->0 (CSS
-            // dasharray units are absolute; WPF's are multiples of
-            // StrokeThickness, so 480/StrokeThickness(2.5) = 192 here for an
-            // equivalent visual scale against this path's own ~732-unit
-            // length). Both glow via DropShadowEffect, matching the CSS
-            // drop-shadow filters using the same AccentCyan the window's own
-            // theme already uses in place of --accent-color.
+            // down to 0 over 2.2s linear, both looping forever until
+            // ShowCompleted() swaps this out for the static DoneXaml below.
+            // The path/heart are sized down ~30% from the original design
+            // (FontSize 40->28, path scaled from an original 380x50 area to
+            // 266x25 - the ECG's own height, 25, works out ~10% shorter than
+            // the heart's new 28), and StrokeDashArray/Offset (188, in
+            // StrokeThickness(2.5)-relative units) is re-derived for this
+            // smaller path's shorter length. Both glow via DropShadowEffect,
+            // matching the CSS drop-shadow filters - now in red (heart fill)
+            // to match the requested heart color.
             private const string PulseXaml = @"
 <Grid xmlns=""http://schemas.microsoft.com/winfx/2006/xaml/presentation""
       xmlns:x=""http://schemas.microsoft.com/winfx/2006/xaml""
-      Height=""64"">
+      Height=""36"">
     <Grid.Resources>
         <Storyboard x:Key=""HeartbeatAnim"">
             <DoubleAnimationUsingKeyFrames Storyboard.TargetName=""HeartScale"" Storyboard.TargetProperty=""ScaleX""
@@ -1101,7 +1118,7 @@ namespace VMS.TPS
         </Storyboard>
         <Storyboard x:Key=""PulseLineAnim"">
             <DoubleAnimation Storyboard.TargetName=""EcgPath"" Storyboard.TargetProperty=""StrokeDashOffset""
-                              From=""293"" To=""0"" Duration=""0:0:2.2"" RepeatBehavior=""Forever"" />
+                              From=""188"" To=""0"" Duration=""0:0:2.2"" RepeatBehavior=""Forever"" />
         </Storyboard>
     </Grid.Resources>
     <Grid.Triggers>
@@ -1113,26 +1130,53 @@ namespace VMS.TPS
 
     <Path x:Name=""EcgPath"" Stroke=""#00E5FF"" StrokeThickness=""2.5""
           StrokeStartLineCap=""Round"" StrokeEndLineCap=""Round"" StrokeLineJoin=""Round""
-          StrokeDashArray=""293 293"" VerticalAlignment=""Center"" Margin=""54,0,0,0""
-          Data=""M0,35 L20,35 L28,20 L36,35 L42,55 L48,5 L54,45 L60,35 L110,35 L130,35 L138,20 L146,35 L152,55 L158,5 L164,45 L170,35 L220,35 L240,35 L248,20 L256,35 L262,55 L268,5 L274,45 L280,35 L380,35"">
+          StrokeDashArray=""188 188"" VerticalAlignment=""Center"" Margin=""40,0,0,0""
+          Data=""M0,15 L14,15 L20,8 L25,15 L29,25 L34,0 L38,20 L42,15 L77,15 L91,15 L97,8 L102,15 L106,25 L111,0 L115,20 L119,15 L154,15 L168,15 L174,8 L179,15 L183,25 L188,0 L192,20 L196,15 L266,15"">
         <Path.Effect>
             <DropShadowEffect Color=""#00E5FF"" BlurRadius=""10"" ShadowDepth=""0"" Opacity=""0.9"" />
         </Path.Effect>
     </Path>
 
-    <TextBlock Text=""&#10084;&#65039;"" FontSize=""40"" Foreground=""#00E5FF""
+    <TextBlock Text=""&#10084;&#65039;"" FontSize=""28"" Foreground=""Red""
                VerticalAlignment=""Center"" HorizontalAlignment=""Left""
                RenderTransformOrigin=""0.5,0.5"">
         <TextBlock.RenderTransform>
             <ScaleTransform x:Name=""HeartScale"" ScaleX=""1"" ScaleY=""1"" />
         </TextBlock.RenderTransform>
         <TextBlock.Effect>
-            <DropShadowEffect Color=""#00E5FF"" BlurRadius=""10"" ShadowDepth=""0"" Opacity=""0.9"" />
+            <DropShadowEffect Color=""Red"" BlurRadius=""10"" ShadowDepth=""0"" Opacity=""0.9"" />
+        </TextBlock.Effect>
+    </TextBlock>
+</Grid>";
+
+            // Static "done" state shown once Report() reaches 100%: same
+            // heart + ECG shapes as PulseXaml but motionless and green,
+            // swapped in for the looping cyan/red pulse via ShowCompleted().
+            // Starts Collapsed - nothing shows until completion.
+            private const string DoneXaml = @"
+<Grid xmlns=""http://schemas.microsoft.com/winfx/2006/xaml/presentation""
+      xmlns:x=""http://schemas.microsoft.com/winfx/2006/xaml""
+      Height=""36"" Visibility=""Collapsed"">
+    <Path Stroke=""#2ECC71"" StrokeThickness=""2.5""
+          StrokeStartLineCap=""Round"" StrokeEndLineCap=""Round"" StrokeLineJoin=""Round""
+          VerticalAlignment=""Center"" Margin=""40,0,0,0""
+          Data=""M0,15 L14,15 L20,8 L25,15 L29,25 L34,0 L38,20 L42,15 L77,15 L91,15 L97,8 L102,15 L106,25 L111,0 L115,20 L119,15 L154,15 L168,15 L174,8 L179,15 L183,25 L188,0 L192,20 L196,15 L266,15"">
+        <Path.Effect>
+            <DropShadowEffect Color=""#2ECC71"" BlurRadius=""10"" ShadowDepth=""0"" Opacity=""0.9"" />
+        </Path.Effect>
+    </Path>
+    <TextBlock Text=""&#10084;&#65039;"" FontSize=""28"" Foreground=""#2ECC71""
+               VerticalAlignment=""Center"" HorizontalAlignment=""Left"">
+        <TextBlock.Effect>
+            <DropShadowEffect Color=""#2ECC71"" BlurRadius=""10"" ShadowDepth=""0"" Opacity=""0.9"" />
         </TextBlock.Effect>
     </TextBlock>
 </Grid>";
 
             private readonly TextBlock _status;
+            private UIElement _pulseHost;
+            private UIElement _doneHost;
+            private bool _completed;
 
             public ProgressWindow(Window owner, string title)
             {
@@ -1154,13 +1198,12 @@ namespace VMS.TPS
                     WindowStartupLocation = WindowStartupLocation.CenterScreen;
                 }
 
-                Brush bg = Brushes.White, textFg = Brushes.Black, borderBr = Brushes.Gray;
+                Brush bg = Brushes.White, borderBr = Brushes.Gray;
                 try
                 {
                     var dict = (ResourceDictionary)XamlReader.Parse(ThemeXaml);
                     Resources.MergedDictionaries.Add(dict);
                     bg = (Brush)FindResource("BgBrush");
-                    textFg = (Brush)FindResource("TextPrimary");
                     borderBr = (Brush)FindResource("BorderBrush");
                 }
                 catch { /* fall back to the plain-color defaults above */ }
@@ -1176,7 +1219,8 @@ namespace VMS.TPS
                 _status = new TextBlock
                 {
                     Text = "Starting...",
-                    Foreground = textFg,
+                    Foreground = Brushes.Orange,
+                    FontWeight = FontWeights.Bold,
                     Margin = new Thickness(0, 0, 0, 10),
                     TextWrapping = TextWrapping.Wrap
                 };
@@ -1184,10 +1228,17 @@ namespace VMS.TPS
 
                 try
                 {
-                    var pulse = (UIElement)XamlReader.Parse(PulseXaml);
-                    panel.Children.Add(pulse);
+                    _pulseHost = (UIElement)XamlReader.Parse(PulseXaml);
+                    panel.Children.Add(_pulseHost);
                 }
                 catch { /* no animation if the XAML parse ever fails - status text alone still works */ }
+
+                try
+                {
+                    _doneHost = (UIElement)XamlReader.Parse(DoneXaml);
+                    panel.Children.Add(_doneHost);
+                }
+                catch { /* if this fails, ShowCompleted() just leaves the pulse as-is */ }
 
                 outerBorder.Child = panel;
                 Content = outerBorder;
@@ -1198,6 +1249,37 @@ namespace VMS.TPS
                 int pct = Math.Max(0, Math.Min(100, percent));
                 if (!string.IsNullOrEmpty(status)) _status.Text = $"{status}  ({pct}%)";
                 Dispatcher.Invoke(() => { }, System.Windows.Threading.DispatcherPriority.Background);
+
+                if (pct >= 100 && !_completed)
+                {
+                    _completed = true;
+                    ShowCompleted();
+                }
+            }
+
+            // Swaps the looping cyan/red pulse for the static green "done"
+            // state, holds for 3 seconds so it's actually visible, then
+            // closes the window itself - independent of whatever the caller
+            // does afterward (e.g. a completion MessageBox), so this window
+            // doesn't linger on-screen once the work is actually done. The
+            // 3-second hold blocks synchronously, same as every other Report()
+            // call already does implicitly on this single-threaded pipeline.
+            private void ShowCompleted()
+            {
+                if (_pulseHost != null) _pulseHost.Visibility = Visibility.Collapsed;
+                if (_doneHost != null) _doneHost.Visibility = Visibility.Visible;
+                Dispatcher.Invoke(() => { }, System.Windows.Threading.DispatcherPriority.Render);
+
+                System.Threading.Thread.Sleep(3000);
+                SafeClose();
+            }
+
+            // Wraps Close() so a caller's own finally-block Close() (already
+            // in place at every call site) is harmless even though
+            // ShowCompleted() may have already closed this window itself.
+            public void SafeClose()
+            {
+                try { Close(); } catch { /* already closed - nothing to do */ }
             }
         }
 
@@ -1286,7 +1368,7 @@ namespace VMS.TPS
             }
             finally
             {
-                progressWin.Close();
+                progressWin.SafeClose();
             }
         }
 
@@ -4503,7 +4585,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.23.0.0";
+                Title = "Generic Crop Structure Generator - v5.24.0.0";
                 Width = 1250;
                 Height = 960;
                 MinWidth = 1000;
@@ -6177,7 +6259,7 @@ namespace VMS.TPS
                     }
                     finally
                     {
-                        progressWin.Close();
+                        progressWin.SafeClose();
                     }
 
                     var msg = new StringBuilder();
@@ -6374,7 +6456,7 @@ namespace VMS.TPS
                     }
                     finally
                     {
-                        progressWin.Close();
+                        progressWin.SafeClose();
                     }
 
                     var msg = new StringBuilder();
@@ -6590,7 +6672,7 @@ namespace VMS.TPS
                     }
                     finally
                     {
-                        progressWin.Close();
+                        progressWin.SafeClose();
                     }
 
                     var msg = allCreated.Count > 0
@@ -7510,7 +7592,7 @@ namespace VMS.TPS
                     }
                     finally
                     {
-                        progressWin.Close();
+                        progressWin.SafeClose();
                     }
 
                     if (errors.Count > 0)
