@@ -752,6 +752,21 @@
 //               actually expected. SafePerpendicularMargin and
 //               TryComputeSkinNormalAtTip are removed entirely - nothing
 //               else used them.
+//   v5.19.2.0 – ProgressWindow now matches OptimisationStructureWindow's
+//               dark theme (BgBrush/TextPrimary/BorderBrush/AccentCyan,
+//               same palette) instead of default WPF white/system colors -
+//               dark background, light status text, a themed border, and
+//               a custom ControlTemplate on the progress bar itself
+//               (PanelBrush track, AccentCyan fill, rounded corners)
+//               instead of the OS-default chrome. Palette is duplicated
+//               into its own small ResourceDictionary rather than reusing
+//               OptimisationStructureWindow.ThemeXaml, since that constant
+//               is private to that class and ProgressWindow can be shown
+//               even after the main window has already closed (e.g. Eval
+//               mode's StructureProcessor.Run(), which runs post-
+//               ShowDialog). Falls back to plain white/black/gray if the
+//               XAML parse ever fails. Only the content area is themed -
+//               the native tool-window title bar chrome is unchanged.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -777,8 +792,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.19.1.0")]
-[assembly: AssemblyFileVersion("5.19.1.0")]
+[assembly: AssemblyVersion("5.19.2.0")]
+[assembly: AssemblyFileVersion("5.19.2.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -910,8 +925,53 @@ namespace VMS.TPS
         // actually happen before the caller resumes its synchronous work,
         // so the bar/text visibly move instead of only flashing once at
         // the very end.
+        //
+        // Styled to match OptimisationStructureWindow's dark theme
+        // (same palette, duplicated here as a small standalone
+        // ResourceDictionary since OptimisationStructureWindow.ThemeXaml is
+        // private to that class and this window can be shown even after
+        // the main window has already closed - e.g. Eval mode's
+        // StructureProcessor.Run(), which runs post-ShowDialog). Only the
+        // content area is themed; the native tool-window title bar chrome
+        // is left as-is.
         private sealed class ProgressWindow : Window
         {
+            private const string ThemeXaml = @"
+<ResourceDictionary xmlns=""http://schemas.microsoft.com/winfx/2006/xaml/presentation""
+                    xmlns:x=""http://schemas.microsoft.com/winfx/2006/xaml"">
+    <SolidColorBrush x:Key=""BgBrush""       Color=""#181B21"" />
+    <SolidColorBrush x:Key=""PanelBrush""    Color=""#21252D"" />
+    <SolidColorBrush x:Key=""TextPrimary""   Color=""#DCE1E8"" />
+    <SolidColorBrush x:Key=""TextSecondary"" Color=""#8B94A5"" />
+    <SolidColorBrush x:Key=""AccentCyan""    Color=""#00E5FF"" />
+    <SolidColorBrush x:Key=""BorderBrush""   Color=""#2E3440"" />
+
+    <Style TargetType=""ProgressBar"">
+        <Setter Property=""Background"" Value=""{StaticResource PanelBrush}"" />
+        <Setter Property=""Foreground"" Value=""{StaticResource AccentCyan}"" />
+        <Setter Property=""BorderBrush"" Value=""{StaticResource BorderBrush}"" />
+        <Setter Property=""BorderThickness"" Value=""1"" />
+        <Setter Property=""Template"">
+            <Setter.Value>
+                <ControlTemplate TargetType=""ProgressBar"">
+                    <Border Background=""{TemplateBinding Background}""
+                            BorderBrush=""{TemplateBinding BorderBrush}""
+                            BorderThickness=""{TemplateBinding BorderThickness}""
+                            CornerRadius=""4"">
+                        <Grid ClipToBounds=""True"" Margin=""1"">
+                            <Rectangle x:Name=""PART_Track"" Fill=""Transparent"" />
+                            <Rectangle x:Name=""PART_Indicator""
+                                       Fill=""{TemplateBinding Foreground}""
+                                       HorizontalAlignment=""Left""
+                                       RadiusX=""3"" RadiusY=""3"" />
+                        </Grid>
+                    </Border>
+                </ControlTemplate>
+            </Setter.Value>
+        </Setter>
+    </Style>
+</ResourceDictionary>";
+
             private readonly ProgressBar _bar;
             private readonly TextBlock _status;
 
@@ -935,10 +995,29 @@ namespace VMS.TPS
                     WindowStartupLocation = WindowStartupLocation.CenterScreen;
                 }
 
+                Brush bg = Brushes.White, textFg = Brushes.Black, borderBr = Brushes.Gray;
+                try
+                {
+                    var dict = (ResourceDictionary)XamlReader.Parse(ThemeXaml);
+                    Resources.MergedDictionaries.Add(dict);
+                    bg = (Brush)FindResource("BgBrush");
+                    textFg = (Brush)FindResource("TextPrimary");
+                    borderBr = (Brush)FindResource("BorderBrush");
+                }
+                catch { /* fall back to the plain-color defaults above */ }
+
+                Background = bg;
+
+                var outerBorder = new Border
+                {
+                    BorderBrush = borderBr,
+                    BorderThickness = new Thickness(1)
+                };
                 var panel = new StackPanel { Margin = new Thickness(18) };
                 _status = new TextBlock
                 {
                     Text = "Starting...",
+                    Foreground = textFg,
                     Margin = new Thickness(0, 0, 0, 12),
                     TextWrapping = TextWrapping.Wrap
                 };
@@ -947,7 +1026,8 @@ namespace VMS.TPS
                 _bar = new ProgressBar { Minimum = 0, Maximum = 100, Value = 0, Height = 18 };
                 panel.Children.Add(_bar);
 
-                Content = panel;
+                outerBorder.Child = panel;
+                Content = outerBorder;
             }
 
             public void Report(string status, int percent)
@@ -4056,7 +4136,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.19.1.0";
+                Title = "Generic Crop Structure Generator - v5.19.2.0";
                 Width = 1250;
                 Height = 960;
                 MinWidth = 1000;
