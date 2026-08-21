@@ -836,6 +836,24 @@
 //               itself runs continuously and independently of percent,
 //               like a real vitals monitor signalling "still working"
 //               rather than literal progress.
+//   v5.23.0.0 – Breast Opto tab: (1) Targets table now prefills Dose (Gy)
+//               = 50 (BREAST_DEFAULT_DOSE_GY, only when GuessDoseFromName
+//               found nothing from the structure's own name) and Suffix
+//               for name-matched PTVs: nodal-looking names ("_N_"/"_LN_"/
+//               "node") get Suffix "LN"; chest-wall-looking names
+//               ("chest"/"_CW_") get "CW"; breast-looking names
+//               ("breast") get "Br" - see new LooksLikeNodalPtvName/
+//               LooksLikeChestWallPtvName/LooksLikeBreastPtvName helpers,
+//               applied once in Execute() right after vmBreast is built.
+//               Purely a starting suggestion, freely editable in the grid.
+//               (2) CommitSelections() gained the inverse of the existing
+//               "Physical Bolus ticked but no BOLUS structure found"
+//               check: if a BOLUS-type structure already exists in the
+//               structure set but "Physical Bolus present" is NOT ticked,
+//               a warning now blocks Generate Structures until it's
+//               ticked (or the BOLUS structure is removed/renamed) -
+//               previously this case proceeded silently, ignoring the
+//               existing physical bolus.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -861,8 +879,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.22.0.0")]
-[assembly: AssemblyFileVersion("5.22.0.0")]
+[assembly: AssemblyVersion("5.23.0.0")]
+[assembly: AssemblyFileVersion("5.23.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -878,6 +896,12 @@ namespace VMS.TPS
         private const double RING_OUTER_EXPAND_MM = 10.0;
         private const double DEFAULT_PRV_MARGIN_MM = 2.0;
         private const double AVOIDANCE_MARGIN_MM = 35.0;
+
+        // Breast Opto tab only: default Dose (Gy) prefilled into the Targets
+        // table for nodal/chest-wall/breast-named PTVs when no dose could be
+        // guessed from the structure's own name (see LooksLikeNodalPtvName/
+        // LooksLikeChestWallPtvName/LooksLikeBreastPtvName + Execute()).
+        private const double BREAST_DEFAULT_DOSE_GY = 50.0;
 
         // Generic-tab-only avoidance/ring constants (Breast Opto keeps the
         // constants above instead; z_Ring_1/z_Ring_2 reuse RCC's own zone
@@ -1227,6 +1251,27 @@ namespace VMS.TPS
             var vmGeneric = new UiModel(targetCandidates, oarCandidates, externals) { IsGenericTab = true };
             var vmBreast = new UiModel(targetCandidates, oarCandidates, externals);
             var vmRcc = new UiModel(targetCandidates, oarCandidates, externals);
+
+            // Breast Opto tab only: name-based Targets table defaults. Dose
+            // only fills in when GuessDoseFromName found nothing (an
+            // explicit dose already encoded in the name, e.g. "PTV60_LN",
+            // is left alone); Suffix always fills in, since there's no
+            // existing suffix-guessing to conflict with. See
+            // LooksLikeNodalPtvName/LooksLikeChestWallPtvName/
+            // LooksLikeBreastPtvName above for the exact matching rules.
+            foreach (var row in vmBreast.TargetDoseRows)
+            {
+                string suffix = LooksLikeNodalPtvName(row.TargetId) ? "LN"
+                    : LooksLikeChestWallPtvName(row.TargetId) ? "CW"
+                    : LooksLikeBreastPtvName(row.TargetId) ? "Br"
+                    : null;
+                if (suffix == null) continue;
+
+                if (string.IsNullOrWhiteSpace(row.DoseGy))
+                    row.DoseGy = BREAST_DEFAULT_DOSE_GY.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+                row.Suffix = suffix;
+            }
+
             var win = new OptimisationStructureWindow(vmGeneric, vmBreast, vmRcc, ss);
 
             if (win.ShowDialog() != true || win.ConfirmedVm == null) return;
@@ -3473,6 +3518,31 @@ namespace VMS.TPS
             return false;
         }
 
+        // Breast Opto tab only: name-based defaults for the Targets table's
+        // Dose (Gy) and Suffix columns (see UiModel construction in
+        // Execute()). Uses "_"/string-boundary segmentation (same
+        // convention as IsTargetByName's LN check above) rather than a bare
+        // substring match, so e.g. "PTVN" or "Chestnut" don't false-positive
+        // just for containing the letter "n" - only a standalone "N"/"LN"
+        // token (surrounded by "_" or the start/end of the id) counts as
+        // nodal. These are only ever a starting suggestion the user can
+        // freely edit/override in the grid, never a binding clinical
+        // decision, so an imperfect match on an unusual naming convention
+        // is low-stakes.
+        private static bool LooksLikeNodalPtvName(string id) =>
+            !string.IsNullOrEmpty(id) &&
+            (Regex.IsMatch(id, @"(^|_)N($|_)", RegexOptions.IgnoreCase) ||
+             Regex.IsMatch(id, @"(^|_)LN($|_)", RegexOptions.IgnoreCase) ||
+             id.IndexOf("node", StringComparison.OrdinalIgnoreCase) >= 0);
+
+        private static bool LooksLikeChestWallPtvName(string id) =>
+            !string.IsNullOrEmpty(id) &&
+            (id.IndexOf("chest", StringComparison.OrdinalIgnoreCase) >= 0 ||
+             Regex.IsMatch(id, @"(^|_)CW($|_)", RegexOptions.IgnoreCase));
+
+        private static bool LooksLikeBreastPtvName(string id) =>
+            !string.IsNullOrEmpty(id) && id.IndexOf("breast", StringComparison.OrdinalIgnoreCase) >= 0;
+
         private static bool ContainsToken(string id, string token)
         {
             if (string.IsNullOrEmpty(id) || string.IsNullOrEmpty(token)) return false;
@@ -4433,7 +4503,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.22.0.0";
+                Title = "Generic Crop Structure Generator - v5.23.0.0";
                 Width = 1250;
                 Height = 960;
                 MinWidth = 1000;
@@ -6663,6 +6733,32 @@ namespace VMS.TPS
                                 "\"Physical Bolus present\" is ticked, but no structure with DICOM type BOLUS was found in this structure set.\n\n" +
                                 "Please add the bolus via Insert → New Bolus... in Eclipse before running this script, or untick the Physical Bolus option.",
                                 "Missing BOLUS Structure", MessageBoxButton.OK, MessageBoxImage.Error);
+                            return false;
+                        }
+                    }
+
+                    // ----------------------------------------------------------------
+                    // Inverse of the check above: a BOLUS structure already exists in
+                    // the structure set, but "Physical Bolus present" isn't ticked -
+                    // proceeding as-is would silently ignore it (Virtual Bolus would
+                    // be generated against the plain body, not on top of the real
+                    // bolus surface). Block until the user either ticks it or removes/
+                    // renames the BOLUS structure.
+                    // ----------------------------------------------------------------
+                    if (IsBreast && !_vm.HasPhysicalBolus)
+                    {
+                        var existingBolus = _ss.Structures.FirstOrDefault(s =>
+                            s != null && !s.IsEmpty &&
+                            string.Equals(s.DicomType, "BOLUS", StringComparison.OrdinalIgnoreCase) &&
+                            !string.Equals(s.Id, "Bolus_physical", StringComparison.OrdinalIgnoreCase));
+
+                        if (existingBolus != null)
+                        {
+                            MessageBox.Show(_owner,
+                                $"A BOLUS structure (\"{existingBolus.Id}\") exists in this structure set, but \"Physical Bolus present\" is not ticked.\n\n" +
+                                "Tick \"Physical Bolus present\" before proceeding, so the Virtual Bolus pipeline builds on top of it correctly, " +
+                                "or remove/rename the BOLUS structure if it isn't meant to be used here.",
+                                "Physical Bolus Not Selected", MessageBoxButton.OK, MessageBoxImage.Warning);
                             return false;
                         }
                     }
