@@ -936,6 +936,25 @@
 //               scales with contour complexity/resolution) and wasn't
 //               something this pass could remove further without
 //               changing the resulting geometry.
+//   v5.28.0.0 – Generic tab: stopped showing "5) Virtual Bolus Pipeline"
+//               in the progress window during Generic runs. Root cause:
+//               Run() called Step5_VirtualBolus unconditionally through
+//               RunStep() (which reports its label/percent before the
+//               step body even executes) regardless of tab, but Generic's
+//               Targets grid never adds the Bolus (mm) column at all
+//               (OptimisationStructureWindow only adds _colBolus when
+//               IsBreast is true) - so bolusRequests is always empty on
+//               Generic and Step5_VirtualBolus's own first line (`if
+//               (bolusRequests == null || bolusRequests.Count == 0)
+//               return null;`) made it a guaranteed no-op there. No bolus
+//               geometry was ever actually built on Generic - the label
+//               was cosmetic noise from a shared pipeline. Now Run() skips
+//               the RunStep() call entirely on Generic and logs a plain
+//               "SKIP: not applicable to the Generic tab" line in the
+//               results text instead; _totalSteps is now a flat 10 for
+//               both tabs (previously 11 for Generic/10 for Breast Opto -
+//               Generic replaces Step5 in the count with Step10's Rind,
+//               so the RunStep() call count still matches on both paths).
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -961,8 +980,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.27.0.0")]
-[assembly: AssemblyFileVersion("5.27.0.0")]
+[assembly: AssemblyVersion("5.28.0.0")]
+[assembly: AssemblyFileVersion("5.28.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -1669,7 +1688,13 @@ namespace VMS.TPS
                                             null, _fb, "BodyMinus3", globalTg);
 
                         bool isGeneric = _vm.IsGenericTab;
-                        _totalSteps = isGeneric ? 11 : 10;
+                        // Both tabs count 10 RunStep() calls: non-generic runs
+                        // 1,2,3a,3b,4,5,6,7,8,9 (including Step5's Virtual Bolus
+                        // Pipeline); Generic instead runs 1,2,3a,3b,4,6,7,8,9,10
+                        // (Step5 is skipped outright below - Generic has no Bolus
+                        // column at all, so it's a guaranteed no-op there - and
+                        // Step10's Rind takes its place in the count).
+                        _totalSteps = 10;
 
                         // Each step runs through RunStep() so an exception in one
                         // (e.g. Step3a) can't silently abort every step after it -
@@ -1714,9 +1739,25 @@ namespace VMS.TPS
                         // Step5: pass physicalBolus (null if not used).
                         // When non-null, Step5 builds Body_with_Bolus = body Or physicalBolus
                         // and uses it as the skin baseline. Steps 6-9 still use selectedExternal.
-                        RunStep("5) Virtual Bolus Pipeline", () => Step5_VirtualBolus(
-                            bolusRequests, selectedExternal, isLeft, globalTg,
-                            physicalBolus, _vm.PhysicalBolusThicknessMm, optSum));
+                        // Generic's Targets grid never adds the Bolus (mm) column at all
+                        // (OptimisationStructureWindow only adds _colBolus when IsBreast is
+                        // true), so TargetDoseRow.BolusMm stays empty for every Generic row
+                        // and bolusRequests is always empty there - Step5_VirtualBolus's own
+                        // first line (`if (bolusRequests == null || bolusRequests.Count == 0)
+                        // return null;`) makes it a guaranteed no-op on Generic. Skip calling
+                        // it at all in that case so its "Virtual Bolus Pipeline" progress
+                        // label never shows on a tab that has no bolus feature to run.
+                        if (isGeneric)
+                        {
+                            LogSection("5) Virtual Bolus Pipeline");
+                            _progress.AppendLine("  SKIP: not applicable to the Generic tab (no Bolus column)");
+                        }
+                        else
+                        {
+                            RunStep("5) Virtual Bolus Pipeline", () => Step5_VirtualBolus(
+                                bolusRequests, selectedExternal, isLeft, globalTg,
+                                physicalBolus, _vm.PhysicalBolusThicknessMm, optSum));
+                        }
 
                         RunStep("6) z_[OAR]_Ovl_[dose]",
                             () => Step6_Overlaps(organRows, doseLevels, selectedExternal));
@@ -4625,7 +4666,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.27.0.0";
+                Title = "Generic Crop Structure Generator - v5.28.0.0";
                 Width = 1250;
                 Height = 960;
                 MinWidth = 1000;
