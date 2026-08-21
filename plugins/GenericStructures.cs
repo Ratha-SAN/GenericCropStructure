@@ -784,6 +784,30 @@
 //               one of Generic/RCC/Breast-Opto-physical-bolus on the same
 //               structure set will overwrite whichever ring pair ran
 //               first. Skipped entirely if Body_new couldn't be built.
+//   v5.21.0.0 – Breast Opto Physical Bolus mode, superseding v5.20.0.0's
+//               z_Ring_1/z_Ring_2 approach per follow-up feedback:
+//               (1) rings now UPDATE the existing per-dose zRing_{dose}_1/
+//               zRing_{dose}_2 ids (the ones Step9_Rings already builds)
+//               instead of creating separate z_Ring_1/z_Ring_2 structures -
+//               one pair per distinct dose among the bolus-requesting
+//               targets. Step9_Rings runs AFTER Step5 and would otherwise
+//               unconditionally rebuild those same ids with its own
+//               formula, so a new _physicalBolusRingDoses set tracks which
+//               doses Step5 already claimed and Step9_Rings skips them.
+//               (2) the ring base is now an in-memory-only union of
+//               z_PTV_opt_sum and z_Virtual_PTV (Or'd together, never
+//               itself kept as a structure) instead of z_Virtual_PTV
+//               alone - Step5_VirtualBolus gained a new `optSum` parameter
+//               (the global z_PTV_opt_sum built earlier by Step3b, already
+//               available by the time Step5 runs) to make this possible.
+//               (3) zAvoidance_{dose} (the same per-dose id Step4's
+//               automatic avoidance already builds) is ALSO rebuilt from
+//               that same union: ext Sub (union +32mm), capped to ext -
+//               new VB_RING_AVOIDANCE_MARGIN_MM (32.0) constant, replacing
+//               the default 35mm (AVOIDANCE_MARGIN_MM) for the affected
+//               dose(s) only. Ring gap/thickness (4mm gap + 1cm thick each,
+//               contiguous) and the Body_new-minus-2mm ring crop are
+//               unchanged from v5.20.0.0.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -809,8 +833,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.20.0.0")]
-[assembly: AssemblyFileVersion("5.20.0.0")]
+[assembly: AssemblyVersion("5.21.0.0")]
+[assembly: AssemblyFileVersion("5.21.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -841,8 +865,9 @@ namespace VMS.TPS
         private const double VB_OPT_INWARD_MM = 5.0;  // expansion magnitude for Virtual_PTV_Opt (no physical bolus)
         private const double VB_PHYS_OPT_EXPAND_MM = 4.0;  // ant+lat expansion of z_PTV_opt for z_Virtual_PTV_Opt (physical bolus mode)
         private const double VB_PHYS_BOLUS_OPT_MARGIN_MM = 4.0;  // isotropic (all-direction) margin around Bolus_phys_Opt used as an in-memory crop boundary for z_Virtual_PTV_Opt (physical bolus mode)
-        private const double VB_RING_GAP_MM = 4.0;  // gap from z_Virtual_PTV to z_Ring_1's inner boundary (physical bolus mode); z_Ring_2's inner boundary is this + VB_RING_THICKNESS_MM
-        private const double VB_RING_THICKNESS_MM = 10.0;  // thickness (1cm) of both z_Ring_1 and z_Ring_2 (physical bolus mode)
+        private const double VB_RING_GAP_MM = 4.0;  // gap from the z_PTV_opt_sum/z_Virtual_PTV union to zRing_{dose}_1's inner boundary (physical bolus mode); zRing_{dose}_2's inner boundary is this + VB_RING_THICKNESS_MM
+        private const double VB_RING_THICKNESS_MM = 10.0;  // thickness (1cm) of both zRing_{dose}_1 and zRing_{dose}_2 (physical bolus mode)
+        private const double VB_RING_AVOIDANCE_MARGIN_MM = 32.0;  // gap (3.2cm) from the z_PTV_opt_sum/z_Virtual_PTV union used to rebuild zAvoidance_{dose} (physical bolus mode) - replaces the default AVOIDANCE_MARGIN_MM (35mm) for the affected dose(s)
 
         private static readonly double[] PhysicalBolusThicknessOptionsMm = { 5.0, 10.0, 15.0, 20.0 };
 
@@ -1179,6 +1204,14 @@ namespace VMS.TPS
             // Keyed by dose only – see KNOWN LIMITATIONS note at top of file
             private readonly Dictionary<double, Structure> _zOptDoseSum = new Dictionary<double, Structure>();
 
+            // Breast Opto, Physical Bolus mode only: doses whose zRing_{dose}_1/
+            // _2 were already rebuilt by Step5_VirtualBolus using the physical-
+            // bolus-specific formula. Step9_Rings (which runs AFTER Step5 and
+            // would otherwise unconditionally rebuild the exact same ids with
+            // its own dose-level-sum-based formula) checks this set and skips
+            // any dose already claimed here, so Step5's update actually sticks.
+            private readonly HashSet<double> _physicalBolusRingDoses = new HashSet<double>();
+
             // Optional progress callback (label, percent 0-100) - fired once
             // at the start of every RunStep() below. Null in any context that
             // doesn't want a progress window (there is none currently, but
@@ -1440,7 +1473,7 @@ namespace VMS.TPS
                         // and uses it as the skin baseline. Steps 6-9 still use selectedExternal.
                         RunStep("5) Virtual Bolus Pipeline", () => Step5_VirtualBolus(
                             bolusRequests, selectedExternal, isLeft, globalTg,
-                            physicalBolus, _vm.PhysicalBolusThicknessMm));
+                            physicalBolus, _vm.PhysicalBolusThicknessMm, optSum));
 
                         RunStep("6) z_[OAR]_Ovl_[dose]",
                             () => Step6_Overlaps(organRows, doseLevels, selectedExternal));
@@ -1863,7 +1896,8 @@ namespace VMS.TPS
                 bool isLeft,
                 TempGuard globalTg,
                 Structure physicalBolus,        // NEW PARAMETER (v3.0.0.30)
-                double physicalThicknessMm)     // NEW PARAMETER (v3.0.0.32)
+                double physicalThicknessMm,     // NEW PARAMETER (v3.0.0.32)
+                Structure optSum)               // NEW PARAMETER (v5.21.0.0) - global z_PTV_opt_sum, for the physical-bolus-mode zRing_{dose}_1/_2 + zAvoidance_{dose} update
             {
                 if (bolusRequests == null || bolusRequests.Count == 0) return null;
                 LogSection("5) Virtual Bolus Pipeline");
@@ -2263,25 +2297,56 @@ namespace VMS.TPS
                         }
 
                         // ========================================================
-                        // STEP 6 (physical bolus mode only): z_Ring_1 / z_Ring_2
-                        // falloff rings around z_Virtual_PTV (the "extended"
-                        // virtual PTV, not the plain z_PTV_opt_sum).
-                        //   z_Ring_1 = (z_Virtual_PTV +14mm) Sub (z_Virtual_PTV +4mm)
-                        //              -> 4mm gap, VB_RING_THICKNESS_MM (1cm) thick.
-                        //   z_Ring_2 = (z_Virtual_PTV +24mm) Sub (z_Virtual_PTV +14mm)
-                        //              -> starts exactly where Ring 1 ends (14mm
-                        //              gap), same 1cm thickness.
-                        // Both cropped to remove whatever part extends outside
-                        // Body_new, capped 2mm inward (SafeMargin(Body_new,
-                        // -VB_SKIN_CROP_MM)) - the same skin-trim convention
-                        // already used for z_Virtual_Bolus above.
+                        // STEP 6 (physical bolus mode only): UPDATE the existing
+                        // zRing_{dose}_1 / zRing_{dose}_2 / zAvoidance_{dose}
+                        // structures (built earlier by Step9_Rings/Step4_
+                        // Avoidance) for every dose among the bolus-requesting
+                        // targets - not new structures - using an in-memory
+                        // union of z_PTV_opt_sum and z_Virtual_PTV as the base
+                        // instead of z_Virtual_PTV alone.
+                        //   union = z_PTV_opt_sum Or z_Virtual_PTV (in memory
+                        //           only, never itself kept as a structure).
+                        //   zRing_{dose}_1 = (union +14mm) Sub (union +4mm)
+                        //                    -> 4mm gap, 1cm thick.
+                        //   zRing_{dose}_2 = (union +24mm) Sub (union +14mm)
+                        //                    -> starts where Ring 1 ends (14mm
+                        //                    gap), same 1cm thick. Both cropped
+                        //                    to remove whatever extends outside
+                        //                    Body_new, capped 2mm inward
+                        //                    (SafeMargin(Body_new,
+                        //                    -VB_SKIN_CROP_MM)), same skin-trim
+                        //                    convention as z_Virtual_Bolus above.
+                        //   zAvoidance_{dose} = ext Sub (union +32mm), capped to
+                        //                       ext - the same "ext minus
+                        //                       expanded base" pattern Step4's
+                        //                       automatic per-dose avoidance
+                        //                       already uses, just with this
+                        //                       union as the base and 32mm
+                        //                       (VB_RING_AVOIDANCE_MARGIN_MM)
+                        //                       instead of the default 35mm
+                        //                       (AVOIDANCE_MARGIN_MM).
+                        // Because Step9_Rings runs AFTER this step and would
+                        // otherwise unconditionally rebuild the same
+                        // zRing_{dose}_1/_2 ids with its own dose-level-sum
+                        // formula, every dose updated here is recorded in
+                        // _physicalBolusRingDoses so Step9_Rings can skip it.
                         // ========================================================
                         if (bodyNew == null)
                         {
-                            _progress.AppendLine("  SKIP: z_Ring_1/z_Ring_2 (Body_new not available)");
+                            _progress.AppendLine("  SKIP: zRing_{dose}_1/_2/zAvoidance_{dose} update (Body_new not available)");
                         }
                         else
                         {
+                            var unionSeg = (optSum != null && !optSum.IsEmpty)
+                                ? SafeBoolean(_ss, optSum.SegmentVolume, zVirtualPtv.SegmentVolume,
+                                      BoolOp.Or, optSum, zVirtualPtv, null, _fb,
+                                      "VB_RingBase_OptSumOrVPtv", tg)
+                                : zVirtualPtv.SegmentVolume;
+                            var unionSt = tg.Add(_ss.AddStructure("CONTROL", MakeUniqueId(_ss, "zVB_RingBase")));
+                            if (zVirtualPtv.IsHighResolution && !unionSt.IsHighResolution)
+                                unionSt.ConvertToHighResolution();
+                            AssignSegmentSafely(unionSt, unionSeg);
+
                             double ring1InnerMm = VB_RING_GAP_MM;
                             double ring1OuterMm = VB_RING_GAP_MM + VB_RING_THICKNESS_MM;
                             double ring2InnerMm = ring1OuterMm;
@@ -2293,14 +2358,20 @@ namespace VMS.TPS
                                 bodyCapSt.ConvertToHighResolution();
                             AssignSegmentSafely(bodyCapSt, bodyCapSeg);
 
+                            var avoidExpSeg = SafeMargin(unionSeg, VB_RING_AVOIDANCE_MARGIN_MM);
+                            var avoidExpSt = tg.Add(_ss.AddStructure("CONTROL", MakeUniqueId(_ss, "zVB_AvoidExp")));
+                            if (unionSt.IsHighResolution && !avoidExpSt.IsHighResolution)
+                                avoidExpSt.ConvertToHighResolution();
+                            AssignSegmentSafely(avoidExpSt, avoidExpSeg);
+
                             void BuildVirtualBolusRing(double innerMm, double outerMm, string ringId)
                             {
-                                var innerSeg = SafeMargin(zVirtualPtv.SegmentVolume, innerMm);
-                                var outerSeg = SafeMargin(zVirtualPtv.SegmentVolume, outerMm);
+                                var innerSeg = SafeMargin(unionSeg, innerMm);
+                                var outerSeg = SafeMargin(unionSeg, outerMm);
                                 var innerSt = tg.Add(_ss.AddStructure("CONTROL", MakeUniqueId(_ss, "zVB_RingInner")));
                                 var outerSt = tg.Add(_ss.AddStructure("CONTROL", MakeUniqueId(_ss, "zVB_RingOuter")));
-                                if (zVirtualPtv.IsHighResolution && !innerSt.IsHighResolution) innerSt.ConvertToHighResolution();
-                                if (zVirtualPtv.IsHighResolution && !outerSt.IsHighResolution) outerSt.ConvertToHighResolution();
+                                if (unionSt.IsHighResolution && !innerSt.IsHighResolution) innerSt.ConvertToHighResolution();
+                                if (unionSt.IsHighResolution && !outerSt.IsHighResolution) outerSt.ConvertToHighResolution();
                                 AssignSegmentSafely(innerSt, innerSeg);
                                 AssignSegmentSafely(outerSt, outerSeg);
 
@@ -2333,8 +2404,33 @@ namespace VMS.TPS
                                 }
                             }
 
-                            BuildVirtualBolusRing(ring1InnerMm, ring1OuterMm, "z_Ring_1");
-                            BuildVirtualBolusRing(ring2InnerMm, ring2OuterMm, "z_Ring_2");
+                            void BuildVirtualBolusAvoidance(string avoidId)
+                            {
+                                var avoidanceSeg = SafeBoolean(_ss, ext.SegmentVolume, avoidExpSeg, BoolOp.Sub,
+                                    ext, avoidExpSt, avoidId, _fb, $"VBAvoid_{avoidId}_ExtMinusExpUnion", tg);
+                                if (avoidanceSeg != null)
+                                    avoidanceSeg = SafeBoolean(_ss, avoidanceSeg, ext.SegmentVolume, BoolOp.And,
+                                        null, ext, avoidId, _fb, $"VBAvoid_{avoidId}_CapExt", tg);
+
+                                if (avoidanceSeg == null)
+                                {
+                                    _progress.AppendLine($"  SKIP: {avoidId} (empty)");
+                                    return;
+                                }
+
+                                var avoidSt = GetOrCreate(_ss, "CONTROL", avoidId);
+                                if (AssignSegmentSafely(avoidSt, avoidanceSeg)) LogCreated(avoidId);
+                                else { _ss.RemoveStructure(avoidSt); _progress.AppendLine($"  SKIP: {avoidId} (Empty volume)"); }
+                            }
+
+                            foreach (var d in bolusRequests.Select(r => r.DoseGy).Distinct())
+                            {
+                                string doseStr = d.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                                BuildVirtualBolusRing(ring1InnerMm, ring1OuterMm, $"zRing_{doseStr}_1");
+                                BuildVirtualBolusRing(ring2InnerMm, ring2OuterMm, $"zRing_{doseStr}_2");
+                                BuildVirtualBolusAvoidance(TruncId($"zAvoidance_{doseStr}"));
+                                _physicalBolusRingDoses.Add(d);
+                            }
                         }
 
                         return bodyNew;
@@ -2750,6 +2846,18 @@ namespace VMS.TPS
                 foreach (var d in doseLevels)
                 {
                     string doseStr = d.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+                    // Breast Opto, Physical Bolus mode: Step5_VirtualBolus
+                    // already rebuilt zRing_{dose}_1/_2 for this dose with its
+                    // own union-based formula (see _physicalBolusRingDoses) -
+                    // don't overwrite that here with the plain per-dose-sum
+                    // formula below.
+                    if (_physicalBolusRingDoses.Contains(d))
+                    {
+                        _progress.AppendLine($"  SKIP: zRing_{doseStr}_1/_2 (already built by Physical Bolus pipeline)");
+                        continue;
+                    }
+
                     if (!_zOptDoseSum.TryGetValue(d, out var optSt)) continue;
 
                     try
@@ -4230,7 +4338,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.20.0.0";
+                Title = "Generic Crop Structure Generator - v5.21.0.0";
                 Width = 1250;
                 Height = 960;
                 MinWidth = 1000;
