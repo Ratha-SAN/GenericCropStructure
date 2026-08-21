@@ -972,6 +972,29 @@
 //               respects ApplyTargetFilter()'s active Filter, so "select
 //               all" only affects what's actually visible.
 //
+//   v5.30.0.0 – Generic tab, Nested mode: fixed a real freeze when ticking
+//               an organ's "Nested" box. RefreshNestedPtvOptions() bulk-
+//               assigned every OrganRow's NestedPtvOption, and each
+//               assignment fires OrganRow.PropertyChanged -> which
+//               _rowPropertyChanged routed straight back into
+//               RefreshNestedPtvOptions() itself, reentrantly, before the
+//               outer assignment loop had even finished - so ticking one
+//               organ triggered a reentrant call per remaining OrganRow
+//               (O(n) recursion depth), each level redoing the full
+//               rebuild plus _rowPropertyChanged's other work (including
+//               RefreshAutoStructurePreview(), not cheap) for O(n^2) total
+//               work. Added a _inRefreshNestedPtvOptions reentrancy guard
+//               so nested calls now no-op instead of recursing. Also: the
+//               "PTV (z_PTV_opt)" column previously showed a picker on
+//               every organ row and defaulted them all to the highest-dose
+//               PTV, whether or not "Nested" was ticked - changed to a
+//               DataGridTemplateColumn whose ComboBox is Visible only when
+//               that row's NestedSparing is true (Collapsed otherwise via
+//               a DataTrigger), and the auto-default in
+//               RefreshNestedPtvOptions() now only applies to
+//               NestedSparing-ticked rows, so the picker only ever appears
+//               on the organ row that's actually selected.
+//
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
 //     but differ by suffix, Step3a will overwrite the first entry and Step9 rings will only
@@ -996,8 +1019,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.29.0.0")]
-[assembly: AssemblyFileVersion("5.29.0.0")]
+[assembly: AssemblyVersion("5.30.0.0")]
+[assembly: AssemblyFileVersion("5.30.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -4682,7 +4705,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.29.0.0";
+                Title = "Generic Crop Structure Generator - v5.30.0.0";
                 Width = 1250;
                 Height = 960;
                 MinWidth = 1000;
@@ -5854,20 +5877,70 @@ namespace VMS.TPS
                 // PRV. Ticking "Nested" no longer touches the Auto Structures
                 // table - DoNestedCreate/EnsurePtvOpt build/find the picked
                 // PTV_Opt on their own, independent of it.
+                // Cell template for the "PTV (z_PTV_opt)" column below: a
+                // ComboBox that's only Visible on rows where "Nested" is
+                // ticked (DataTrigger on OrganRow.NestedSparing), Collapsed
+                // otherwise - so the picker only ever appears on the
+                // selected organ's own row instead of every row in the
+                // column. ItemsSource is smuggled in via the DataGrid's own
+                // Tag property (set to _nestedPtvOptions in
+                // AddOrganNestedColumns below) and read back with a
+                // RelativeSource binding, since a DataTemplate parsed from a
+                // plain XAML string has no direct way to reference an
+                // instance field.
+                private const string NestedPtvCellTemplateXaml = @"
+<DataTemplate xmlns=""http://schemas.microsoft.com/winfx/2006/xaml/presentation""
+              xmlns:x=""http://schemas.microsoft.com/winfx/2006/xaml"">
+    <ComboBox DisplayMemberPath=""DisplayId""
+              ItemsSource=""{Binding RelativeSource={RelativeSource AncestorType=DataGrid}, Path=Tag}""
+              SelectedItem=""{Binding NestedPtvOption, Mode=TwoWay}"">
+        <ComboBox.Style>
+            <Style TargetType=""ComboBox"">
+                <Setter Property=""Visibility"" Value=""Collapsed"" />
+                <Style.Triggers>
+                    <DataTrigger Binding=""{Binding NestedSparing}"" Value=""True"">
+                        <Setter Property=""Visibility"" Value=""Visible"" />
+                    </DataTrigger>
+                </Style.Triggers>
+            </Style>
+        </ComboBox.Style>
+    </ComboBox>
+</DataTemplate>";
+
                 private void AddOrganNestedColumns()
                 {
                     AddBoolColumn(_dgOrgans, _vm.OrganRows, "Nested",
                         (r, v) => r.NestedSparing = v, nameof(OrganRow.NestedSparing), 70,
                         () => { });
 
-                    _dgOrgans.Columns.Add(new DataGridComboBoxColumn
+                    _dgOrgans.Tag = _nestedPtvOptions;
+
+                    DataGridColumn ptvCol;
+                    try
                     {
-                        Header = "PTV (z_PTV_opt)",
-                        ItemsSource = _nestedPtvOptions,
-                        DisplayMemberPath = nameof(NestedPtvOption.DisplayId),
-                        SelectedItemBinding = new Binding(nameof(OrganRow.NestedPtvOption)) { Mode = BindingMode.TwoWay },
-                        Width = 170
-                    });
+                        ptvCol = new DataGridTemplateColumn
+                        {
+                            Header = "PTV (z_PTV_opt)",
+                            CellTemplate = (DataTemplate)XamlReader.Parse(NestedPtvCellTemplateXaml),
+                            Width = 170
+                        };
+                    }
+                    catch
+                    {
+                        // Fallback: same combo shown on every row (old
+                        // behavior) if the inline XAML template ever fails
+                        // to parse, so Nested mode's PTV picker still works
+                        // even in that edge case.
+                        ptvCol = new DataGridComboBoxColumn
+                        {
+                            Header = "PTV (z_PTV_opt)",
+                            ItemsSource = _nestedPtvOptions,
+                            DisplayMemberPath = nameof(NestedPtvOption.DisplayId),
+                            SelectedItemBinding = new Binding(nameof(OrganRow.NestedPtvOption)) { Mode = BindingMode.TwoWay },
+                            Width = 170
+                        };
+                    }
+                    _dgOrgans.Columns.Add(ptvCol);
 
                     _dgOrgans.Columns.Add(new DataGridTextColumn
                     {
@@ -5883,50 +5956,76 @@ namespace VMS.TPS
                 // Organs grid combo column reads from - the exact same
                 // z_PTV_opt_{dose}{suffix} ids RefreshAutoStructurePreview
                 // would list for the currently ticked/valid-dose targets.
+                // Guards against a genuine freeze: assigning oar.NestedPtvOption
+                // below fires OrganRow.PropertyChanged, which _rowPropertyChanged
+                // routes straight back into this same method (still inside the
+                // loop that's doing the assigning). Without this guard, each
+                // assignment recursively re-entered RefreshNestedPtvOptions
+                // before the outer loop's next iteration even ran, so ticking
+                // one organ's "Nested" box triggered one reentrant call per
+                // remaining OrganRow - O(n) recursion depth, each level redoing
+                // the full O(n) rebuild (including the comparatively expensive
+                // RefreshAutoStructurePreview() that _rowPropertyChanged also
+                // calls on every property change) for O(n^2) total work. With
+                // enough OAR candidates in the structure set this reads as the
+                // whole window locking up the instant an organ row is ticked.
+                private bool _inRefreshNestedPtvOptions;
+
                 private void RefreshNestedPtvOptions()
                 {
-                    var groupKeys = _vm.TargetDoseRows
-                        .Where(r => r.IsSelected && r.ParsedDoseGy.HasValue && r.ParsedDoseGy.Value > 0)
-                        .Select(r => new OptKey(r.ParsedDoseGy.Value, (r.Suffix ?? "").Trim()))
-                        .Distinct()
-                        .OrderByDescending(k => k.DoseGy)
-                        .ThenBy(k => k.Suffix, StringComparer.OrdinalIgnoreCase)
-                        .ToList();
-
-                    var stillValid = new HashSet<string>(groupKeys.Select(k =>
-                        TruncId($"z_PTV_opt_{k.DoseGy.ToString(System.Globalization.CultureInfo.InvariantCulture)}{(string.IsNullOrWhiteSpace(k.Suffix) ? "" : "_" + k.Suffix)}")),
-                        StringComparer.OrdinalIgnoreCase);
-
-                    // Clear a row's pick if its option no longer exists (dose/
-                    // suffix was edited or unticked away) instead of leaving it
-                    // pointed at a stale option object.
-                    foreach (var oar in _vm.OrganRows)
-                        if (oar.NestedPtvOption != null && !stillValid.Contains(oar.NestedPtvOption.DisplayId))
-                            oar.NestedPtvOption = null;
-
-                    _nestedPtvOptions.Clear();
-                    foreach (var k in groupKeys)
+                    if (_inRefreshNestedPtvOptions) return;
+                    _inRefreshNestedPtvOptions = true;
+                    try
                     {
-                        string doseStr = k.DoseGy.ToString(System.Globalization.CultureInfo.InvariantCulture);
-                        string sfxStr = string.IsNullOrWhiteSpace(k.Suffix) ? "" : "_" + k.Suffix;
-                        _nestedPtvOptions.Add(new NestedPtvOption
-                        {
-                            DisplayId = TruncId($"z_PTV_opt_{doseStr}{sfxStr}"),
-                            DoseGy = k.DoseGy,
-                            Suffix = k.Suffix
-                        });
-                    }
+                        var groupKeys = _vm.TargetDoseRows
+                            .Where(r => r.IsSelected && r.ParsedDoseGy.HasValue && r.ParsedDoseGy.Value > 0)
+                            .Select(r => new OptKey(r.ParsedDoseGy.Value, (r.Suffix ?? "").Trim()))
+                            .Distinct()
+                            .OrderByDescending(k => k.DoseGy)
+                            .ThenBy(k => k.Suffix, StringComparer.OrdinalIgnoreCase)
+                            .ToList();
 
-                    // groupKeys is sorted highest-dose-first, so the first
-                    // option built above is the highest-dose PTV - default
-                    // every organ row without a pick yet to it, so the PTV
-                    // column shows a sensible choice instead of blank.
-                    if (_nestedPtvOptions.Count > 0)
-                    {
-                        var highestDose = _nestedPtvOptions[0];
+                        var stillValid = new HashSet<string>(groupKeys.Select(k =>
+                            TruncId($"z_PTV_opt_{k.DoseGy.ToString(System.Globalization.CultureInfo.InvariantCulture)}{(string.IsNullOrWhiteSpace(k.Suffix) ? "" : "_" + k.Suffix)}")),
+                            StringComparer.OrdinalIgnoreCase);
+
+                        // Clear a row's pick if its option no longer exists (dose/
+                        // suffix was edited or unticked away) instead of leaving it
+                        // pointed at a stale option object.
                         foreach (var oar in _vm.OrganRows)
-                            if (oar.NestedPtvOption == null)
-                                oar.NestedPtvOption = highestDose;
+                            if (oar.NestedPtvOption != null && !stillValid.Contains(oar.NestedPtvOption.DisplayId))
+                                oar.NestedPtvOption = null;
+
+                        _nestedPtvOptions.Clear();
+                        foreach (var k in groupKeys)
+                        {
+                            string doseStr = k.DoseGy.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                            string sfxStr = string.IsNullOrWhiteSpace(k.Suffix) ? "" : "_" + k.Suffix;
+                            _nestedPtvOptions.Add(new NestedPtvOption
+                            {
+                                DisplayId = TruncId($"z_PTV_opt_{doseStr}{sfxStr}"),
+                                DoseGy = k.DoseGy,
+                                Suffix = k.Suffix
+                            });
+                        }
+
+                        // groupKeys is sorted highest-dose-first, so the first
+                        // option built above is the highest-dose PTV - default
+                        // only organs with "Nested" ticked and no pick yet to it
+                        // (the PTV picker itself is now hidden for un-ticked rows
+                        // too - see AddOrganNestedColumns - so there's no reason
+                        // to pre-fill a value nobody can see).
+                        if (_nestedPtvOptions.Count > 0)
+                        {
+                            var highestDose = _nestedPtvOptions[0];
+                            foreach (var oar in _vm.OrganRows)
+                                if (oar.NestedSparing && oar.NestedPtvOption == null)
+                                    oar.NestedPtvOption = highestDose;
+                        }
+                    }
+                    finally
+                    {
+                        _inRefreshNestedPtvOptions = false;
                     }
                 }
 
