@@ -808,6 +808,11 @@
 //               dose(s) only. Ring gap/thickness (4mm gap + 1cm thick each,
 //               contiguous) and the Body_new-minus-2mm ring crop are
 //               unchanged from v5.20.0.0.
+//   v5.21.1.0 – Breast Opto Physical Bolus mode, zAvoidance_{dose} formula
+//               correction: base is now Body_new (not ext), and the result
+//               is no longer capped back to ext afterward -
+//               zAvoidance_{dose} = Body_new Sub (union +32mm), kept as-is.
+//               Rings are unaffected by this change.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -833,8 +838,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.21.0.0")]
-[assembly: AssemblyFileVersion("5.21.0.0")]
+[assembly: AssemblyVersion("5.21.1.0")]
+[assembly: AssemblyFileVersion("5.21.1.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -2316,15 +2321,18 @@ namespace VMS.TPS
                         //                    (SafeMargin(Body_new,
                         //                    -VB_SKIN_CROP_MM)), same skin-trim
                         //                    convention as z_Virtual_Bolus above.
-                        //   zAvoidance_{dose} = ext Sub (union +32mm), capped to
-                        //                       ext - the same "ext minus
-                        //                       expanded base" pattern Step4's
-                        //                       automatic per-dose avoidance
-                        //                       already uses, just with this
-                        //                       union as the base and 32mm
+                        //   zAvoidance_{dose} = Body_new Sub (union +32mm), NOT
+                        //                       capped back to ext/Body_new -
+                        //                       unlike Step4's own automatic
+                        //                       per-dose avoidance (which
+                        //                       subtracts from ext and then
+                        //                       caps to ext), this one's base
+                        //                       is Body_new (not ext) and the
+                        //                       subtraction result is kept
+                        //                       as-is. New 32mm
                         //                       (VB_RING_AVOIDANCE_MARGIN_MM)
-                        //                       instead of the default 35mm
-                        //                       (AVOIDANCE_MARGIN_MM).
+                        //                       margin, replacing the default
+                        //                       35mm (AVOIDANCE_MARGIN_MM).
                         // Because Step9_Rings runs AFTER this step and would
                         // otherwise unconditionally rebuild the same
                         // zRing_{dose}_1/_2 ids with its own dose-level-sum
@@ -2406,11 +2414,8 @@ namespace VMS.TPS
 
                             void BuildVirtualBolusAvoidance(string avoidId)
                             {
-                                var avoidanceSeg = SafeBoolean(_ss, ext.SegmentVolume, avoidExpSeg, BoolOp.Sub,
-                                    ext, avoidExpSt, avoidId, _fb, $"VBAvoid_{avoidId}_ExtMinusExpUnion", tg);
-                                if (avoidanceSeg != null)
-                                    avoidanceSeg = SafeBoolean(_ss, avoidanceSeg, ext.SegmentVolume, BoolOp.And,
-                                        null, ext, avoidId, _fb, $"VBAvoid_{avoidId}_CapExt", tg);
+                                var avoidanceSeg = SafeBoolean(_ss, bodyNew.SegmentVolume, avoidExpSeg, BoolOp.Sub,
+                                    bodyNew, avoidExpSt, avoidId, _fb, $"VBAvoid_{avoidId}_BodyNewMinusExpUnion", tg);
 
                                 if (avoidanceSeg == null)
                                 {
@@ -4338,7 +4343,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.21.0.0";
+                Title = "Generic Crop Structure Generator - v5.21.1.0";
                 Width = 1250;
                 Height = 960;
                 MinWidth = 1000;
