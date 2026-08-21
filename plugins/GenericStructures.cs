@@ -994,6 +994,25 @@
 //               RefreshNestedPtvOptions() now only applies to
 //               NestedSparing-ticked rows, so the picker only ever appears
 //               on the organ row that's actually selected.
+//   v5.31.0.0 – Fixed TruncId dropping an OAR's L/R laterality on Nested
+//               shell ids. z_oar_in_ptv_hr{level} puts the OAR's own
+//               "_L"/"_R" marker in the middle of the id (e.g.
+//               "z_Lung_L_in_ptv_hr1"), not at the end - TruncId's
+//               laterality check only ever looked at the very end of the
+//               string, so it never matched here, and worse, a lone
+//               "_L_"/"_R_" token doesn't even survive AbbreviateName's
+//               own word-tokenizer regex (underscores count as \w, so its
+//               \b boundary check never fires around a single flanked
+//               letter) - it was silently dropped rather than shortened.
+//               Confirmed this was a real ID-collision bug, not just
+//               cosmetic: "z_Lung_L_in_ptv_hr1" and "z_Lung_R_in_ptv_hr1"
+//               both truncated to the identical "zLunginptvhr1", so the
+//               left and right lung's nested shells would silently reuse/
+//               overwrite the same structure. TruncId now also looks for
+//               a laterality token embedded between underscores when no
+//               trailing one is found, pulls it out the same way, and
+//               reattaches it after abbreviating the rest - so it's
+//               prioritized/preserved instead of vanishing.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -1019,8 +1038,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.30.0.0")]
-[assembly: AssemblyFileVersion("5.30.0.0")]
+[assembly: AssemblyVersion("5.31.0.0")]
+[assembly: AssemblyFileVersion("5.31.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -3857,6 +3876,28 @@ namespace VMS.TPS
                 }
             }
 
+            // Nested-mode ids like "z_Lung_L_in_ptv_hr1" carry the OAR's own
+            // laterality marker in the middle, not at the end (more text
+            // follows describing what it's nested inside) - the check above
+            // only ever finds a trailing marker, so this never matched for
+            // Nested shells. Left unhandled, a lone "_L_"/"_R_" token doesn't
+            // even survive AbbreviateName's word-tokenizer regex (underscores
+            // count as \w, so its \b boundary check never fires around a
+            // single flanked letter) - it silently vanishes rather than just
+            // getting shortened. Look for one embedded between underscores
+            // when no trailing marker was found, and prioritize it the same
+            // way: pull it out, abbreviate everything else to fit, then
+            // reattach it untouched.
+            if (suffix.Length == 0)
+            {
+                var embedded = Regex.Match(core, @"_(Left|Right|L|R)_", RegexOptions.IgnoreCase);
+                if (embedded.Success)
+                {
+                    suffix = "_" + embedded.Groups[1].Value;
+                    core = core.Substring(0, embedded.Index) + "_" + core.Substring(embedded.Index + embedded.Length);
+                }
+            }
+
             if (suffix.Equals("_Left", StringComparison.OrdinalIgnoreCase)) suffix = "_L";
             if (suffix.Equals("_Right", StringComparison.OrdinalIgnoreCase)) suffix = "_R";
 
@@ -4705,7 +4746,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.30.0.0";
+                Title = "Generic Crop Structure Generator - v5.31.0.0";
                 Width = 1250;
                 Height = 960;
                 MinWidth = 1000;
