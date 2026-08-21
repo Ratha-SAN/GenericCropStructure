@@ -714,6 +714,26 @@
 //               was just a confusing side effect with no real purpose. The
 //               "PTV (z_PTV_opt)" picker column on the Organs grid is
 //               unchanged.
+//   v5.19.0.0 – Breast Opto, Physical Bolus mode, two formula changes:
+//               (1) z_Virtual_PTV's ant+lat expansion is now bolusMm input +
+//               VB_EXTRA_EXPAND_MM (2mm) + the selected physical thickness
+//               (e.g. 10mm input + 2mm + 10mm selected = 22mm), instead of
+//               just bolusMm + physical thickness with no buffer - brings
+//               it in line with the no-physical-bolus branch, which always
+//               included that 2mm buffer.
+//               (2) z_Virtual_PTV_Opt gets an extra crop after its existing
+//               ant+lat-expand-then-cap-to-Body_new construction: it's
+//               further cropped to Bolus_phys_Opt expanded by
+//               VB_PHYS_BOLUS_OPT_MARGIN_MM (4mm) in every direction (new
+//               constant; an in-memory-only working boundary, never itself
+//               kept as a structure) - keeps the optimisation target close
+//               to where the PTV actually overlaps the physical bolus,
+//               rather than extending along the whole expanded-PTV_opt
+//               union. Only applied when Bolus_phys_Opt was itself built
+//               successfully; skipped otherwise (falls back to the prior
+//               cap-to-Body_new-only result). Bolus_phys_Opt is now hoisted
+//               to method scope (was previously a block-local variable) so
+//               Step 4-5 can read it.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -739,8 +759,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.18.0.0")]
-[assembly: AssemblyFileVersion("5.18.0.0")]
+[assembly: AssemblyVersion("5.19.0.0")]
+[assembly: AssemblyFileVersion("5.19.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -765,11 +785,12 @@ namespace VMS.TPS
         private const double GENERIC_HIGHEST_DOSE_RING_GAP_MM = 3.0;  // z_Ring_{dose}: fixed gap from the highest-dose PTV_Opt (not RCC's formula-derived gap)
 
         // Virtual Bolus geometry constants
-        private const double VB_EXTRA_EXPAND_MM = 2.0;  // added to user bolus input for Virtual_PTV expansion (no physical bolus)
+        private const double VB_EXTRA_EXPAND_MM = 2.0;  // added to user bolus input for Virtual_PTV expansion, both with and without physical bolus
         private const double VB_SKIN_CROP_MM = 2.0;  // trim outer shell from Body_new for z_Virtual_Bolus
         private const double VB_OPT_SKIN_CROP_MM = 4.0;  // trim outer shell from Body_new for z_Virtual_PTV_Opt (no physical bolus)
         private const double VB_OPT_INWARD_MM = 5.0;  // expansion magnitude for Virtual_PTV_Opt (no physical bolus)
         private const double VB_PHYS_OPT_EXPAND_MM = 4.0;  // ant+lat expansion of z_PTV_opt for z_Virtual_PTV_Opt (physical bolus mode)
+        private const double VB_PHYS_BOLUS_OPT_MARGIN_MM = 4.0;  // isotropic (all-direction) margin around Bolus_phys_Opt used as an in-memory crop boundary for z_Virtual_PTV_Opt (physical bolus mode)
 
         private static readonly double[] PhysicalBolusThicknessOptionsMm = { 5.0, 10.0, 15.0, 20.0 };
 
@@ -1699,15 +1720,22 @@ namespace VMS.TPS
             // instead of original_body. This places the virtual bolus on top of
             // the physical bolus surface. Steps 6-9 are unaffected.
             //
-            // Pipeline (physical bolus present):
+            // Pipeline (physical bolus present, v3.0.0.32 formulas + current):
             //   0. Body_with_Bolus (temp) = body Or physicalBolus
-            //   1. z_Virtual_PTV  = z_PTV_opt expanded ant+lat, lung subtracted
-            //                       (same as before, but relative to Body_with_Bolus)
-            //   2. zVB_RawBolus (temp) = z_Virtual_PTV Sub Body_with_Bolus
+            //   1. z_Virtual_PTV = union of ticked z_PTV_opt targets, each
+            //      expanded ant+lat by (that target's bolus mm input +
+            //      VB_EXTRA_EXPAND_MM + the selected physical thickness),
+            //      lung subtracted (relative to Body_with_Bolus).
+            //   1b. Bolus_physical = copy of physicalBolus; Bolus_phys_Opt =
+            //       Bolus_physical And z_Virtual_PTV.
             //   3. Body_new = Body_with_Bolus Or z_Virtual_PTV  [CONTROL structure]
-            //   4. z_Virtual_Bolus = rawBolus And SafeMargin(Body_new, -VB_SKIN_CROP_MM)
-            //   5. z_Virtual_PTV_Opt = z_Virtual_Bolus expanded post+inf VB_OPT_INWARD_MM,
-            //                          capped to SafeMargin(Body_new, -VB_OPT_SKIN_CROP_MM)
+            //   4. z_Virtual_Bolus = z_Virtual_PTV Sub Bolus_physical Sub Body.
+            //   5. z_Virtual_PTV_Opt = (union of the same z_PTV_opt targets,
+            //      each expanded ant+lat by VB_PHYS_OPT_EXPAND_MM) capped to
+            //      Body_new, then further cropped to Bolus_phys_Opt expanded
+            //      by VB_PHYS_BOLUS_OPT_MARGIN_MM in every direction (an
+            //      in-memory-only boundary - never itself kept as a structure)
+            //      when Bolus_phys_Opt was built successfully.
             //
             // Pipeline (no physical bolus – original behaviour):
             //   skinRef = original_body (ext) throughout.
@@ -1779,9 +1807,11 @@ namespace VMS.TPS
                     // STEP 1: z_Virtual_PTV
                     //   Union of all z_PTV_opt targets, each expanded ant + lateral
                     //   by totalMm, then subtract ipsilateral lung.
-                    //   totalMm = bolusMm + physicalThicknessMm when Physical Bolus is
-                    //   ticked (v3.0.0.32; no extra buffer), otherwise
-                    //   bolusMm + VB_EXTRA_EXPAND_MM (original behaviour).
+                    //   totalMm = bolusMm + VB_EXTRA_EXPAND_MM + physicalThicknessMm
+                    //   when Physical Bolus is ticked (e.g. 10mm input + 2mm +
+                    //   10mm selected thickness = 22mm), otherwise
+                    //   bolusMm + VB_EXTRA_EXPAND_MM (original behaviour) - both
+                    //   branches now share the same +VB_EXTRA_EXPAND_MM buffer.
                     //   Uses skinRefSt (Body_with_Bolus when physical bolus present).
                     // ============================================================
                     var ipsiLung = FindIpsilateralLung(_ss, isLeft);
@@ -1807,7 +1837,7 @@ namespace VMS.TPS
                         if (!_zOpt.ContainsKey(k)) continue;
 
                         double totalMm = physicalBolus != null
-                            ? req.BolusMm.GetValueOrDefault() + physicalThicknessMm
+                            ? req.BolusMm.GetValueOrDefault() + VB_EXTRA_EXPAND_MM + physicalThicknessMm
                             : req.BolusMm.GetValueOrDefault() + VB_EXTRA_EXPAND_MM;
 
                         var baseSt = tg.Add(_ss.AddStructure("CONTROL", MakeUniqueId(_ss, "zVB_Base")));
@@ -1886,10 +1916,12 @@ namespace VMS.TPS
                     //   Bolus_physical is therefore type CONTROL, matching Body_new
                     //   and the other script-created helper structures.
                     //
-                    //   bolusPhysical is hoisted to method scope (assigned here, used
-                    //   again below in the physical-bolus z_Virtual_Bolus formula).
+                    //   bolusPhysical and bolusPhysOpt are hoisted to method scope
+                    //   (assigned here, used again below in the physical-bolus
+                    //   z_Virtual_Bolus / z_Virtual_PTV_Opt formulas).
                     // ============================================================
                     Structure bolusPhysical = null;
+                    Structure bolusPhysOpt = null;
                     if (physicalBolus != null)
                     {
                         bolusPhysical = GetOrCreate(_ss, "CONTROL", "Bolus_physical");
@@ -1924,15 +1956,16 @@ namespace VMS.TPS
 
                             if (bolusPhysOptSeg != null)
                             {
-                                var bolusPhysOpt = GetOrCreate(_ss, "CONTROL", "Bolus_phys_Opt");
-                                if (AssignSegmentSafely(bolusPhysOpt, bolusPhysOptSeg))
+                                var bolusPhysOptCand = GetOrCreate(_ss, "CONTROL", "Bolus_phys_Opt");
+                                if (AssignSegmentSafely(bolusPhysOptCand, bolusPhysOptSeg))
                                 {
-                                    bolusPhysOpt.Color = Color.FromRgb(255, 200, 0);
+                                    bolusPhysOptCand.Color = Color.FromRgb(255, 200, 0);
                                     LogCreated("Bolus_phys_Opt");
+                                    bolusPhysOpt = bolusPhysOptCand;
                                 }
                                 else
                                 {
-                                    _ss.RemoveStructure(bolusPhysOpt);
+                                    _ss.RemoveStructure(bolusPhysOptCand);
                                     _progress.AppendLine("  SKIP: Bolus_phys_Opt (no overlap with z_Virtual_PTV)");
                                 }
                             }
@@ -1988,11 +2021,14 @@ namespace VMS.TPS
                     if (physicalBolus != null)
                     {
                         // ========================================================
-                        // STEP 4-5 (v3.0.0.32, physical bolus mode):
+                        // STEP 4-5 (physical bolus mode):
                         //   z_Virtual_Bolus   = z_Virtual_PTV Sub Bolus_physical Sub Body
                         //   z_Virtual_PTV_Opt = (union of z_PTV_opt targets feeding
                         //                        z_Virtual_PTV) expanded ant+lat by
-                        //                        VB_PHYS_OPT_EXPAND_MM, capped to Body_new.
+                        //                        VB_PHYS_OPT_EXPAND_MM, capped to Body_new,
+                        //                        then further cropped to Bolus_phys_Opt
+                        //                        expanded by VB_PHYS_BOLUS_OPT_MARGIN_MM in
+                        //                        every direction (in-memory boundary only).
                         // ========================================================
                         var afterPhysBolusSeg = (bolusPhysical != null && !bolusPhysical.IsEmpty)
                             ? SafeBoolean(_ss, zVirtualPtv.SegmentVolume, bolusPhysical.SegmentVolume,
@@ -2066,6 +2102,35 @@ namespace VMS.TPS
                         {
                             _progress.AppendLine("  SKIP: z_Virtual_PTV_Opt (empty after capping to Body_new)");
                             return bodyNew;
+                        }
+
+                        // Crop z_Virtual_PTV_Opt to Bolus_phys_Opt expanded by
+                        // VB_PHYS_BOLUS_OPT_MARGIN_MM in every direction (an
+                        // in-memory-only working boundary, never itself kept as
+                        // a structure) - so the optimisation target stays close
+                        // to where the PTV actually overlaps the physical bolus,
+                        // instead of extending arbitrarily far along the whole
+                        // expanded-PTV_opt union computed above. Only applied
+                        // when Bolus_phys_Opt itself was successfully built.
+                        if (bolusPhysOpt != null && !bolusPhysOpt.IsEmpty)
+                        {
+                            var vPtvOptPreCropSt = tg.Add(_ss.AddStructure("CONTROL",
+                                MakeUniqueId(_ss, "zVB_PhysOptPreCrop")));
+                            if (ptvOptAccSt.IsHighResolution && !vPtvOptPreCropSt.IsHighResolution)
+                                vPtvOptPreCropSt.ConvertToHighResolution();
+                            AssignSegmentSafely(vPtvOptPreCropSt, vPtvOptSegPhys);
+
+                            var physBolus4mmSeg = SafeMargin(bolusPhysOpt.SegmentVolume, VB_PHYS_BOLUS_OPT_MARGIN_MM);
+                            var physBolus4mmSt = tg.Add(_ss.AddStructure("CONTROL",
+                                MakeUniqueId(_ss, "zVB_PhysBol4mm")));
+                            if (bolusPhysOpt.IsHighResolution && !physBolus4mmSt.IsHighResolution)
+                                physBolus4mmSt.ConvertToHighResolution();
+                            AssignSegmentSafely(physBolus4mmSt, physBolus4mmSeg);
+
+                            var croppedSeg = SafeBoolean(_ss, vPtvOptPreCropSt.SegmentVolume, physBolus4mmSeg,
+                                BoolOp.And, vPtvOptPreCropSt, physBolus4mmSt, "z_Virtual_PTV_Opt", _fb,
+                                "VBPhysOpt_CapPhysBolusOptMargin", tg);
+                            if (croppedSeg != null) vPtvOptSegPhys = croppedSeg;
                         }
 
                         var zVPtvOptPhys = GetOrCreate(_ss, "PTV", "z_Virtual_PTV_Opt");
@@ -4089,7 +4154,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.18.0.0";
+                Title = "Generic Crop Structure Generator - v5.19.0.0";
                 Width = 1250;
                 Height = 960;
                 MinWidth = 1000;
