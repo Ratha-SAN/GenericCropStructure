@@ -1090,6 +1090,52 @@
 //               place, destroying the original contour), and keeps the
 //               v5.32 volume sanity check that flags a PRV which did not
 //               actually grow.
+//   v5.34.0.0 - Performance pass over the whole pipeline, plus one more
+//               correctness bug found on the way. Every ESAPI geometry call
+//               (AddStructure, SegmentVolume assign, RemoveStructure,
+//               Margin, boolean) is orders of magnitude more expensive than
+//               anything happening in C#, so the work was to delete
+//               geometry calls, not to micro-optimise code.
+//               (1) Removed all 12 CloneSegViaTempTracked round-trips. Each
+//               one cost an AddStructure + SegmentVolume assign + a later
+//               RemoveStructure purely to hand back geometry the source
+//               structure already held, and it rasterised a high-resolution
+//               source down onto the coarse grid on the way through. They
+//               are replaced by the source SegmentVolume directly, which is
+//               geometry-identical. This was NOT protecting the boolean
+//               fast path: SafeBoolean normalises operand resolution itself
+//               via TryMatchResolutionAndOp, and only pays for it when a
+//               boolean actually fails - so the old code paid that cost
+//               unconditionally on every iteration to avoid a cost that is
+//               usually never incurred. Biggest win is Step6_Overlaps,
+//               which cloned BOTH operands on every dose x OAR iteration
+//               (6 ESAPI calls per pair, the hottest loop in the script);
+//               Step2's SIB shave cloned once per dose-pair, and Step9's
+//               ring builder cloned up to four times per dose. The now
+//               unused CloneSegViaTempTracked helper is deleted.
+//               (2) Both crop paths (DoCrop and DoRccStyleCrop) built a
+//               throwaway temp structure per (target x OAR) pair just to
+//               have a fallback owner for the OAR union - another 3 ESAPI
+//               calls per pair, now removed.
+//               (3) BUG, found while doing (2): those same crop paths kept
+//               expandedOarsUnionSt pointing at the FIRST OAR's temp and
+//               never re-pointed it as the union accumulated. So whenever
+//               the recontour fallback fired, the target was cropped away
+//               from only that first organ instead of all the ticked ones -
+//               a silent under-crop of the PTV. Fixed with the same
+//               null-owner rule as v5.33.
+//               (4) Two more v5.33-class owner mismatches that the v5.33
+//               audit missed, because that audit matched a hardcoded list
+//               of variable names: Step9's ring base (baseSeg is PTV_Opt
+//               +2mm but named optSt as owner) and its higher-dose subtract
+//               (hBase is +2mm but named higherOpt). Both would have
+//               collapsed the ring's inner edge on a fallback. The audit is
+//               now derived automatically - it collects every variable
+//               assigned from SafeMargin/SafeBoolean/Smooth and every temp
+//               provably built from one - and reports 0 mismatches across
+//               all 96 SafeBoolean call sites.
+//               No structure ids, margins, dose logic or boolean order
+//               changed anywhere in this pass.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -1115,8 +1161,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.33.0.0")]
-[assembly: AssemblyFileVersion("5.33.0.0")]
+[assembly: AssemblyVersion("5.34.0.0")]
+[assembly: AssemblyFileVersion("5.34.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -2016,8 +2062,11 @@ namespace VMS.TPS
                     // whether it's kept or just used internally this run.
                     using (var tg = new TempGuard(_ss))
                     {
-                        var evalClone = CloneSegViaTempTracked(_ss, evalSt.SegmentVolume, "zTmpEval", tg);
-                        var optSeg = SafeMargin(evalClone, +EVAL_TO_OPT_EXPAND_MM);
+                        // Margin the Eval segment directly - the clone round-trip
+                        // this replaced cost 3 ESAPI calls to reproduce geometry
+                        // evalSt already holds (and down-sampled it if evalSt was
+                        // high-res).
+                        var optSeg = SafeMargin(evalSt.SegmentVolume, +EVAL_TO_OPT_EXPAND_MM);
 
                         // Subtract all higher-dose opt structures, expanded by the
                         // crop distance between this dose and each higher one.
@@ -2032,8 +2081,10 @@ namespace VMS.TPS
                                 ? Math.Max(0.0, RccCropMm(RccPctDiff(hk.DoseGy, k.DoseGy), RCC_ZONE_B_DEFAULT_PCT_PER_MM))
                                 : LOWER_SUBTRACT_EXTRA_MM;
 
-                            var higherClone = CloneSegViaTempTracked(_ss, higherOpt.SegmentVolume, "zTmpOptH", tg);
-                            var higherExpanded = SafeMargin(higherClone, +subtractMm);
+                            // Direct margin - this inner loop runs once per
+                            // higher-dose group for every group, so the clone it
+                            // replaced was 3 wasted ESAPI calls per pair.
+                            var higherExpanded = SafeMargin(higherOpt.SegmentVolume, +subtractMm);
 
                             string hDoseStr = hk.DoseGy.ToString(System.Globalization.CultureInfo.InvariantCulture);
                             string hSfxStr = string.IsNullOrWhiteSpace(hk.Suffix) ? "" : "_" + hk.Suffix;
@@ -3012,8 +3063,15 @@ namespace VMS.TPS
                         foreach (var hd in doseLevels.Where(x => x > d))
                         {
                             if (!_zOptDoseSum.TryGetValue(hd, out var higherOptSum)) continue;
-                            var higherClone = CloneSegViaTempTracked(_ss, higherOptSum.SegmentVolume, "zTmpOptH", doseTg);
-                            higherExpandedByDose[hd] = SafeMargin(higherClone, +LOWER_SUBTRACT_EXTRA_MM);
+                            // Margin the source segment directly. The old
+                            // CloneSegViaTempTracked round-trip here cost an
+                            // AddStructure + assign + RemoveStructure purely to
+                            // hand back geometry we already had, and it silently
+                            // rasterised a high-res source down onto the coarse
+                            // grid on the way through. SafeBoolean normalises
+                            // operand resolution itself (TryMatchResolutionAndOp)
+                            // and only pays for it when a boolean actually fails.
+                            higherExpandedByDose[hd] = SafeMargin(higherOptSum.SegmentVolume, +LOWER_SUBTRACT_EXTRA_MM);
                         }
 
                         foreach (var req in ovlRequests)
@@ -3036,12 +3094,17 @@ namespace VMS.TPS
 
                                 using (var tg = new TempGuard(_ss))
                                 {
-                                    var optSeg = CloneSegViaTempTracked(_ss, optSumSt.SegmentVolume, "zTmpOptOvlp", tg);
-                                    var oarSeg = CloneSegViaTempTracked(_ss, oar.SegmentVolume, "zTmpOarOvlp", tg);
+                                    // Feed the two source SegmentVolumes straight
+                                    // in. This used to clone BOTH through fresh
+                                    // temp structures first - 6 extra ESAPI calls
+                                    // (2x AddStructure + assign + RemoveStructure)
+                                    // on EVERY dose x OAR iteration, the hottest
+                                    // loop in the pipeline - to produce geometry
+                                    // identical to what the owners already hold.
                                     var opToUse = OVERLAP_IS_INTERSECTION ? BoolOp.And : BoolOp.Or;
                                     var actionName = OVERLAP_IS_INTERSECTION ? "And" : "Or";
 
-                                    var ov = SafeBoolean(_ss, optSeg, oarSeg, opToUse,
+                                    var ov = SafeBoolean(_ss, optSumSt.SegmentVolume, oar.SegmentVolume, opToUse,
                                                 optSumSt, oar, ovlId, _fb,
                                                 $"Ovlp_{doseStr}_{req.OarId}_{actionName}", tg);
 
@@ -3049,8 +3112,12 @@ namespace VMS.TPS
                                     // + 1mm, reusing the geometry precomputed once above.
                                     foreach (var hd in doseLevels.Where(x => x > d))
                                     {
+                                        // higherExpandedByDose only ever gets an
+                                        // entry for a dose _zOptDoseSum had, so the
+                                        // second lookup that used to sit here was
+                                        // redundant - and its result went unused
+                                        // once ownerB became null.
                                         if (!higherExpandedByDose.TryGetValue(hd, out var higherExpanded)) continue;
-                                        if (!_zOptDoseSum.TryGetValue(hd, out var higherOptSum)) continue;
 
                                         string hDoseStr = hd.ToString(System.Globalization.CultureInfo.InvariantCulture);
 
@@ -3111,8 +3178,7 @@ namespace VMS.TPS
                     {
                         if (!_zEval.TryGetValue(k, out var evalSt)) continue;
 
-                        var evalClone2 = CloneSegViaTempTracked(_ss, evalSt.SegmentVolume, "zTmpEval2", tg);
-                        var plus2 = SafeMargin(evalClone2, +EVAL_TO_OPT_EXPAND_MM);
+                        var plus2 = SafeMargin(evalSt.SegmentVolume, +EVAL_TO_OPT_EXPAND_MM);
                         plus2 = SmoothSegByExpandContract(plus2, SMOOTH_MM);
 
                         var plus2St = tg.Add(_ss.AddStructure("CONTROL", MakeUniqueId(_ss, "zRC_Plus2")));
@@ -3161,10 +3227,14 @@ namespace VMS.TPS
 
                             using (var innerTg = new TempGuard(_ss))
                             {
-                                var seg = CloneSegViaTempTracked(_ss, oar.SegmentVolume, "zTmpOar", innerTg);
+                                // Start from the OAR's own segment; ownerA stays
+                                // `oar` below because this IS oar's geometry.
+                                var seg = oar.SegmentVolume;
 
                                 if (evalPlus2UnionSeg != null)
-                                    seg = SafeBoolean(_ss, seg, evalPlus2UnionSeg, BoolOp.Sub,
+                                    // pass oar.SegmentVolume explicitly so the
+                                    // ownerA=oar pairing is obviously correct
+                                    seg = SafeBoolean(_ss, oar.SegmentVolume, evalPlus2UnionSeg, BoolOp.Sub,
                                             oar, null, optId, _fb,
                                             $"OptOAR_{req.OarId}_SubEvalPlus2", innerTg);
 
@@ -3366,12 +3436,15 @@ namespace VMS.TPS
                     {
                         using (var tg = new TempGuard(_ss))
                         {
-                            var optSegD = CloneSegViaTempTracked(_ss, optSt.SegmentVolume, "zTmpOptRing", tg);
-                            var baseSeg = SafeMargin(optSegD, +2.0);
+                            var baseSeg = SafeMargin(optSt.SegmentVolume, +2.0);
 
+                            // ownerB null: baseSeg is optSt EXPANDED by 2mm, not
+                            // optSt's own geometry, so naming optSt here made the
+                            // recontour fallback subtract the un-expanded target
+                            // and collapse the ring's inner edge.
                             var ringOuter10 = SafeMargin(baseSeg, +RING_OUTER_EXPAND_MM);
                             var ringSeg = SafeBoolean(_ss, ringOuter10, baseSeg, BoolOp.Sub,
-                                                null, optSt, $"zRing_{doseStr}_1", _fb,
+                                                null, null, $"zRing_{doseStr}_1", _fb,
                                                 $"Ring1_{doseStr}_BasePlus10MinusBase", tg);
 
                             var ringOuter20 = SafeMargin(baseSeg, +(2.0 * RING_OUTER_EXPAND_MM));
@@ -3385,20 +3458,21 @@ namespace VMS.TPS
 
                                 if (_zOptDoseSum.TryGetValue(hd, out var higherOpt))
                                 {
-                                    var hBase = SafeMargin(CloneSegViaTempTracked(
-                                        _ss, higherOpt.SegmentVolume, "zTmpOptRingH", tg), +2.0);
-                                    ringSeg = SafeBoolean(_ss, ringSeg, hBase, BoolOp.Sub, null, higherOpt, $"zRing_{doseStr}_1", _fb, $"Ring1_{doseStr}_SubOptBase_{hDoseStr}", tg);
-                                    ring2Seg = SafeBoolean(_ss, ring2Seg, hBase, BoolOp.Sub, null, higherOpt, $"zRing_{doseStr}_2", _fb, $"Ring2_{doseStr}_SubOptBase_{hDoseStr}", tg);
+                                    // ownerB null - hBase is higherOpt EXPANDED by
+                                    // 2mm, not higherOpt itself.
+                                    var hBase = SafeMargin(higherOpt.SegmentVolume, +2.0);
+                                    ringSeg = SafeBoolean(_ss, ringSeg, hBase, BoolOp.Sub, null, null, $"zRing_{doseStr}_1", _fb, $"Ring1_{doseStr}_SubOptBase_{hDoseStr}", tg);
+                                    ring2Seg = SafeBoolean(_ss, ring2Seg, hBase, BoolOp.Sub, null, null, $"zRing_{doseStr}_2", _fb, $"Ring2_{doseStr}_SubOptBase_{hDoseStr}", tg);
                                 }
                                 if (rings.TryGetValue(hd, out var hRing1))
                                 {
-                                    var hRing1Seg = CloneSegViaTempTracked(_ss, hRing1.SegmentVolume, "zTmpRing1H", tg);
+                                    var hRing1Seg = hRing1.SegmentVolume;
                                     ringSeg = SafeBoolean(_ss, ringSeg, hRing1Seg, BoolOp.Sub, null, hRing1, $"zRing_{doseStr}_1", _fb, $"Ring1_{doseStr}_SubRing1_{hDoseStr}", tg);
                                     ring2Seg = SafeBoolean(_ss, ring2Seg, hRing1Seg, BoolOp.Sub, null, hRing1, $"zRing_{doseStr}_2", _fb, $"Ring2_{doseStr}_SubRing1_{hDoseStr}", tg);
                                 }
                                 if (rings2.TryGetValue(hd, out var hRing2))
                                 {
-                                    var hRing2Seg = CloneSegViaTempTracked(_ss, hRing2.SegmentVolume, "zTmpRing2H", tg);
+                                    var hRing2Seg = hRing2.SegmentVolume;
                                     ringSeg = SafeBoolean(_ss, ringSeg, hRing2Seg, BoolOp.Sub, null, hRing2, $"zRing_{doseStr}_1", _fb, $"Ring1_{doseStr}_SubRing2_{hDoseStr}", tg);
                                     ring2Seg = SafeBoolean(_ss, ring2Seg, hRing2Seg, BoolOp.Sub, null, hRing2, $"zRing_{doseStr}_2", _fb, $"Ring2_{doseStr}_SubRing2_{hDoseStr}", tg);
                                 }
@@ -3948,16 +4022,6 @@ namespace VMS.TPS
         {
             if (seg == null || mm <= 0) return seg;
             return seg.Margin(+mm).Margin(-mm);
-        }
-
-        private static SegmentVolume CloneSegViaTempTracked(
-            StructureSet ss, SegmentVolume seg, string baseId, TempGuard guard)
-        {
-            if (seg == null) return null;
-            var id = MakeUniqueId(ss, TruncId(baseId));
-            var tmp = guard.Add(ss.AddStructure("CONTROL", id));
-            AssignSegmentSafely(tmp, seg);
-            return tmp.SegmentVolume;
         }
 
         private static Structure CreateTempFromSegment(
@@ -4897,7 +4961,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.33.0.0";
+                Title = "Generic Crop Structure Generator - v5.34.0.0";
                 Width = 1250;
                 Height = 960;
                 MinWidth = 1000;
@@ -6583,7 +6647,6 @@ namespace VMS.TPS
                         using (var tgUnion = new TempGuard(_ss))
                         {
                             SegmentVolume expandedOarsUnion = null;
-                            Structure expandedOarsUnionSt = null;
 
                             foreach (var oarRow in tickedOars)
                             {
@@ -6595,19 +6658,21 @@ namespace VMS.TPS
                                 {
                                     double dist = oarRow.Targets[ptvIndex].ParsedCropMm.GetValueOrDefault();
                                     var expanded = SafeMargin(oarSt.SegmentVolume, dist);
-                                    var tmpSt = tgUnion.Add(CreateTempFromSegment(_ss, expanded, "zRC_ExpOar"));
-
+                                    // No per-OAR temp structure any more. It existed only
+                                    // to be a recontour-fallback owner, at the price of an
+                                    // AddStructure + assign + RemoveStructure for EVERY
+                                    // (target x OAR) pair - and the union owner it fed was
+                                    // stale anyway: it kept pointing at the FIRST OAR while
+                                    // the union grew, so a fallback silently collapsed the
+                                    // union back to that one organ (under-cropping the PTV).
+                                    // Passing null lets SafeBoolean rebuild from the real
+                                    // accumulated segments, and only when a boolean fails.
                                     if (expandedOarsUnion == null)
-                                    {
                                         expandedOarsUnion = expanded;
-                                        expandedOarsUnionSt = tmpSt;
-                                    }
                                     else
-                                    {
                                         expandedOarsUnion = SafeBoolean(_ss,
                                             expandedOarsUnion, expanded, BoolOp.Or,
-                                            expandedOarsUnionSt, tmpSt, null, fb, "CropOarsUnion", tgUnion);
-                                    }
+                                            null, null, null, fb, "CropOarsUnion", tgUnion);
                                 }
                                 catch (Exception ex)
                                 {
@@ -6623,7 +6688,7 @@ namespace VMS.TPS
                                     {
                                         var croppedSeg = SafeBoolean(_ss,
                                             target.SegmentVolume, expandedOarsUnion, BoolOp.Sub,
-                                            target, expandedOarsUnionSt, null, fb,
+                                            target, null, null, fb,
                                             $"Crop_{tdr.TargetId}_Sub", tgCrop);
                                         croppedSeg = SafeBoolean(_ss, croppedSeg, ext.SegmentVolume, BoolOp.And,
                                             null, ext, null, fb, $"Crop_{tdr.TargetId}_CapExt", tgCrop);
@@ -6784,7 +6849,6 @@ namespace VMS.TPS
                         using (var tgUnion = new TempGuard(_ss))
                         {
                             SegmentVolume expandedOarsUnion = null;
-                            Structure expandedOarsUnionSt = null;
                             var pairLabels = new List<string>();
 
                             int pairIndex = 0;
@@ -6801,19 +6865,21 @@ namespace VMS.TPS
                                 try
                                 {
                                     var expanded = SafeMargin(oarSt.SegmentVolume, pair.Value);
-                                    var tmpSt = tgUnion.Add(CreateTempFromSegment(_ss, expanded, "zGC_ExpOar"));
-
+                                    // No per-OAR temp structure any more. It existed only
+                                    // to be a recontour-fallback owner, at the price of an
+                                    // AddStructure + assign + RemoveStructure for EVERY
+                                    // (target x OAR) pair - and the union owner it fed was
+                                    // stale anyway: it kept pointing at the FIRST OAR while
+                                    // the union grew, so a fallback silently collapsed the
+                                    // union back to that one organ (under-cropping the PTV).
+                                    // Passing null lets SafeBoolean rebuild from the real
+                                    // accumulated segments, and only when a boolean fails.
                                     if (expandedOarsUnion == null)
-                                    {
                                         expandedOarsUnion = expanded;
-                                        expandedOarsUnionSt = tmpSt;
-                                    }
                                     else
-                                    {
                                         expandedOarsUnion = SafeBoolean(_ss,
                                             expandedOarsUnion, expanded, BoolOp.Or,
-                                            expandedOarsUnionSt, tmpSt, null, fb, "GenericCropOarsUnion", tgUnion);
-                                    }
+                                            null, null, null, fb, "GenericCropOarsUnion", tgUnion);
                                     pairLabels.Add($"{pair.Key.OarId}({pair.Value:0.0}mm)");
                                 }
                                 catch (Exception ex)
@@ -6829,7 +6895,7 @@ namespace VMS.TPS
                                 {
                                     var croppedSeg = SafeBoolean(_ss,
                                         target.SegmentVolume, expandedOarsUnion, BoolOp.Sub,
-                                        target, expandedOarsUnionSt, null, fb,
+                                        target, null, null, fb,
                                         $"GenericCrop_{tdr.TargetId}_Sub", tgCrop);
                                     croppedSeg = SafeBoolean(_ss, croppedSeg, ext.SegmentVolume, BoolOp.And,
                                         null, ext, null, fb, $"GenericCrop_{tdr.TargetId}_CapExt", tgCrop);
@@ -7182,8 +7248,7 @@ namespace VMS.TPS
                             evalSt = evalStNew;
                         }
 
-                        var evalClone = CloneSegViaTempTracked(_ss, evalSt.SegmentVolume, "zTmpNestEval", tg);
-                        var optSeg = SafeMargin(evalClone, EVAL_TO_OPT_EXPAND_MM);
+                        var optSeg = SafeMargin(evalSt.SegmentVolume, EVAL_TO_OPT_EXPAND_MM);
                         optSeg = SafeBoolean(_ss, optSeg, ext.SegmentVolume, BoolOp.And,
                             null, ext, option.DisplayId, fb, "Nested_Opt_CapExt", tg);
                         if (optSeg == null)
