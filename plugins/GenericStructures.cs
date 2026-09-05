@@ -1136,6 +1136,57 @@
 //               all 96 SafeBoolean call sites.
 //               No structure ids, margins, dose logic or boolean order
 //               changed anywhere in this pass.
+//   v5.35.0.0 - FIXES the PRV failures reported from a real run
+//               ("FAIL: PRV_SpinalCord -> Can not combine segment volumes
+//               because they have different geometries", same for both
+//               cochleae, both optic nerves and the chiasm, while
+//               PRV_Brainstem succeeded). The pattern is the diagnosis:
+//               every failing organ is a small structure contoured at HIGH
+//               RESOLUTION, the one that worked is not. That message is
+//               Eclipse refusing a boolean between a high-resolution and a
+//               standard-resolution SegmentVolume.
+//               Why v5.34 exposed it: the clone round-trip removed there
+//               had been silently DOWN-SAMPLING every high-res organ onto
+//               the coarse grid, which accidentally made the resolutions
+//               match. Removing it was still right (that down-sampling was
+//               destroying the fidelity of exactly these small organs, and
+//               was half of the original "no expansion" bug), but it left
+//               the real mismatch exposed - and neither recovery path
+//               handled it:
+//               (1) TryMatchResolutionAndOp converted its second temp to
+//               high resolution BEFORE assigning, then tried to put the
+//               standard-resolution Body into it. That throws, and its
+//               catch simply retried the identical assignment and threw
+//               again, so the helper returned null for every high-res
+//               organ vs standard-res Body pair. It now builds each
+//               operand into a temp at that operand's OWN resolution first
+//               (assign, and only convert if the assign is refused) and
+//               only then raises the lower one - a conversion that is
+//               legal because the structure already has contours.
+//               (2) SafeBoolean's recontour fallback then built copyA via
+//               CreateTempFromSegment (which preserves high resolution)
+//               and copyB via a plane-by-plane contour copy into a plain
+//               standard-resolution structure, and combined them without
+//               matching. That final op also sat OUTSIDE any try, so the
+//               exception escaped SafeBoolean entirely and failed the
+//               whole structure instead of degrading. Both fixed: the two
+//               copies are resolution-matched first, and the op is
+//               try-guarded so a genuine failure returns null.
+//               New shared helpers MakeResTemp (assign-then-convert, the
+//               only order Eclipse accepts) and MatchResolution (raise the
+//               lower of two NON-EMPTY temps). Both only ever touch temps,
+//               never a real structure. Step7's inline temp creation had
+//               the same convert-an-empty-structure bug and now uses
+//               MakeResTemp too.
+//               Speed: Step8_Prvs builds ONE high-resolution copy of the
+//               Body per run and shares it across every high-res OAR,
+//               instead of letting each organ drive its own whole-Body
+//               conversion inside the fallback - with the six high-res
+//               organs in a typical H&N set that is one expensive
+//               conversion instead of six, and it keeps the fast path so
+//               the fallback is not entered at all. If that conversion
+//               cannot be made the code degrades to the (now working)
+//               SafeBoolean path rather than failing.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -1161,8 +1212,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.34.0.0")]
-[assembly: AssemblyFileVersion("5.34.0.0")]
+[assembly: AssemblyVersion("5.35.0.0")]
+[assembly: AssemblyFileVersion("5.35.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -3181,9 +3232,11 @@ namespace VMS.TPS
                         var plus2 = SafeMargin(evalSt.SegmentVolume, +EVAL_TO_OPT_EXPAND_MM);
                         plus2 = SmoothSegByExpandContract(plus2, SMOOTH_MM);
 
-                        var plus2St = tg.Add(_ss.AddStructure("CONTROL", MakeUniqueId(_ss, "zRC_Plus2")));
-                        try { plus2St.SegmentVolume = plus2; }
-                        catch { plus2St.ConvertToHighResolution(); plus2St.SegmentVolume = plus2; }
+                        // MakeResTemp assigns first and only converts if the
+                        // assign is rejected. The old inline version converted a
+                        // still-EMPTY structure, which Eclipse refuses, so a
+                        // high-resolution Eval threw straight out of this step.
+                        var plus2St = MakeResTemp(_ss, plus2, "zRC_Plus2", tg);
 
                         if (evalPlus2Acc == null)
                         {
@@ -3276,6 +3329,46 @@ namespace VMS.TPS
                     .Where(r => r.CreatePrv && r.ParsedPrvMarginMm.GetValueOrDefault() > 0)
                     .ToList();
                 _progress.AppendLine($"  ({prvRequests.Count} PRV requests)");
+                if (prvRequests.Count == 0) return;
+
+                // A boolean only works when both operands share a resolution, so
+                // a high-resolution organ needs a high-resolution Body to be
+                // capped against. Small OARs (spinal cord, cochleae, optic
+                // nerves, chiasm...) are routinely contoured high-res while the
+                // External is not, which is exactly the pairing that failed with
+                // "Can not combine segment volumes because they have different
+                // geometries". Build that high-res Body AT MOST ONCE and share
+                // it: ConvertToHighResolution on the whole External is one of
+                // the most expensive calls in ESAPI, and doing it per organ
+                // would repeat it for every high-res OAR in the list.
+                using (var stepTg = new TempGuard(_ss))
+                {
+                Structure extHiRes = null;
+                bool extHiResTried = false;
+
+                Structure BodyFor(Structure organ)
+                {
+                    if (organ == null || !organ.IsHighResolution || ext.IsHighResolution) return ext;
+                    if (!extHiResTried)
+                    {
+                        extHiResTried = true;
+                        var t = stepTg.Add(_ss.AddStructure("CONTROL",
+                            MakeUniqueId(_ss, "zTmpPrvBodyHi")));
+                        // Assign at the Body's own resolution FIRST, then
+                        // convert - Eclipse refuses to convert a structure that
+                        // has no contours yet, which is the trap the old code
+                        // fell into.
+                        if (AssignSegmentSafely(t, ext.SegmentVolume) && !t.IsHighResolution)
+                        {
+                            try { t.ConvertToHighResolution(); } catch { /* stay standard res */ }
+                        }
+                        if (!t.IsEmpty && t.IsHighResolution) extHiRes = t;
+                        _progress.AppendLine(extHiRes != null
+                            ? "  (built a high-resolution copy of the Body once, shared by all high-res OARs)"
+                            : "  (could not build a high-resolution Body - high-res OARs fall back to SafeBoolean)");
+                    }
+                    return extHiRes ?? ext;
+                }
 
                 foreach (var req in prvRequests)
                 {
@@ -3345,8 +3438,12 @@ namespace VMS.TPS
                             // why it hit spinal cord and other small high-res
                             // organs while leaving the big standard-res ones
                             // (lungs, heart) looking correct.
-                            var cappedSeg = SafeBoolean(_ss, prvSeg, ext.SegmentVolume, BoolOp.And,
-                                                null, ext, prvId, _fb,
+                            // Cap against the Body at the organ's own resolution.
+                            // ownerB is whichever Body structure we actually
+                            // passed, so it genuinely holds that geometry.
+                            var body = BodyFor(oar);
+                            var cappedSeg = SafeBoolean(_ss, prvSeg, body.SegmentVolume, BoolOp.And,
+                                                null, body, prvId, _fb,
                                                 $"PRV_{req.OarId}_CapExt", tg);
 
                             if (cappedSeg == null)
@@ -3400,6 +3497,7 @@ namespace VMS.TPS
                         _progress.AppendLine($"  FAIL: {prvId} -> {exPrv.Message}");
                     }
                 }
+                } // stepTg - releases the shared high-resolution Body copy
             }
 
             // ------------------------------------------------------------------
@@ -4206,20 +4304,61 @@ namespace VMS.TPS
         // ==================================================================
         private enum BoolOp { And, Or, Sub }
 
+        // Materialise `seg` into a temp structure at the segment's OWN natural
+        // resolution. Order matters and is the whole point of this helper:
+        // Eclipse will only convert a structure to high resolution once it
+        // actually HAS contours, and it refuses to accept a SegmentVolume whose
+        // resolution differs from the target structure's. So assign first (the
+        // standard-resolution case, which is most of them) and only if that is
+        // rejected - meaning `seg` is high-resolution - convert the still-empty
+        // temp and assign again.
+        private static Structure MakeResTemp(
+            StructureSet ss, SegmentVolume seg, string baseId, TempGuard tg)
+        {
+            var t = tg.Add(ss.AddStructure("CONTROL", MakeUniqueId(ss, baseId)));
+            if (seg == null) return t;
+            try { t.SegmentVolume = seg; }
+            catch
+            {
+                try { t.ConvertToHighResolution(); } catch { /* leave standard res */ }
+                try { t.SegmentVolume = seg; } catch { /* caller checks IsEmpty */ }
+            }
+            return t;
+        }
+
+        // Raise the lower-resolution of two NON-EMPTY temps up to match the
+        // other. Converting here is safe precisely because both already carry
+        // contours - converting an empty structure is what used to fail.
+        private static void MatchResolution(Structure x, Structure y)
+        {
+            if (x == null || y == null) return;
+            try
+            {
+                if (x.IsHighResolution && !y.IsHighResolution && !y.IsEmpty) y.ConvertToHighResolution();
+                else if (y.IsHighResolution && !x.IsHighResolution && !x.IsEmpty) x.ConvertToHighResolution();
+            }
+            catch { /* fall through - the caller's op is try-guarded */ }
+        }
+
         private static SegmentVolume TryMatchResolutionAndOp(
             StructureSet ss, SegmentVolume a, SegmentVolume b, BoolOp op, TempGuard tg)
         {
             try
             {
-                var tmpA = tg.Add(ss.AddStructure("CONTROL", MakeUniqueId(ss, "zTmpMatchA")));
-                try { if (a != null) tmpA.SegmentVolume = a; }
-                catch { tmpA.ConvertToHighResolution(); if (a != null) tmpA.SegmentVolume = a; }
+                // Build BOTH operands at their own resolution first, then raise
+                // the lower one. The previous version converted tmpB to high
+                // resolution BEFORE assigning it, so feeding it a
+                // standard-resolution Body threw "Can not combine segment
+                // volumes because they have different geometries" - its catch
+                // then re-tried the identical assignment and threw again,
+                // making this whole helper return null for every high-res
+                // organ vs standard-res Body pair (spinal cord, cochlea,
+                // optic nerves, chiasm...).
+                var tmpA = MakeResTemp(ss, a, "zTmpMatchA", tg);
+                var tmpB = MakeResTemp(ss, b, "zTmpMatchB", tg);
+                if (tmpA.IsEmpty || tmpB.IsEmpty) return null;
 
-                var tmpB = tg.Add(ss.AddStructure("CONTROL", MakeUniqueId(ss, "zTmpMatchB")));
-                if (tmpA.IsHighResolution && !tmpB.IsHighResolution) tmpB.ConvertToHighResolution();
-
-                try { if (b != null) tmpB.SegmentVolume = b; }
-                catch { if (!tmpB.IsHighResolution) tmpB.ConvertToHighResolution(); if (b != null) tmpB.SegmentVolume = b; }
+                MatchResolution(tmpA, tmpB);
 
                 switch (op)
                 {
@@ -4273,13 +4412,27 @@ namespace VMS.TPS
                     : tg.Add(CreateTempFromSegment(ss, b, "zRC_DerB"));
                 if (ownerB != null) CopyContoursPlaneByPlane(ss, ownerB, copyB);
 
-                switch (op)
+                // These two copies are built by different routes -
+                // CreateTempFromSegment preserves a high-resolution segment,
+                // while a plane-by-plane contour copy lands in a plain
+                // standard-resolution structure - so they can easily disagree.
+                // Combining them unmatched is what surfaced as
+                // "Can not combine segment volumes because they have different
+                // geometries", and because the op below sat outside any try it
+                // escaped SafeBoolean entirely and failed the whole structure.
+                MatchResolution(copyA, copyB);
+
+                try
                 {
-                    case BoolOp.And: return copyA.SegmentVolume.And(copyB.SegmentVolume);
-                    case BoolOp.Or: return copyA.SegmentVolume.Or(copyB.SegmentVolume);
-                    case BoolOp.Sub: return copyA.SegmentVolume.Sub(copyB.SegmentVolume);
-                    default: return null;
+                    switch (op)
+                    {
+                        case BoolOp.And: return copyA.SegmentVolume.And(copyB.SegmentVolume);
+                        case BoolOp.Or: return copyA.SegmentVolume.Or(copyB.SegmentVolume);
+                        case BoolOp.Sub: return copyA.SegmentVolume.Sub(copyB.SegmentVolume);
+                        default: return null;
+                    }
                 }
+                catch { return null; }
             }
         }
 
@@ -4961,7 +5114,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.34.0.0";
+                Title = "Generic Crop Structure Generator - v5.35.0.0";
                 Width = 1250;
                 Height = 960;
                 MinWidth = 1000;
