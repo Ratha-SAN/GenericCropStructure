@@ -1013,6 +1013,36 @@
 //               trailing one is found, pulls it out the same way, and
 //               reattaches it after abbreviating the rest - so it's
 //               prioritized/preserved instead of vanishing.
+//   v5.32.0.0 – Three Generic tab fixes: (1) SwitchMode() now commits any
+//               pending Targets/Organs/Crop grid cell edit before clearing
+//               columns or toggling grid visibility, matching the defense
+//               CommitSelections()/DoNestedCreate()/RefreshAutoStructurePreview()
+//               already had - previously switching the Mode combo while a
+//               cell was still being edited could leave the DataGrid in a
+//               broken internal edit state, requiring the whole window to
+//               be closed and reopened to recover (this was the reported
+//               "need to close/reopen to use other mode" freeze). (2) The
+//               bottom-bar dialog button now reads "Close" on the Generic
+//               tab specifically (Breast Opto/RCC keep "Cancel") -
+//               CancelDialog() only ever closes the window, it never rolls
+//               anything back (Generic's own Crop/Nested actions already
+//               commit structures directly the moment their own button is
+//               clicked), so "Cancel" was misleading there. (3)
+//               Investigated a report of PRV_[OAR] showing no volume
+//               increase over its OAR for spinal cord and other organs -
+//               couldn't reproduce a code defect in Step8_Prvs/SafeMargin
+//               through static analysis, but found a real gap:
+//               AssignSegmentSafely's success check only confirms the
+//               target is non-empty afterward, which reads as success
+//               even if a pre-existing PRV_[OAR] (e.g. left over from an
+//               earlier run, possibly locked/approved) silently failed to
+//               update and kept its old, un-margined geometry. Added a
+//               volume sanity check right after a successful assignment -
+//               a real PRV must be a strict superset of its OAR, so if
+//               PRV volume isn't meaningfully larger, it's now logged as
+//               a WARNING (with both volumes and the margin used) instead
+//               of silently reported as OK, surfacing the actual symptom
+//               either way instead of hiding it.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -1038,8 +1068,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.31.0.0")]
-[assembly: AssemblyFileVersion("5.31.0.0")]
+[assembly: AssemblyVersion("5.32.0.0")]
+[assembly: AssemblyFileVersion("5.32.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -3175,6 +3205,25 @@ namespace VMS.TPS
                                 {
                                     prv.Color = Color.FromRgb(255, 165, 0);
                                     LogCreated(prvId);
+
+                                    // AssignSegmentSafely only confirms the target
+                                    // is non-empty afterward - it can't tell a
+                                    // freshly-expanded PRV from a pre-existing
+                                    // PRV_[OAR] (e.g. left over from an earlier
+                                    // run, possibly locked/approved) whose
+                                    // assignment silently no-opped, leaving its
+                                    // old, un-margined geometry in place. A real
+                                    // PRV must be a strict superset of its OAR,
+                                    // so its volume can never be smaller and is
+                                    // essentially never *equal* by chance - flag
+                                    // it instead of reporting a silent false
+                                    // success when that's what actually happened.
+                                    if (prv.Volume <= oar.Volume * 1.001)
+                                        _progress.AppendLine(
+                                            $"  WARNING: {prvId} shows no volume increase over {req.OarId} " +
+                                            $"(PRV={prv.Volume:0.0}cc vs OAR={oar.Volume:0.0}cc, margin={marginMm:0.#}mm) - " +
+                                            "the margin may not have applied. Check whether this structure already " +
+                                            "existed (possibly locked/approved) before this run.");
                                 }
                                 else
                                 {
@@ -4746,7 +4795,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.31.0.0";
+                Title = "Generic Crop Structure Generator - v5.32.0.0";
                 Width = 1250;
                 Height = 960;
                 MinWidth = 1000;
@@ -6134,7 +6183,16 @@ namespace VMS.TPS
                         buttonPanel.Children.Add(_btnCreate);
                     }
 
-                    var btnCancel = new Button { Content = "Cancel", Padding = new Thickness(15, 6, 15, 6) };
+                    // CancelDialog() just sets DialogResult=false and closes the
+                    // window (see its own comment: "close the dialog" and
+                    // "cancel the dialog" are the same call here) - there's
+                    // nothing to actually roll back, since Generic's own Crop/
+                    // Nested actions already create structures directly the
+                    // moment their own button is clicked, before this dialog
+                    // ever closes. "Cancel" implies discarding pending work,
+                    // which is misleading on the Generic tab specifically -
+                    // labeled "Close" there; Breast Opto/RCC keep "Cancel".
+                    var btnCancel = new Button { Content = IsGenericKind ? "Close" : "Cancel", Padding = new Thickness(15, 6, 15, 6) };
                     btnCancel.Click += (s, e) => _owner.CancelDialog();
                     buttonPanel.Children.Add(btnCancel);
 
@@ -6161,6 +6219,25 @@ namespace VMS.TPS
                 // never reach nestedMode here).
                 private void SwitchMode(int modeIndex)
                 {
+                    // Commit any pending cell edit first - this function clears
+                    // and rebuilds _dgOrgans' Columns and toggles grid Visibility
+                    // below, and every OTHER place that does either of those
+                    // (CommitSelections, DoNestedCreate, RefreshAutoStructurePreview)
+                    // already defends against exactly this. This one didn't: if
+                    // the user was still typing in an Organs/Targets grid cell
+                    // (e.g. Max Dose, PRV Margin) when they picked a different
+                    // Mode, clearing that grid's Columns out from under an
+                    // in-progress edit left its DataGrid in a broken internal
+                    // edit state - the Mode combo LOOKED like it wasn't
+                    // responding to further clicks, actually requiring the whole
+                    // window to be closed and reopened to recover.
+                    _dgTargets?.CommitEdit(DataGridEditingUnit.Cell, true);
+                    _dgTargets?.CommitEdit(DataGridEditingUnit.Row, true);
+                    _dgOrgans?.CommitEdit(DataGridEditingUnit.Cell, true);
+                    _dgOrgans?.CommitEdit(DataGridEditingUnit.Row, true);
+                    _dgCrop?.CommitEdit(DataGridEditingUnit.Cell, true);
+                    _dgCrop?.CommitEdit(DataGridEditingUnit.Row, true);
+
                     if (IsRcc)
                     {
                         // View-only toggle: Organs and the Advanced plan preview
