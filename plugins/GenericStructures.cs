@@ -1043,6 +1043,53 @@
 //               a WARNING (with both volumes and the margin used) instead
 //               of silently reported as OK, surfacing the actual symptom
 //               either way instead of hiding it.
+//   v5.33.0.0 – ROOT-CAUSED the PRV "no expansion" report, and fixed a whole
+//               class of the same bug across every tab. SafeBoolean's
+//               slice-recontour fallback rebuilds its operands from the
+//               ownerA/ownerB structures it is handed
+//               (CopyContoursPlaneByPlane), NOT from the SegmentVolumes
+//               passed as a/b. So whenever a call passed a DERIVED segment
+//               (something margined, contracted or already booleaned) but
+//               named the ORIGINAL source structure as that operand's
+//               owner, the fallback silently substituted the original,
+//               un-margined geometry - the margin simply vanished, with no
+//               error anywhere. The fallback fires on a resolution
+//               mismatch, which is exactly what happens when a
+//               HIGH-RESOLUTION organ meets the standard-resolution Body -
+//               so it hit spinal cord and other small high-res organs
+//               while big standard-res organs (lung, heart) took the fast
+//               path and looked perfectly fine. That is precisely the
+//               reported "PRV expansion for spinal cord and some other
+//               (no expansion)" symptom: PRV came back byte-identical to
+//               its OAR. Fixed by passing null as the owner wherever the
+//               operand is derived (16 call sites; null makes the fallback
+//               rebuild from the actual derived segment instead). Sites
+//               corrected: Run()'s BodyMinus3, Step1 Eval∩BodyMinus3,
+//               Step2's SIB shave, Step4 avoidance (all three variants +
+//               the per-target subtract), Step6's higher-dose Ovl
+//               subtract, Step8's PRV Body cap, Step9's Ring1/Ring2
+//               cap-to-Body-3mm, Step10's Rind, DoNestedCreate's
+//               BodyMinus3 + Eval, and RCC's own BodyMinus3, Eval and
+//               Rind. Untouched were the calls that name a TEMP structure
+//               explicitly built from that same derived segment
+//               (higherSt/bodyCapSt/avoidExpSt/tmpSt) - those owners do
+//               hold the right geometry and are correct as-is.
+//               Step8_Prvs additionally rewritten to margin the OAR's own
+//               SegmentVolume directly, the way every other OAR-expanding
+//               step already does, instead of first copying the OAR into a
+//               freshly added CONTROL structure (always standard
+//               resolution, so a high-res organ got rasterised down onto
+//               the coarse grid BEFORE the margin was applied) and
+//               force-converting a whole-Body temp copy to high resolution
+//               for no reason - SafeBoolean matches operand resolutions
+//               itself. It now also assigns before converting the target
+//               to high-res (ConvertToHighResolution on a structure with
+//               no geometry yet is unreliable), skips the case where
+//               prvId collides with the source OAR's own id (an organ
+//               already named "PRV_x" would otherwise be expanded in
+//               place, destroying the original contour), and keeps the
+//               v5.32 volume sanity check that flags a PRV which did not
+//               actually grow.
 //
 // KNOWN LIMITATIONS (not yet fixed in this version):
 //   - _zOptDoseSum is keyed by dose (double) only. If two groups share the same dose level
@@ -1068,8 +1115,8 @@ using System.Windows.Media;
 using VMS.TPS.Common.Model.API;
 using VMS.TPS.Common.Model.Types;
 
-[assembly: AssemblyVersion("5.32.0.0")]
-[assembly: AssemblyFileVersion("5.32.0.0")]
+[assembly: AssemblyVersion("5.33.0.0")]
+[assembly: AssemblyFileVersion("5.33.0.0")]
 [assembly: ESAPIScript(IsWriteable = true)]
 
 namespace VMS.TPS
@@ -1770,9 +1817,15 @@ namespace VMS.TPS
 
                     using (var globalTg = new TempGuard(_ss))
                     {
+                        // ownerA is null on purpose: extMinus3 is the CONTRACTED
+                        // body, not selectedExternal's own geometry, and
+                        // SafeBoolean's recontour fallback rebuilds operand A from
+                        // ownerA's contours - naming selectedExternal there would
+                        // hand back the full, uncontracted Body and silently drop
+                        // the -3mm. (Same bug class as the PRV/Rind ones below.)
                         var extMinus3 = SafeMargin(selectedExternal.SegmentVolume, -BODY_CONTRACT_MM);
                         var bodyMinus3 = SafeBoolean(_ss, extMinus3, selectedExternal.SegmentVolume,
-                                            BoolOp.And, selectedExternal, selectedExternal,
+                                            BoolOp.And, null, selectedExternal,
                                             null, _fb, "BodyMinus3", globalTg);
 
                         bool isGeneric = _vm.IsGenericTab;
@@ -1927,8 +1980,9 @@ namespace VMS.TPS
                                             $"DoseUnion_{doseStr}{sfxStr}", tg));
                         if (doseUnionSt == null) continue;
 
+                        // ownerB null - bodyMinus3 is the contracted Body, not ext.
                         var evalSeg = SafeBoolean(_ss, doseUnionSt.SegmentVolume, bodyMinus3,
-                                        BoolOp.And, doseUnionSt, ext, evalId, _fb,
+                                        BoolOp.And, doseUnionSt, null, evalId, _fb,
                                         $"Eval_{doseStr}{sfxStr}_AndBodyMinus3", tg);
                         evalSeg = SafeBoolean(_ss, evalSeg, ext.SegmentVolume,
                                     BoolOp.And, null, ext, evalId, _fb,
@@ -1984,8 +2038,12 @@ namespace VMS.TPS
                             string hDoseStr = hk.DoseGy.ToString(System.Globalization.CultureInfo.InvariantCulture);
                             string hSfxStr = string.IsNullOrWhiteSpace(hk.Suffix) ? "" : "_" + hk.Suffix;
 
+                            // ownerB null: higherExpanded is higherOpt EXPANDED by
+                            // subtractMm, so naming higherOpt as ownerB would make
+                            // the recontour fallback subtract the un-expanded
+                            // target and silently drop the SIB shave gap.
                             optSeg = SafeBoolean(_ss, optSeg, higherExpanded, BoolOp.Sub,
-                                        null, higherOpt, optId, _fb,
+                                        null, null, optId, _fb,
                                         $"Opt_{doseStr}{sfxStr}_SubHigher_{hDoseStr}{hSfxStr}", tg);
                         }
 
@@ -2109,9 +2167,13 @@ namespace VMS.TPS
 
                     using (var tg = new TempGuard(_ss))
                     {
+                        // ownerB null: `expanded` is optSumSt grown by
+                        // AVOIDANCE_MARGIN_MM, not its own geometry - see the
+                        // BodyMinus3 note in Run() for why naming it here would
+                        // silently drop the expansion on the fallback path.
                         var expanded = SafeMargin(optSumSt.SegmentVolume, +AVOIDANCE_MARGIN_MM);
                         var avoidanceSeg = SafeBoolean(_ss, ext.SegmentVolume, expanded, BoolOp.Sub,
-                                            ext, optSumSt, avoidId, _fb,
+                                            ext, null, avoidId, _fb,
                                             $"Avoid_{doseStr}_ExtMinusExpOpt", tg);
                         avoidanceSeg = SafeBoolean(_ss, avoidanceSeg, ext.SegmentVolume, BoolOp.And,
                                         null, ext, avoidId, _fb,
@@ -2142,9 +2204,10 @@ namespace VMS.TPS
 
                     using (var tg = new TempGuard(_ss))
                     {
+                        // ownerB null - `expanded` is the grown copy, not optSt.
                         var expanded = SafeMargin(optSt.SegmentVolume, +AVOIDANCE_MARGIN_MM);
                         var avoidanceSeg = SafeBoolean(_ss, ext.SegmentVolume, expanded, BoolOp.Sub,
-                                            ext, optSt, avoidId, _fb,
+                                            ext, null, avoidId, _fb,
                                             $"Avoid_{doseStr}{sfxStr}_ExtMinusExpOpt", tg);
                         avoidanceSeg = SafeBoolean(_ss, avoidanceSeg, ext.SegmentVolume, BoolOp.And,
                                         null, ext, avoidId, _fb,
@@ -2195,9 +2258,10 @@ namespace VMS.TPS
                 {
                     using (var tg = new TempGuard(_ss))
                     {
+                        // ownerB null - sumExpanded is the grown copy, not optSum.
                         var sumExpanded = SafeMargin(optSum.SegmentVolume, +GENERIC_AVOIDANCE_SUM_MARGIN_MM);
                         var avoidanceSeg = SafeBoolean(_ss, ext.SegmentVolume, sumExpanded, BoolOp.Sub,
-                                            ext, optSum, avoidId, _fb, "Avoid_ExtMinusExpSum", tg);
+                                            ext, null, avoidId, _fb, "Avoid_ExtMinusExpSum", tg);
 
                         foreach (var k in groupKeys)
                         {
@@ -2210,8 +2274,9 @@ namespace VMS.TPS
 
                             var expanded = SafeMargin(optSt.SegmentVolume, +cropMm);
                             string doseStr = k.DoseGy.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                            // ownerB null - `expanded` is optSt grown by cropMm.
                             avoidanceSeg = SafeBoolean(_ss, avoidanceSeg, expanded, BoolOp.Sub,
-                                                null, optSt, avoidId, _fb, $"Avoid_SubTarget_{doseStr}", tg);
+                                                null, null, avoidId, _fb, $"Avoid_SubTarget_{doseStr}", tg);
                         }
 
                         if (avoidanceSeg != null)
@@ -2989,8 +3054,10 @@ namespace VMS.TPS
 
                                         string hDoseStr = hd.ToString(System.Globalization.CultureInfo.InvariantCulture);
 
+                                        // ownerB null - higherExpanded is the
+                                        // grown copy, not higherOptSum itself.
                                         ov = SafeBoolean(_ss, ov, higherExpanded, BoolOp.Sub,
-                                                null, higherOptSum, ovlId, _fb,
+                                                null, null, ovlId, _fb,
                                                 $"Ovlp_{doseStr}_SubHigher_{hDoseStr}", tg);
                                     }
 
@@ -3158,78 +3225,103 @@ namespace VMS.TPS
                             continue;
                         }
 
+                        // An OAR that is itself already called PRV_something
+                        // abbreviates back to its own id here (e.g. an existing
+                        // "PRV_SpinalCord" organ row -> prvId "PRV_SpinalCord"),
+                        // which would expand that organ in place and destroy the
+                        // original contour rather than deriving a new structure.
+                        if (string.Equals(prvId, oar.Id, StringComparison.OrdinalIgnoreCase))
+                        {
+                            _progress.AppendLine(
+                                $"  SKIP: {prvId} (id collides with the source OAR \"{oar.Id}\" - " +
+                                "would overwrite the organ itself)");
+                            continue;
+                        }
+
+                        double marginMm = req.ParsedPrvMarginMm.GetValueOrDefault();
+
                         using (var tg = new TempGuard(_ss))
                         {
-                            var oarTemp = tg.Add(_ss.AddStructure("CONTROL",
-                                MakeUniqueId(_ss, TruncId("zTmpPrvOar"))));
-                            if (oar.IsHighResolution && !oarTemp.IsHighResolution)
-                                oarTemp.ConvertToHighResolution();
-                            AssignSegmentSafely(oarTemp, oar.SegmentVolume);
-
-                            double marginMm = req.ParsedPrvMarginMm.GetValueOrDefault();
-                            var prvSeg = SafeMargin(oarTemp.SegmentVolume, marginMm);
-
-                            var extTemp = tg.Add(_ss.AddStructure("CONTROL",
-                                MakeUniqueId(_ss, TruncId("zTmpPrvExt"))));
-                            if (oarTemp.IsHighResolution && !extTemp.IsHighResolution)
-                                extTemp.ConvertToHighResolution();
-
-                            try
+                            // Margin the OAR's own SegmentVolume directly, exactly
+                            // the way every other step that expands an OAR does
+                            // (DoRccStyleCrop, BuildRccNestedShells, Step10's
+                            // Rind). This step used to copy the OAR into a fresh
+                            // CONTROL structure and margin THAT instead - a newly
+                            // added structure is standard resolution, so for a
+                            // high-resolution OAR (spinal cord and other small
+                            // organs are routinely high-res) the copy rasterised
+                            // the contours down onto the coarse grid before the
+                            // margin was ever applied. It also force-converted a
+                            // whole-Body temp copy to high resolution for no
+                            // reason. SafeBoolean already matches operand
+                            // resolutions itself (TryMatchResolutionAndOp), so
+                            // none of that round-trip was needed.
+                            var prvSeg = SafeMargin(oar.SegmentVolume, marginMm);
+                            if (prvSeg == null)
                             {
-                                AssignSegmentSafely(extTemp, ext.SegmentVolume);
-                            }
-                            catch
-                            {
-                                if (!oarTemp.IsHighResolution) oarTemp.ConvertToHighResolution();
-                                if (!extTemp.IsHighResolution) extTemp.ConvertToHighResolution();
-                                AssignSegmentSafely(extTemp, ext.SegmentVolume);
-                                prvSeg = SafeMargin(oarTemp.SegmentVolume, marginMm);
+                                _progress.AppendLine($"  SKIP: {prvId} (margin produced nothing)");
+                                continue;
                             }
 
-                            SegmentVolume cappedSeg;
-                            try { cappedSeg = prvSeg.And(extTemp.SegmentVolume); }
-                            catch
+                            // ownerA MUST stay null: prvSeg is a derived
+                            // (margined) segment, not oar's own geometry, and
+                            // SafeBoolean's recontour fallback rebuilds operand A
+                            // from ownerA's contours whenever it fires. Passing
+                            // the OAR here - as this call used to - silently threw
+                            // the margin away and handed back the bare organ, so
+                            // the PRV came out identical to the OAR. That fallback
+                            // fires precisely on a resolution mismatch between a
+                            // high-res organ and the standard-res Body, which is
+                            // why it hit spinal cord and other small high-res
+                            // organs while leaving the big standard-res ones
+                            // (lungs, heart) looking correct.
+                            var cappedSeg = SafeBoolean(_ss, prvSeg, ext.SegmentVolume, BoolOp.And,
+                                                null, ext, prvId, _fb,
+                                                $"PRV_{req.OarId}_CapExt", tg);
+
+                            if (cappedSeg == null)
                             {
-                                cappedSeg = SafeBoolean(_ss, prvSeg, extTemp.SegmentVolume, BoolOp.And,
-                                                    oarTemp, extTemp, prvId, _fb,
-                                                    $"PRV_{req.OarId}_CapExt", tg);
+                                _progress.AppendLine($"  SKIP: {prvId} (empty after Body crop)");
+                                continue;
                             }
 
-                            if (cappedSeg != null)
+                            var prv = GetOrCreate(_ss, "CONTROL", prvId);
+
+                            // Assign first and only convert to high resolution if
+                            // the plain assign is rejected - ConvertToHighResolution()
+                            // on a structure that has no geometry yet is unreliable
+                            // (same order CreateTempFromSegment already uses).
+                            bool assigned = AssignSegmentSafely(prv, cappedSeg);
+                            if (!assigned && !prv.IsHighResolution)
                             {
-                                var prv = GetOrCreate(_ss, "CONTROL", prvId);
-                                if (oarTemp.IsHighResolution && !prv.IsHighResolution)
-                                    prv.ConvertToHighResolution();
+                                try { prv.ConvertToHighResolution(); } catch { /* stay standard res */ }
+                                assigned = AssignSegmentSafely(prv, cappedSeg);
+                            }
 
-                                if (AssignSegmentSafely(prv, cappedSeg))
-                                {
-                                    prv.Color = Color.FromRgb(255, 165, 0);
-                                    LogCreated(prvId);
+                            if (assigned)
+                            {
+                                prv.Color = Color.FromRgb(255, 165, 0);
+                                LogCreated(prvId);
 
-                                    // AssignSegmentSafely only confirms the target
-                                    // is non-empty afterward - it can't tell a
-                                    // freshly-expanded PRV from a pre-existing
-                                    // PRV_[OAR] (e.g. left over from an earlier
-                                    // run, possibly locked/approved) whose
-                                    // assignment silently no-opped, leaving its
-                                    // old, un-margined geometry in place. A real
-                                    // PRV must be a strict superset of its OAR,
-                                    // so its volume can never be smaller and is
-                                    // essentially never *equal* by chance - flag
-                                    // it instead of reporting a silent false
-                                    // success when that's what actually happened.
-                                    if (prv.Volume <= oar.Volume * 1.001)
-                                        _progress.AppendLine(
-                                            $"  WARNING: {prvId} shows no volume increase over {req.OarId} " +
-                                            $"(PRV={prv.Volume:0.0}cc vs OAR={oar.Volume:0.0}cc, margin={marginMm:0.#}mm) - " +
-                                            "the margin may not have applied. Check whether this structure already " +
-                                            "existed (possibly locked/approved) before this run.");
-                                }
-                                else
-                                {
-                                    _ss.RemoveStructure(prv);
-                                    _progress.AppendLine($"  SKIP: {prvId} (Empty volume)");
-                                }
+                                // AssignSegmentSafely only confirms the target is
+                                // non-empty afterward - it can't tell a freshly
+                                // expanded PRV from a pre-existing PRV_[OAR] whose
+                                // assignment silently no-opped and kept its old
+                                // geometry. A real PRV is a strict superset of its
+                                // OAR, so it can never be smaller and is never
+                                // equal by chance - flag it rather than report a
+                                // false success.
+                                if (prv.Volume <= oar.Volume * 1.001)
+                                    _progress.AppendLine(
+                                        $"  WARNING: {prvId} shows no volume increase over {req.OarId} " +
+                                        $"(PRV={prv.Volume:0.0}cc vs OAR={oar.Volume:0.0}cc, margin={marginMm:0.#}mm) - " +
+                                        "the margin did not take effect. Check whether this structure already " +
+                                        "existed and is locked/approved.");
+                            }
+                            else
+                            {
+                                _ss.RemoveStructure(prv);
+                                _progress.AppendLine($"  SKIP: {prvId} (Empty volume)");
                             }
                         }
                     }
@@ -3312,8 +3404,12 @@ namespace VMS.TPS
                                 }
                             }
 
-                            ringSeg = SafeBoolean(_ss, ringSeg, extMinus3, BoolOp.And, null, ext, $"zRing_{doseStr}_1", _fb, $"Ring1_{doseStr}_CapExtMinus3", tg);
-                            ring2Seg = SafeBoolean(_ss, ring2Seg, extMinus3, BoolOp.And, null, ext, $"zRing_{doseStr}_2", _fb, $"Ring2_{doseStr}_CapExtMinus3", tg);
+                            // ownerB null: extMinus3 is the Body CONTRACTED by
+                            // BODY_CONTRACT_MM, not ext's own geometry - naming
+                            // ext would make the recontour fallback cap to the
+                            // full Body and let the rings run 3mm out to the skin.
+                            ringSeg = SafeBoolean(_ss, ringSeg, extMinus3, BoolOp.And, null, null, $"zRing_{doseStr}_1", _fb, $"Ring1_{doseStr}_CapExtMinus3", tg);
+                            ring2Seg = SafeBoolean(_ss, ring2Seg, extMinus3, BoolOp.And, null, null, $"zRing_{doseStr}_2", _fb, $"Ring2_{doseStr}_CapExtMinus3", tg);
 
                             if (ringSeg != null)
                             {
@@ -3651,9 +3747,15 @@ namespace VMS.TPS
                     {
                         using (var tg = new TempGuard(_ss))
                         {
+                            // ownerA null: rindSeg is optSt CONTRACTED inward by
+                            // RCC_RIND_MARGIN_MM, so naming optSt as ownerA would
+                            // make the recontour fallback hand back the full,
+                            // uncontracted PTV_Opt - the Rind would come out
+                            // identical to the target with no inward margin at
+                            // all, the same failure the PRV step had.
                             var rindSeg = SafeMargin(optSt.SegmentVolume, -RCC_RIND_MARGIN_MM);
                             rindSeg = SafeBoolean(_ss, rindSeg, ext.SegmentVolume, BoolOp.And,
-                                        optSt, ext, rindId, _fb, $"Rind_{doseStr}{sfxStr}_CapExt", tg);
+                                        null, ext, rindId, _fb, $"Rind_{doseStr}{sfxStr}_CapExt", tg);
 
                             if (rindSeg != null)
                             {
@@ -4795,7 +4897,7 @@ namespace VMS.TPS
                 if (vmBreast == null) throw new ArgumentNullException(nameof(vmBreast));
                 if (vmRcc == null) throw new ArgumentNullException(nameof(vmRcc));
 
-                Title = "Generic Crop Structure Generator - v5.32.0.0";
+                Title = "Generic Crop Structure Generator - v5.33.0.0";
                 Width = 1250;
                 Height = 960;
                 MinWidth = 1000;
@@ -7053,11 +7155,14 @@ namespace VMS.TPS
                             }
 
                             var extMinus3 = SafeMargin(ext.SegmentVolume, -BODY_CONTRACT_MM);
+                            // owners null where the operand is the CONTRACTED body
+                            // rather than ext's own geometry - see Run()'s
+                            // BodyMinus3 note.
                             var bodyMinus3 = SafeBoolean(_ss, extMinus3, ext.SegmentVolume, BoolOp.And,
-                                ext, ext, null, fb, "Nested_BodyMinus3", tg);
+                                null, ext, null, fb, "Nested_BodyMinus3", tg);
 
                             var evalSeg = SafeBoolean(_ss, doseUnionSt.SegmentVolume, bodyMinus3, BoolOp.And,
-                                doseUnionSt, ext, evalId, fb, "Nested_Eval_AndBodyMinus3", tg);
+                                doseUnionSt, null, evalId, fb, "Nested_Eval_AndBodyMinus3", tg);
                             evalSeg = SafeBoolean(_ss, evalSeg, ext.SegmentVolume, BoolOp.And,
                                 null, ext, evalId, fb, "Nested_Eval_AndExt", tg);
                             if (evalSeg == null)
@@ -7970,8 +8075,9 @@ namespace VMS.TPS
                     using (var tg0 = new TempGuard(_ss))
                     {
                         var extMinus3 = SafeMargin(ext.SegmentVolume, -BODY_CONTRACT_MM);
+                        // ownerA null - extMinus3 is the contracted Body, not ext.
                         bodyMinus3 = SafeBoolean(_ss, extMinus3, ext.SegmentVolume, BoolOp.And,
-                            ext, ext, null, fb, "RccBodyMinus3", tg0);
+                            null, ext, null, fb, "RccBodyMinus3", tg0);
                     }
 
                     foreach (var row in targets)
@@ -7986,8 +8092,9 @@ namespace VMS.TPS
                             {
                                 // Step 1: PTV_Eval = target ∩ (Body - 3mm) ∩ Body
                                 string evalId = RccEvalId(row.TargetId);
+                                // ownerB null - bodyMinus3 is the contracted Body.
                                 var evalSeg = SafeBoolean(_ss, targetSt.SegmentVolume, bodyMinus3, BoolOp.And,
-                                    targetSt, ext, evalId, fb, $"RccEval_{row.TargetId}_AndBodyMinus3", tg);
+                                    targetSt, null, evalId, fb, $"RccEval_{row.TargetId}_AndBodyMinus3", tg);
                                 evalSeg = SafeBoolean(_ss, evalSeg, ext.SegmentVolume, BoolOp.And,
                                     null, ext, evalId, fb, $"RccEval_{row.TargetId}_AndExt", tg);
 
@@ -8313,9 +8420,12 @@ namespace VMS.TPS
                             using (var tg = new TempGuard(_ss))
                             {
                                 string rindId = RccRindId(targetId);
+                                // ownerA null - rindSeg is optSt contracted inward,
+                                // not optSt itself (RCC sibling of the same fix
+                                // applied to Step10_Rind_Generic).
                                 var rindSeg = SafeMargin(optSt.SegmentVolume, -RCC_RIND_MARGIN_MM);
                                 rindSeg = SafeBoolean(_ss, rindSeg, ext.SegmentVolume, BoolOp.And,
-                                    optSt, ext, rindId, fb, $"RccRind_{targetId}_CapExt", tg);
+                                    null, ext, rindId, fb, $"RccRind_{targetId}_CapExt", tg);
 
                                 var st = GetOrCreate(_ss, "CONTROL", rindId);
                                 EnsureRccHighRes(st);
